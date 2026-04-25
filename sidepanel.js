@@ -5,6 +5,9 @@ let pinnedTabId = null, scopeDomains = [], notes = {}, diffStore = { a: null, b:
 let liveActive = false, liveTargetDomain = '', liveFindings = [];
 const liveSeenItems = new Set(); // dedup: skip already-found items
 const liveDomainData = {}; // domain → { findings, seenItems, feedHTML }
+let liveScanTimer = null; // debounce timer
+let liveScanLastUrl = ''; // last URL scanned
+let liveScanLastTime = 0; // timestamp of last scan
 const cache = {};
 const browseHistory = {}; // domain → [{url, title, timestamp}]
 
@@ -102,7 +105,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const targetRoot = getRootDomain(liveTargetDomain);
         if (pageRoot === targetRoot) {
           log('SPA navigate: ' + msg.payload.method + ' → ' + msg.payload.url, 'info');
-          setTimeout(() => liveScanPage(activeTabId, msg.payload.url, ''), 600);
+          debouncedLiveScan(activeTabId, msg.payload.url, '');
         }
       } catch {}
     }
@@ -112,7 +115,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const targetRoot = getRootDomain(liveTargetDomain);
         if (pageRoot === targetRoot && (msg.payload.forms > 0 || msg.payload.scripts > 0)) {
           log('DOM mutation: ' + msg.payload.forms + ' forms, ' + msg.payload.scripts + ' scripts', 'info');
-          setTimeout(() => liveScanPage(activeTabId, msg.payload.url, ''), 400);
+          debouncedLiveScan(activeTabId, msg.payload.url, '');
         }
       } catch {}
     }
@@ -197,7 +200,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           const targetRoot = getRootDomain(liveTargetDomain);
           const pageRoot = getRootDomain(host);
           if (pageRoot === targetRoot) {
-            setTimeout(() => liveScanPage(tabId, tab.url, tab.title || ''), 600);
+            debouncedLiveScan(tabId, tab.url, tab.title || '');
           }
         } catch {}
       }
@@ -608,25 +611,114 @@ async function runTool(tool) {
 // ═══ TOOLS ═══
 async function toolTechStack() {
   const b = showResults('recon', 'Tech Stack', true);
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Deep scanning tech stack...</div>';
   const res = await msgTab({ type: 'ANALYZE_TECH_STACK' });
   const hRes = await chrome.runtime.sendMessage({ type: 'GET_HEADERS', tabId: activeTabId });
-  const srv = [];
+  const all = [...(res?.data||[])];
+
+  // 1. Server headers with version extraction
   if (hRes.headers?.responseHeaders) hRes.headers.responseHeaders.forEach(h => {
-    if (h.name.toLowerCase()==='server') srv.push({name:h.value,category:'Server',confidence:'high'});
-    if (h.name.toLowerCase()==='x-powered-by') srv.push({name:h.value,category:'Backend',confidence:'high'});
+    const n = h.name.toLowerCase();
+    if (n === 'server') all.push({ name: h.value, category: 'Server', confidence: 'high' });
+    if (n === 'x-powered-by') all.push({ name: h.value, category: 'Backend', confidence: 'high' });
+    if (n === 'x-aspnet-version') all.push({ name: 'ASP.NET ' + h.value, category: 'Backend', confidence: 'high' });
+    if (n === 'x-generator') all.push({ name: h.value, category: 'CMS', confidence: 'high' });
+    if (n === 'x-drupal-cache' || n === 'x-drupal-dynamic-cache') all.push({ name: 'Drupal', category: 'CMS', confidence: 'high' });
+    if (n === 'x-varnish') all.push({ name: 'Varnish', category: 'Cache', confidence: 'high' });
+    if (n === 'x-cache' && h.value.includes('cloudfront')) all.push({ name: 'AWS CloudFront', category: 'CDN', confidence: 'high' });
+    if (n === 'cf-ray') all.push({ name: 'Cloudflare', category: 'CDN/WAF', confidence: 'high' });
+    if (n === 'x-akamai-transformed') all.push({ name: 'Akamai', category: 'CDN/WAF', confidence: 'high' });
+    if (n === 'x-sucuri-id') all.push({ name: 'Sucuri WAF', category: 'WAF', confidence: 'high' });
+    if (n === 'x-iinfo') all.push({ name: 'Imperva', category: 'WAF', confidence: 'high' });
+    if (n === 'x-cdn' || (n === 'via' && /cloudflare|akamai|fastly|cdn/i.test(h.value))) all.push({ name: 'CDN: ' + h.value, category: 'CDN', confidence: 'medium' });
+    if (n === 'x-frame-options') all.push({ name: 'X-Frame-Options: ' + h.value, category: 'Security Header', confidence: 'high' });
   });
-  const all = [...(res?.data||[]), ...srv];
-  // Enhanced: detect framework globals from main world
+
+  // 2. Cookie-based tech detection
+  try {
+    const cookieRes = await chrome.runtime.sendMessage({ type: 'GET_COOKIES', domain: activeTabDomain });
+    if (cookieRes.ok) {
+      const cookieTech = { 'PHPSESSID': 'PHP', 'JSESSIONID': 'Java/Tomcat', 'connect.sid': 'Express/Node.js', 'ASP.NET_SessionId': 'ASP.NET', 'laravel_session': 'Laravel', 'CFID': 'ColdFusion', '_rails_session': 'Ruby on Rails', 'rack.session': 'Ruby Rack', '_session_id': 'Ruby on Rails', 'ci_session': 'CodeIgniter', 'PLAY_SESSION': 'Play Framework', '__cfduid': 'Cloudflare' };
+      cookieRes.cookies.forEach(c => {
+        for (const [pat, tech] of Object.entries(cookieTech)) {
+          if (c.name === pat || c.name.startsWith(pat)) {
+            if (!all.some(t => t.name.includes(tech))) all.push({ name: tech, category: 'Backend (cookie)', confidence: 'high' });
+          }
+        }
+      });
+    }
+  } catch {}
+
+  // 3. JS file version extraction (scan first 200 chars of top JS files for version comments)
+  try {
+    const sr = await msgTab({ type: 'GET_SCRIPT_URLS' });
+    if (sr?.ok) {
+      const versionPatterns = [
+        { re: /jquery[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'jQuery' },
+        { re: /bootstrap[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'Bootstrap' },
+        { re: /angular[.\-\s/]?v?(\d+\.\d+\.\d+)/i, name: 'Angular' },
+        { re: /react[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'React' },
+        { re: /vue[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'Vue.js' },
+        { re: /lodash[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'Lodash' },
+        { re: /moment[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'Moment.js' },
+        { re: /axios[.\-\s]?v?(\d+\.\d+\.\d+)/i, name: 'Axios' },
+      ];
+      // Check external JS filenames for version hints
+      sr.data.external.slice(0, 15).forEach(url => {
+        const filename = url.split('/').pop()?.split('?')[0] || '';
+        versionPatterns.forEach(({ re, name }) => {
+          const m = filename.match(re);
+          if (m) {
+            const existing = all.find(t => t.name.toLowerCase().includes(name.toLowerCase()));
+            if (existing) existing.name = name + ' v' + m[1];
+            else all.push({ name: name + ' v' + m[1], category: 'Library', confidence: 'high' });
+          }
+        });
+      });
+      // Scan first few JS file headers for version comments
+      for (const url of sr.data.external.slice(0, 5)) {
+        try {
+          const r = await chrome.runtime.sendMessage({ type: 'FETCH_JS', url });
+          if (r.ok) {
+            const header = r.text.slice(0, 300);
+            versionPatterns.forEach(({ re, name }) => {
+              const m = header.match(re);
+              if (m && !all.some(t => t.name.includes(name + ' v'))) {
+                const existing = all.find(t => t.name.toLowerCase().includes(name.toLowerCase()));
+                if (existing) existing.name = name + ' v' + m[1];
+                else all.push({ name: name + ' v' + m[1], category: 'Library', confidence: 'high' });
+              }
+            });
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // 4. Framework globals from main world (React, Next.js, Vue, etc. with versions)
   try {
     const globalsRes = await msgTab({ type: 'DETECT_GLOBALS' });
     if (globalsRes?.ok && globalsRes.data) {
       globalsRes.data.forEach(g => {
-        if (!all.some(t => t.name.toLowerCase().includes(g.name.toLowerCase()))) {
+        const existing = all.find(t => t.name.toLowerCase().includes(g.name.toLowerCase()));
+        if (existing) {
+          if (g.detail && !existing.name.includes(g.detail)) existing.name += ' (' + g.detail + ')';
+          existing.confidence = 'high';
+        } else {
           all.push({ name: g.name + (g.detail ? ' (' + g.detail + ')' : ''), category: 'Framework', confidence: 'high' });
         }
       });
     }
   } catch {}
+
+  // Deduplicate by name similarity
+  const deduped = [];
+  all.forEach(t => {
+    const existing = deduped.find(d => d.name.toLowerCase() === t.name.toLowerCase());
+    if (!existing) deduped.push(t);
+    else if (t.confidence === 'high' && existing.confidence !== 'high') Object.assign(existing, t);
+  });
+
   const attackHints = {
     'WordPress': 'Try: /wp-json/wp/v2/users, xmlrpc.php brute force, plugin vulns',
     'Next.js': 'Try: /_next/data paths, API routes, SSRF via image optimization',
@@ -644,13 +736,19 @@ async function toolTechStack() {
     'ASP.NET': 'Try: /trace.axd, /elmah.axd, viewstate deserialization',
     'jQuery': 'Check version for known XSS (pre-3.5.0 CVEs)',
     'Bootstrap': 'Low priority — mostly CSS, check for XSS in tooltips/popovers',
+    'Drupal': 'Try: /user/login, /admin, /node/1, /CHANGELOG.txt for version',
+    'Ruby on Rails': 'Try: /rails/info, debug mode, mass assignment, CSRF bypass',
+    'Java': 'Try: /actuator, /console, deserialization, JNDI injection',
+    'Tomcat': 'Try: /manager/html, /host-manager, /status, default creds',
   };
+
+  const confIcon = { high: '', medium: '~', low: '?' };
   b.innerHTML = `<div class="text-xs text-muted mb-4">URL: ${esc(activeTabUrl)}</div>` +
-    (all.length===0?'<div class="text-muted text-sm">No tech detected</div>':all.map(t => {
+    (deduped.length === 0 ? '<div class="text-muted text-sm">No tech detected</div>' : deduped.map(t => {
       const hint = Object.entries(attackHints).find(([k]) => t.name.toLowerCase().includes(k.toLowerCase()));
-      return `<div class="result-item info" style="cursor:pointer">
-        <div class="result-label">${esc(t.category)}</div>
-        <div class="result-value">${esc(t.name)}</div>
+      return `<div class="result-item ${hint ? 'medium' : 'info'}" style="cursor:pointer">
+        <div class="result-label">${esc(t.category)} <span class="text-xs text-muted">${confIcon[t.confidence] || ''}${esc(t.confidence)}</span></div>
+        <div class="result-value" style="font-weight:600">${esc(t.name)}</div>
         ${hint ? `<div class="text-xs" style="color:var(--warning);margin-top:2px">${hint[1]}</div>` : ''}
       </div>`;
     }).join(''));
@@ -1176,6 +1274,40 @@ async function toolEndpoints() {
   const proc = (t, src) => { for(const p of ENDPOINT_PATTERNS){const re=new RegExp(p.source,p.flags);let m;while((m=re.exec(t))!==null){const ep=m[1]||m[0];if(isRealEndpoint(ep)&&!epMap.has(ep))epMap.set(ep,src)}} };
   for(const url of sr.data.external.slice(0,20)){try{const r=await chrome.runtime.sendMessage({type:'FETCH_JS',url});if(r.ok)proc(r.text,url)}catch{}}
   sr.data.inline.forEach((t,i) => proc(t, activeTabUrl + ' [inline]'));
+
+  // Also scan HTML source for data attributes with URLs
+  try {
+    const hiddenRes = await msgTab({ type: 'FIND_HIDDEN_ELEMENTS' });
+    if (hiddenRes?.ok) {
+      (hiddenRes.data.dataAttrs || []).forEach(attr => {
+        if (attr.value && (attr.value.startsWith('/') || attr.value.startsWith('http')) && isRealEndpoint(attr.value)) {
+          if (!epMap.has(attr.value)) epMap.set(attr.value, 'data-attr: ' + attr.attr);
+        }
+      });
+    }
+  } catch {}
+
+  // Scan captured XHR/fetch requests (runtime API calls Burp would see)
+  try {
+    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+    const capturedReqs = reqRes.requests || [];
+    capturedReqs.forEach(req => {
+      if (!req.url) return;
+      try {
+        const ru = new URL(req.url);
+        const path = ru.pathname + ru.search;
+        // Skip static assets
+        if (/\.(css|js|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico|map|webp)(\?|$)/i.test(ru.pathname)) return;
+        // Skip tracking/analytics
+        if (/google-analytics|googletagmanager|facebook\.com|doubleclick|clarity\.ms|hotjar/i.test(req.url)) return;
+        const ep = ru.origin === new URL(activeTabUrl).origin ? path : req.url;
+        if (!epMap.has(ep) && ep.length > 3) {
+          epMap.set(ep, 'XHR ' + (req.method || 'GET'));
+        }
+      } catch {}
+    });
+  } catch {}
+
   const sorted = [...epMap.entries()].sort((a,c) => a[0].localeCompare(c[0]));
   if (!sorted.length) { b.innerHTML = '<div class="text-muted text-sm">No endpoints</div>'; finalizeResults('discovery'); return; }
 
@@ -1421,11 +1553,40 @@ async function toolCors() {
 }
 
 async function toolRedirect() {
-  const b = showResults('offensive','Redirect',true);
-  const r = await msgTab({ type: 'CHECK_PASSIVE_VULNS' });
-  const rf = (r?.data||[]).filter(f=>f.type==='Potential Open Redirect');
-  b.innerHTML = rf.length?rf.map(f=>`<div class="result-item medium"><div class="result-label"><span class="result-tag tag-medium">POTENTIAL</span>${esc(f.type)}</div><div class="result-value">${esc(f.detail)}</div></div>`).join(''):'<div class="text-muted text-sm">No redirect params</div>';
-  finalizeResults('offensive');
+  const b = showResults('offensive','Redirect',false);
+  // Auto-detect redirect params from current URL
+  const u = new URL(activeTabUrl);
+  const redirParams = ['url', 'redirect', 'redirect_uri', 'next', 'return', 'returnTo', 'goto', 'dest', 'destination', 'redir', 'return_url', 'continue', 'retUrl', 'forward', 'target', 'link', 'to'];
+  const detected = [...u.searchParams.keys()].filter(k => redirParams.includes(k.toLowerCase()));
+
+  b.innerHTML = `<div class="text-sm mb-6">Active redirect testing with 12 bypass payloads</div>
+    <div class="tool-input-row"><input class="tool-input" id="rd-url" value="${esc(activeTabUrl)}" placeholder="URL with redirect param"></div>
+    <div class="tool-input-row"><input class="tool-input" id="rd-param" value="${esc(detected[0] || '')}" placeholder="Param name (e.g. redirect, next, return)" style="width:50%"><button class="btn-sm primary" id="rd-go">Test 12 Payloads</button></div>
+    ${detected.length ? '<div class="text-xs mb-6" style="color:var(--success)">Auto-detected redirect param: ' + detected.map(esc).join(', ') + '</div>' : '<div class="text-xs text-muted mb-6">No redirect params auto-detected. Enter the param name manually.</div>'}
+    <div id="rd-out"></div>`;
+
+  b.querySelector('#rd-go')?.addEventListener('click', async () => {
+    const url = b.querySelector('#rd-url').value;
+    const param = b.querySelector('#rd-param').value.trim();
+    const out = b.querySelector('#rd-out');
+    if (!param) { out.innerHTML = '<div class="text-muted text-sm">Enter a redirect parameter name</div>'; return; }
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 12 redirect payloads (authenticated)...</div>';
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_REDIRECT', url, param });
+    if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
+    const vulns = r.results.filter(x => x.redirectsToEvil);
+    out.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + r.results.length + ' tested</span><span class="text-sm ' + (vulns.length ? 'text-accent' : 'text-muted') + '" style="font-weight:700">' + vulns.length + ' redirects to attacker</span></div>' +
+      r.results.map(x => {
+        const sev = x.redirectsToEvil ? 'high' : x.isRedirect ? 'medium' : x.bodyCheck ? 'low' : 'info';
+        const tag = x.redirectsToEvil ? 'VULN' : x.isRedirect ? 'REDIR' : x.bodyCheck ? 'REFL' : x.status;
+        return '<div class="result-item ' + sev + '" style="cursor:pointer"><div class="result-label"><span class="result-tag tag-' + sev + '">' + tag + '</span> ' + esc(x.label) + '</div><div class="result-value">' + esc(x.payload) + '</div>' +
+          (x.isRedirect ? '<div class="text-xs ' + (x.redirectsToEvil ? 'text-accent' : 'text-muted') + '">Location: ' + esc(x.location) + '</div>' : '') +
+          (x.bodyCheck ? '<div class="text-xs" style="color:var(--warning)">' + esc(x.bodyCheck) + '</div>' : '') +
+          (x.error ? '<div class="text-xs text-muted">' + esc(x.error) + '</div>' : '') +
+          '</div>';
+      }).join('');
+    finalizeResults('offensive');
+    log('Redirect: ' + vulns.length + ' open redirects found', vulns.length ? 'warn' : 'success');
+  });
 }
 
 function toolCodec() {
@@ -1573,24 +1734,43 @@ async function toolParamFuzz() {
   b.innerHTML = '<div class="codec-row mb-4" style="border-bottom:1px solid var(--border);padding-bottom:8px"><button class="btn-sm ' + (params.length ? 'primary' : '') + '" id="fz-mode-url" style="font-weight:700">URL Params (' + params.length + ')</button><button class="btn-sm" id="fz-mode-form" style="font-weight:700">Form Fields (<span id="fz-form-count">' + countFields() + '</span>)</button></div><div id="fz-mode-content"></div>';
 
   // ═══ URL PARAMS MODE ═══
+  // Helper: parse URL params from any URL string
+  const parseUrlParams = (urlStr) => {
+    try {
+      let u;
+      try { u = new URL(urlStr); } catch { u = new URL('https://' + urlStr); }
+      return [...u.searchParams.entries()].map(([k, v]) => ({ name: k, value: v }));
+    } catch { return []; }
+  };
+
   const renderUrlMode = () => {
     const mc = b.querySelector('#fz-mode-content');
-    let html = '<div class="tool-input-row"><input class="tool-input" id="fz-url" value="' + esc(activeTabUrl) + '" placeholder="URL with params"></div>';
-    if (params.length) {
-      html += '<div class="text-xs text-muted mb-4">Select params to fuzz:</div><div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">';
-      params.forEach(p => {
-        html += '<label style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:var(--surface);border:1px solid var(--border);border-radius:4px;font-size:9px;font-family:var(--font-mono);cursor:pointer"><input type="checkbox" data-param-cb="' + esc(p) + '" checked style="margin:0;width:12px;height:12px">' + esc(p) + '</label>';
-      });
-      html += '</div><div style="margin-bottom:8px"><button class="btn-sm" id="fz-psel-all" style="font-size:8px;padding:2px 6px">All</button> <button class="btn-sm" id="fz-psel-none" style="font-size:8px;padding:2px 6px">None</button></div>';
-    } else {
-      html += '<div class="text-sm mb-6" style="color:var(--warning)">No URL params. Add ?param=value or switch to Form Fields.</div>';
-    }
-    html += '<div class="codec-row mb-4"><button class="btn-sm primary" data-fzcat="xss">XSS</button><button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button><button class="btn-sm" data-fzcat="ssti">SSTI</button><button class="btn-sm" data-fzcat="path">Path Traversal</button></div>';
-    html += '<details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary><textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea></details><div id="fz-out"></div>';
-    mc.innerHTML = html;
+    mc.innerHTML = '<div class="tool-input-row"><input class="tool-input" id="fz-url" value="' + esc(activeTabUrl) + '" placeholder="Paste any URL with params to fuzz" style="font-size:10px"></div><div id="fz-param-area"></div><div class="codec-row mb-4"><button class="btn-sm primary" data-fzcat="xss">XSS</button><button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button><button class="btn-sm" data-fzcat="ssti">SSTI</button><button class="btn-sm" data-fzcat="path">Path Traversal</button></div><details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary><textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea></details><div id="fz-out"></div>';
 
-    mc.querySelector('#fz-psel-all')?.addEventListener('click', () => mc.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = true));
-    mc.querySelector('#fz-psel-none')?.addEventListener('click', () => mc.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = false));
+    // Render param checkboxes from URL
+    const renderParamCheckboxes = (urlStr) => {
+      const area = mc.querySelector('#fz-param-area');
+      const parsed = parseUrlParams(urlStr);
+      if (!parsed.length) {
+        area.innerHTML = '<div class="text-sm mb-6" style="color:var(--warning)">No URL params detected. Add ?param=value to the URL.</div>';
+        return;
+      }
+      area.innerHTML = '<div class="text-xs text-muted mb-4">Select params to fuzz (' + parsed.length + ' detected):</div><div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">' +
+        parsed.map(p => '<label style="display:inline-flex;align-items:center;gap:3px;padding:3px 8px;background:var(--surface);border:1px solid var(--border);border-radius:4px;font-size:9px;font-family:var(--font-mono);cursor:pointer"><input type="checkbox" data-param-cb="' + esc(p.name) + '" checked style="margin:0;width:12px;height:12px"><strong>' + esc(p.name) + '</strong>' + (p.value ? '<span style="color:var(--text-tertiary)">=' + esc(p.value.slice(0, 20)) + '</span>' : '<span style="color:var(--warning)">(empty)</span>') + '</label>').join('') +
+        '</div><div style="margin-bottom:8px"><button class="btn-sm" id="fz-psel-all" style="font-size:8px;padding:2px 6px">All</button> <button class="btn-sm" id="fz-psel-none" style="font-size:8px;padding:2px 6px">None</button></div>';
+      area.querySelector('#fz-psel-all')?.addEventListener('click', () => area.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = true));
+      area.querySelector('#fz-psel-none')?.addEventListener('click', () => area.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = false));
+    };
+
+    // Initial render
+    renderParamCheckboxes(mc.querySelector('#fz-url').value);
+
+    // Dynamic re-parse on URL change (paste, type, etc.)
+    let parseTimer;
+    mc.querySelector('#fz-url').addEventListener('input', (e) => {
+      clearTimeout(parseTimer);
+      parseTimer = setTimeout(() => renderParamCheckboxes(e.target.value), 300);
+    });
 
     mc.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
       const out = mc.querySelector('#fz-out');
@@ -1631,8 +1811,9 @@ async function toolParamFuzz() {
       const hasPassword = allF.some(fi => fi.type === 'password');
       const hasFile = allF.some(fi => fi.type === 'file');
       const hasCaptcha = allF.some(fi => CAPTCHA_FIELDS.test(fi.name));
-      const label = hasPassword ? 'Login Form' : hasFile ? 'File Upload' : 'Form';
-      const icon = hasPassword ? '&#128274;' : hasFile ? '&#128193;' : '&#128221;';
+      const isVirtual = f.isVirtual;
+      const label = isVirtual ? (f.virtualLabel || 'Standalone Inputs') : hasPassword ? 'Login Form' : hasFile ? 'File Upload' : 'Form';
+      const icon = isVirtual ? '&#128269;' : hasPassword ? '&#128274;' : hasFile ? '&#128193;' : '&#128221;';
       const actionShort = f.action ? (f.action.length > 50 ? '...' + f.action.slice(-40) : f.action) : '(self)';
 
       const card = document.createElement('div');
@@ -2042,30 +2223,36 @@ async function tool403Bypass() {
 
 // ═══ HTTP METHOD TESTER ═══
 async function toolMethodTest() {
-  const b = showResults('offensive', 'Method Tester', true);
-  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 8 HTTP methods…</div>';
-  const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url: activeTabUrl });
-  if (!r.ok) { b.innerHTML = errMsg(r.error); return; }
-  const baseline = r.results[0]; // GET
-  b.innerHTML = `<div class="text-sm mb-6">${esc(activeTabUrl)}<br><span class="text-xs text-muted">Baseline GET: ${baseline.status} · ${baseline.bodyLen}b</span></div>` +
-    r.results.map(x => {
-      let sev = 'info', verdict = '';
-      if (x.error) { sev = 'info'; verdict = x.error; }
-      else if (x.baseline) { verdict = 'Baseline reference'; }
-      else if (x.traceEcho) { sev = 'high'; verdict = 'TRACE echoes request headers back — XST (Cross-Site Tracing) possible!'; }
-      else if (x.realDanger) { sev = 'high'; verdict = `${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
-      else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (${x.bodyDiff}b) — server ignores method, not a real finding`; }
-      else if (x.status === 405) { verdict = 'Method not allowed (expected)'; }
-      else if (x.status !== baseline.status) { sev = 'low'; verdict = `Different status than GET (${baseline.status})  — worth investigating`; }
-      else { verdict = 'Same as GET'; }
-      return `<div class="result-item ${sev}">
-        <div class="result-label"><span class="result-tag tag-${sev === 'high' ? 'high' : sev === 'low' ? 'low' : 'info'}">${x.status}</span> ${x.method}</div>
-        <div class="result-value">${x.bodyLen !== undefined ? x.bodyLen + 'b' : ''} ${x.allow ? '· Allow: ' + esc(x.allow) : ''}</div>
-        <div class="text-xs" style="color:var(--text-secondary)">${verdict}</div>
-        ${x.preview ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;max-height:50px;overflow:auto">${esc(x.preview)}</div>` : ''}
-      </div>`;
-    }).join('');
-  finalizeResults('offensive');
+  const b = showResults('offensive', 'Method Tester', false);
+  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="mt-url" value="${esc(activeTabUrl)}" placeholder="URL to test"><button class="btn-sm primary" id="mt-go">Test 8 Methods</button></div><div id="mt-out"></div>`;
+  const runTest = async () => {
+    const url = b.querySelector('#mt-url').value;
+    const out = b.querySelector('#mt-out');
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 8 HTTP methods (authenticated)...</div>';
+    const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url });
+    if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
+    const baseline = r.results[0];
+    out.innerHTML = `<div class="text-sm mb-6">${esc(url)}<br><span class="text-xs text-muted">Baseline GET: ${baseline.status} · ${baseline.bodyLen}b</span></div>` +
+      r.results.map(x => {
+        let sev = 'info', verdict = '';
+        if (x.error) { sev = 'info'; verdict = x.error; }
+        else if (x.baseline) { verdict = 'Baseline reference'; }
+        else if (x.traceEcho) { sev = 'high'; verdict = 'TRACE echoes request headers back — XST (Cross-Site Tracing) possible!'; }
+        else if (x.realDanger) { sev = 'high'; verdict = `${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
+        else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (${x.bodyDiff}b) — server ignores method, not a real finding`; }
+        else if (x.status === 405) { verdict = 'Method not allowed (expected)'; }
+        else if (x.status !== baseline.status) { sev = 'low'; verdict = `Different status than GET (${baseline.status})  — worth investigating`; }
+        else { verdict = 'Same as GET'; }
+        return `<div class="result-item ${sev}">
+          <div class="result-label"><span class="result-tag tag-${sev === 'high' ? 'high' : sev === 'low' ? 'low' : 'info'}">${x.status}</span> ${x.method}</div>
+          <div class="result-value">${x.bodyLen !== undefined ? x.bodyLen + 'b' : ''} ${x.allow ? '· Allow: ' + esc(x.allow) : ''}</div>
+          <div class="text-xs" style="color:var(--text-secondary)">${verdict}</div>
+          ${x.preview ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;max-height:50px;overflow:auto">${esc(x.preview)}</div>` : ''}
+        </div>`;
+      }).join('');
+    finalizeResults('offensive');
+  };
+  b.querySelector('#mt-go')?.addEventListener('click', runTest);
 }
 
 // ═══ JWT EDITOR ═══
@@ -2393,6 +2580,19 @@ function setupLiveBrowse() {
   });
 }
 
+// Debounced live scan — prevents triple-firing from tab update + SPA + DOM mutation
+function debouncedLiveScan(tabId, url, title) {
+  const now = Date.now();
+  // Skip if same URL scanned within last 2 seconds
+  if (url === liveScanLastUrl && now - liveScanLastTime < 2000) return;
+  clearTimeout(liveScanTimer);
+  liveScanTimer = setTimeout(() => {
+    liveScanLastUrl = url;
+    liveScanLastTime = Date.now();
+    liveScanPage(tabId, url, title || '');
+  }, 500);
+}
+
 async function liveScanPage(tabId, url, title) {
   const feed = document.getElementById('live-feed');
   const ts = new Date().toLocaleTimeString();
@@ -2441,6 +2641,22 @@ async function liveScanPage(tabId, url, title) {
           if (!liveSeenItems.has(key)) { liveSeenItems.add(key); newItems.push({ type: 'endpoints', icon: '🔗', text: ep }); }
         });
       }
+    } catch {}
+
+    // 2b. Runtime API endpoints from captured XHR/fetch
+    try {
+      const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId });
+      (reqRes.requests || []).slice(-30).forEach(req => {
+        if (!req.url) return;
+        try {
+          const ru = new URL(req.url);
+          if (/\.(css|js|png|jpg|gif|svg|woff|ico|map|webp)(\?|$)/i.test(ru.pathname)) return;
+          if (/google-analytics|googletagmanager|facebook\.com|doubleclick|clarity\.ms/i.test(req.url)) return;
+          const ep = ru.pathname + (ru.search || '');
+          const key = 'ep:' + ep;
+          if (!liveSeenItems.has(key) && ep.length > 3) { liveSeenItems.add(key); newItems.push({ type: 'endpoints', icon: '🔗', text: (req.method || 'GET') + ' ' + ep }); }
+        } catch {}
+      });
     } catch {}
 
     // 3. Passive vulns

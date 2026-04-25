@@ -182,6 +182,34 @@ const contentHandlers = {
       f.querySelectorAll('input,select,textarea').forEach(el => fields.push({ tag: el.tagName, name: el.name, type: el.type, value: el.value?.slice(0, 50), autocomplete: el.autocomplete || '' }));
       forms.push({ action: f.action, method: f.method, fields, id: f.id || '', enctype: f.enctype || '' });
     });
+
+    // Detect standalone inputs NOT inside any <form> (SPA search bars, AJAX inputs, React components)
+    const standaloneInputs = [];
+    document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,select').forEach(el => {
+      if (el.closest('form')) return;
+      const name = el.name || el.id || (el.getAttribute('aria-label') || '').replace(/\s+/g, '_').toLowerCase() || '';
+      if (!name) return;
+      const type = el.type || 'text';
+      const placeholder = el.placeholder || '';
+      const role = el.getAttribute('role') || '';
+      const parentClasses = (el.closest('div,section,nav,header')?.className || '').toString();
+      const isSearch = type === 'search' || role === 'searchbox' || role === 'combobox' ||
+        /search/i.test(placeholder) || /search/i.test(el.className) || /search/i.test(parentClasses);
+      standaloneInputs.push({ tag: el.tagName, name, type, value: el.value?.slice(0, 50) || '', autocomplete: el.autocomplete || '', isSearch, placeholder });
+    });
+
+    if (standaloneInputs.length) {
+      forms.push({
+        action: location.href,
+        method: 'GET',
+        fields: standaloneInputs,
+        id: '__standalone__',
+        enctype: '',
+        isVirtual: true,
+        virtualLabel: standaloneInputs.some(f => f.isSearch) ? 'Dynamic Search / AJAX Inputs' : 'Standalone Inputs (no <form> tag)'
+      });
+    }
+
     return forms;
   },
 

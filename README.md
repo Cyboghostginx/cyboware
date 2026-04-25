@@ -90,15 +90,6 @@ Real-time passive scanner. Monitors every page load for secrets, endpoints, vuln
 
 ---
 
-## Stack
-
-- Chrome Extension Manifest V3
-- Vanilla JS — no frameworks, no build step
-- Instrument Serif + DM Sans + DM Mono typography
-- Vox editorial design palette
-
----
-
 ## Privacy
 
 Everything runs locally. No data leaves your browser except when you explicitly trigger subdomain enumeration (crt.sh), DNS lookup (dns.google), or Wayback (archive.org). No analytics. No telemetry. [Full privacy policy](PRIVACY.md).

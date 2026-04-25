@@ -1,5 +1,7 @@
 # Cyboware.
 
+![cyboware](cyboware.png)
+
 **Bug bounty toolkit in your browser sidebar. 35 tools. Zero dependencies. Zero data collection.**
 
 A Chrome extension built for bug bounty hunters, pentesters, and security researchers. Everything runs locally in your browser — no accounts, no API keys, no telemetry.

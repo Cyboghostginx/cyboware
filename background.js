@@ -446,8 +446,10 @@ const handlers = {
       // Enhanced: test all payloads, not just first 4
       const maxPayloads = msg.maxPayloads || testPayloads.length;
       const maxParams = msg.maxParams || Math.min(params.length, 8);
+      const selectedParams = msg.selectedParams || null;
 
-      for (const param of params.slice(0, maxParams)) {
+      const targetParams = selectedParams ? params.filter(p => selectedParams.includes(p)) : params.slice(0, maxParams);
+      for (const param of targetParams) {
         for (const { p: payload, check, expect } of testPayloads.slice(0, maxPayloads)) {
           const testUrl = new URL(msg.url);
           testUrl.searchParams.set(param, payload);
@@ -586,7 +588,7 @@ const handlers = {
             if (r.status >= 500 && body.length < 5000) {
               errorBody = body.slice(0, 500);
             }
-            results.push({ param, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', url: testUrl.toString(), errorBody });
+            results.push({ param, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', url: testUrl.toString(), errorBody, responsePreview: body.slice(0, 600) });
           } catch (e) {
             results.push({ param, payload, severity: 'info', analysis: 'Request failed: ' + e.message, error: e.message });
           }
@@ -1061,7 +1063,7 @@ const handlers = {
 
   // ═══ FORM FIELD FUZZER — POST/GET form submission with payloads ═══
   FUZZ_FORM: async (msg, _, sr) => {
-    const { action, method, fields, payloads, category } = msg;
+    const { action, method, fields, payloads, category, selectedFields, frozenFields } = msg;
     const sqliErrors = ['sql syntax', 'mysql', 'sqlite', 'postgresql', 'ora-', 'syntax error', 'unclosed quotation', 'unterminated string', 'SQLSTATE', 'microsoft sql', 'odbc', 'jdbc', 'quoted string not properly terminated'];
     const results = [];
 
@@ -1148,7 +1150,7 @@ const handlers = {
           let errorBody = '';
           if (r.status >= 500 && body.length < 5000) errorBody = body.slice(0, 500);
 
-          results.push({ field: field.name, fieldType: field.type, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', errorBody });
+          results.push({ field: field.name, fieldType: field.type, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', errorBody, responsePreview: body.slice(0, 600), requestBody: formData.toString(), requestUrl: testUrl });
         } catch (e) {
           results.push({ field: field.name, fieldType: field.type, payload, severity: 'info', analysis: 'Request failed: ' + e.message });
         }

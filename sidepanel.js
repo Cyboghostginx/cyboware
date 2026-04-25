@@ -1554,161 +1554,165 @@ function toolDiff() {
 }
 
 // ═══ PARAMETER FUZZER ═══
+const CAPTCHA_FIELDS = /^(captcha|altcha|recaptcha|g-recaptcha|h-captcha|hcaptcha|cf-turnstile|__cf_chl|captcha_token|captcha_response|captchaAnswer)/i;
+const CSRF_FIELDS = /^(_csrf|csrf|csrftoken|csrf_token|authenticity_token|__RequestVerificationToken|_xsrf|_token|antiforgery|__VIEWSTATE|__EVENTVALIDATION)/i;
+
 async function toolParamFuzz() {
   const b = showResults('offensive', 'Param Fuzzer', false);
   const u = new URL(activeTabUrl);
   const params = [...u.searchParams.keys()];
-
   let pageForms = [];
+
   const refreshForms = async () => {
-    try {
-      const fr = await msgTab({ type: 'EXTRACT_FORMS' });
-      if (fr?.ok) pageForms = fr.data.filter(f => f.fields.length > 0);
-    } catch {}
+    try { const fr = await msgTab({ type: 'EXTRACT_FORMS' }); if (fr?.ok) pageForms = fr.data.filter(f => f.fields.length > 0); } catch {}
     return pageForms;
   };
   await refreshForms();
-  const countFields = () => pageForms.reduce((sum, f) => sum + f.fields.filter(fi => fi.name && fi.type !== 'hidden' && fi.type !== 'submit' && fi.type !== 'button').length, 0);
+  const countFields = () => pageForms.reduce((s, f) => s + f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button').length, 0);
 
-  b.innerHTML = `
-    <div class="codec-row mb-4" style="border-bottom:1px solid var(--border);padding-bottom:8px">
-      <button class="btn-sm ${params.length ? 'primary' : ''}" id="fz-mode-url" style="font-weight:700">URL Params (${params.length})</button>
-      <button class="btn-sm" id="fz-mode-form" style="font-weight:700">Form Fields (<span id="fz-form-count">${countFields()}</span>)</button>
-    </div>
-    <div id="fz-mode-content"></div>`;
+  b.innerHTML = '<div class="codec-row mb-4" style="border-bottom:1px solid var(--border);padding-bottom:8px"><button class="btn-sm ' + (params.length ? 'primary' : '') + '" id="fz-mode-url" style="font-weight:700">URL Params (' + params.length + ')</button><button class="btn-sm" id="fz-mode-form" style="font-weight:700">Form Fields (<span id="fz-form-count">' + countFields() + '</span>)</button></div><div id="fz-mode-content"></div>';
 
+  // ═══ URL PARAMS MODE ═══
   const renderUrlMode = () => {
     const mc = b.querySelector('#fz-mode-content');
-    mc.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : '<span style="color:var(--warning)">No URL params. Add ?param=value or switch to Form Fields.</span>'}</div>
-      <div class="tool-input-row"><input class="tool-input" id="fz-url" value="${esc(activeTabUrl)}" placeholder="URL with params"></div>
-      <div class="codec-row mb-4">
-        <button class="btn-sm primary" data-fzcat="xss">XSS</button>
-        <button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button>
-        <button class="btn-sm" data-fzcat="ssti">SSTI</button>
-        <button class="btn-sm" data-fzcat="path">Path Traversal</button>
-      </div>
-      <details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary>
-        <textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea>
-      </details>
-      <div id="fz-out"></div>`;
+    let html = '<div class="tool-input-row"><input class="tool-input" id="fz-url" value="' + esc(activeTabUrl) + '" placeholder="URL with params"></div>';
+    if (params.length) {
+      html += '<div class="text-xs text-muted mb-4">Select params to fuzz:</div><div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">';
+      params.forEach(p => {
+        html += '<label style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:var(--surface);border:1px solid var(--border);border-radius:4px;font-size:9px;font-family:var(--font-mono);cursor:pointer"><input type="checkbox" data-param-cb="' + esc(p) + '" checked style="margin:0;width:12px;height:12px">' + esc(p) + '</label>';
+      });
+      html += '</div><div style="margin-bottom:8px"><button class="btn-sm" id="fz-psel-all" style="font-size:8px;padding:2px 6px">All</button> <button class="btn-sm" id="fz-psel-none" style="font-size:8px;padding:2px 6px">None</button></div>';
+    } else {
+      html += '<div class="text-sm mb-6" style="color:var(--warning)">No URL params. Add ?param=value or switch to Form Fields.</div>';
+    }
+    html += '<div class="codec-row mb-4"><button class="btn-sm primary" data-fzcat="xss">XSS</button><button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button><button class="btn-sm" data-fzcat="ssti">SSTI</button><button class="btn-sm" data-fzcat="path">Path Traversal</button></div>';
+    html += '<details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary><textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea></details><div id="fz-out"></div>';
+    mc.innerHTML = html;
+
+    mc.querySelector('#fz-psel-all')?.addEventListener('click', () => mc.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = true));
+    mc.querySelector('#fz-psel-none')?.addEventListener('click', () => mc.querySelectorAll('[data-param-cb]').forEach(cb => cb.checked = false));
+
     mc.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
       const out = mc.querySelector('#fz-out');
       const url = mc.querySelector('#fz-url').value;
       const cat = btn.dataset.fzcat;
+      const selectedParams = [...mc.querySelectorAll('[data-param-cb]:checked')].map(cb => cb.dataset.paramCb);
+      if (!selectedParams.length) { out.innerHTML = '<div class="text-muted text-sm">No params selected</div>'; return; }
       const customPayloads = (mc.querySelector('#fz-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-      const isBlind = cat === 'sqli';
-      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${isBlind ? ' (includes blind timing)' : ''}...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>`;
-      const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads });
+      out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Fuzzing ' + cat.toUpperCase() + ' on ' + selectedParams.length + ' param(s)...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>';
+      const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads, selectedParams });
       if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
-      if (r.message) { out.innerHTML = `<div class="text-muted text-sm">${esc(r.message)}</div>`; return; }
+      if (r.message) { out.innerHTML = '<div class="text-muted text-sm">' + esc(r.message) + '</div>'; return; }
       renderFuzzResults(out, r, 'url');
       finalizeResults('offensive');
     }));
   };
 
+  // ═══ FORM FIELDS MODE ═══
   const renderFormMode = async () => {
     const mc = b.querySelector('#fz-mode-content');
-    mc.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning page for forms...</div>';
+    mc.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning forms...</div>';
     await refreshForms();
     const fc = b.querySelector('#fz-form-count');
     if (fc) fc.textContent = countFields();
 
     if (!pageForms.length) {
-      mc.innerHTML = `<div class="text-muted text-sm" style="padding:8px 0">No forms detected on this page.</div>
-        <div class="text-xs text-muted mb-6">Navigate to a page with forms. Dynamic forms appear after re-scanning.</div>
-        <button class="btn-sm" id="fz-rescan">Re-scan Page</button>`;
+      mc.innerHTML = '<div class="text-muted text-sm" style="padding:8px 0">No forms detected.</div><div class="text-xs text-muted mb-6">Navigate to a page with forms. Dynamic forms appear after re-scan.</div><button class="btn-sm" id="fz-rescan">Re-scan Page</button>';
       mc.querySelector('#fz-rescan')?.addEventListener('click', () => renderFormMode());
       return;
     }
 
-    mc.innerHTML = `<div class="flex-between mb-6">
-        <span class="text-sm">${pageForms.length} form${pageForms.length > 1 ? 's' : ''} detected</span>
-        <button class="btn-sm" id="fz-rescan" title="Re-scan for dynamically loaded forms">Re-scan</button>
-      </div>
-      <div id="fz-form-list"></div>
-      <div id="fz-form-detail" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
-        <div class="result-label mb-4" id="fz-form-label">Selected form</div>
-        <div class="codec-row mb-4">
-          <button class="btn-sm primary" data-ffcat="xss">XSS</button>
-          <button class="btn-sm" data-ffcat="sqli">SQLi + Blind</button>
-          <button class="btn-sm" data-ffcat="ssti">SSTI</button>
-          <button class="btn-sm" data-ffcat="path">Path Traversal</button>
-        </div>
-        <div class="text-xs text-muted mb-6" id="fz-form-hint">Payloads submitted through each field. Other fields keep defaults.</div>
-        <div id="fz-form-out"></div>
-      </div>`;
+    mc.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + pageForms.length + ' form(s)</span><button class="btn-sm" id="fz-rescan">Re-scan</button></div><div id="fz-form-list"></div><div id="fz-form-detail" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)"><div class="result-label mb-4" id="fz-form-label">Selected form</div><div class="codec-row mb-4"><button class="btn-sm primary" data-ffcat="xss">XSS</button><button class="btn-sm" data-ffcat="sqli">SQLi + Blind</button><button class="btn-sm" data-ffcat="ssti">SSTI</button><button class="btn-sm" data-ffcat="path">Path Traversal</button></div><div id="fz-form-out"></div></div>';
 
     const listEl = mc.querySelector('#fz-form-list');
-    listEl.innerHTML = pageForms.map((f, i) => {
-      const fuzzableF = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
-      const hiddenF = f.fields.filter(fi => fi.type === 'hidden');
-      const hasPassword = f.fields.some(fi => fi.type === 'password');
-      const hasFile = f.fields.some(fi => fi.type === 'file');
+    pageForms.forEach((f, i) => {
+      const allF = f.fields.filter(fi => fi.name);
+      const fuzzableF = allF.filter(fi => fi.type !== 'submit' && fi.type !== 'button');
+      const hasPassword = allF.some(fi => fi.type === 'password');
+      const hasFile = allF.some(fi => fi.type === 'file');
+      const hasCaptcha = allF.some(fi => CAPTCHA_FIELDS.test(fi.name));
       const label = hasPassword ? 'Login Form' : hasFile ? 'File Upload' : 'Form';
       const icon = hasPassword ? '&#128274;' : hasFile ? '&#128193;' : '&#128221;';
       const actionShort = f.action ? (f.action.length > 50 ? '...' + f.action.slice(-40) : f.action) : '(self)';
-      return `<div class="fz-form-card" data-form-idx="${i}" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:6px;background:var(--surface);overflow:hidden">
-        <div class="fz-form-header" data-toggle="${i}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;cursor:pointer;transition:background var(--transition)">
-          <div style="flex:1;min-width:0">
-            <div style="font-size:11px;font-weight:600;color:var(--text)">${icon} ${label} <span style="font-weight:400;color:var(--text-secondary);font-family:var(--font-mono);font-size:9.5px">${esc(f.method?.toUpperCase() || 'GET')}</span></div>
-            <div style="font-size:9.5px;color:var(--text-tertiary);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(actionShort)}</div>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
-            <span style="font-size:9px;color:var(--text-tertiary)">${fuzzableF.length} field${fuzzableF.length !== 1 ? 's' : ''}</span>
-            <span class="fz-chev" data-chev="${i}" style="font-size:10px;color:var(--text-tertiary);transition:transform var(--transition)">&#9654;</span>
-          </div>
-        </div>
-        <div class="fz-form-body" data-body="${i}" style="display:none;padding:6px 10px 10px;border-top:1px solid var(--border);background:var(--bg)">
-          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px">
-            ${fuzzableF.map(fi => {
-              const isInteresting = /password|secret|token|auth|key|admin|role|email|user/i.test(fi.name);
-              return '<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:' + (isInteresting ? 'var(--accent-soft)' : 'var(--surface)') + ';border:1px solid ' + (isInteresting ? 'var(--accent)' : 'var(--border)') + ';border-radius:4px;font-size:9px;font-family:var(--font-mono)">' + (isInteresting ? '&#127919;' : '') + '<strong>' + esc(fi.name) + '</strong> <span style="color:var(--text-tertiary)">' + (fi.type || 'text') + '</span>' + (fi.value ? ' <span style="color:var(--text-tertiary)">= ' + esc(fi.value.slice(0, 20)) + '</span>' : '') + '</span>';
-            }).join('')}
-          </div>
-          ${hiddenF.length ? '<div style="font-size:9px;color:var(--text-tertiary);margin-bottom:4px">' + hiddenF.length + ' hidden: ' + hiddenF.map(fi => esc(fi.name)).join(', ') + '</div>' : ''}
-          <button class="btn-sm primary" data-select-form="${i}" style="font-size:9px;padding:3px 8px;margin-top:4px">Select for Fuzzing</button>
-        </div>
-      </div>`;
-    }).join('');
 
-    // Collapsible toggle
-    listEl.querySelectorAll('[data-toggle]').forEach(header => {
-      header.addEventListener('click', (e) => {
-        if (e.target.closest('[data-select-form]')) return;
-        const idx = header.dataset.toggle;
-        const body = listEl.querySelector('[data-body="' + idx + '"]');
-        const chev = listEl.querySelector('[data-chev="' + idx + '"]');
+      const card = document.createElement('div');
+      card.className = 'fz-form-card';
+      card.dataset.formIdx = i;
+      card.style.cssText = 'border:1px solid var(--border);border-radius:var(--radius);margin-bottom:6px;background:var(--surface);overflow:hidden';
+
+      // Header
+      let headerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;cursor:pointer"><div style="flex:1;min-width:0"><div style="font-size:11px;font-weight:600">' + icon + ' ' + label + ' <span style="font-weight:400;color:var(--text-secondary);font-family:var(--font-mono);font-size:9.5px">' + esc(f.method?.toUpperCase() || 'GET') + '</span></div><div style="font-size:9.5px;color:var(--text-tertiary);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(actionShort) + '</div></div><div style="display:flex;align-items:center;gap:6px"><span style="font-size:9px;color:var(--text-tertiary)">' + fuzzableF.length + ' fields</span><span class="fz-chev" style="font-size:10px;color:var(--text-tertiary);transition:transform 180ms">&#9654;</span></div></div>';
+
+      // Body with checkboxes
+      let bodyHTML = '<div class="fz-form-body" style="display:none;padding:8px 10px 10px;border-top:1px solid var(--border);background:var(--bg)">';
+      if (hasCaptcha) {
+        bodyHTML += '<div style="padding:4px 8px;margin-bottom:6px;background:var(--warning-soft);border:1px solid var(--warning);border-radius:4px;font-size:9px;color:var(--warning)">&#9888; Captcha detected. Server may reject all submissions. Results show error handling only.</div>';
+      }
+      bodyHTML += '<div style="margin-bottom:6px"><button class="fz-sel-all btn-sm" style="font-size:8px;padding:1px 5px">All</button> <button class="fz-sel-none btn-sm" style="font-size:8px;padding:1px 5px">None</button> <button class="fz-sel-interesting btn-sm" style="font-size:8px;padding:1px 5px">Interesting</button></div>';
+      bodyHTML += '<div style="display:flex;flex-direction:column;gap:3px">';
+      fuzzableF.forEach(fi => {
+        const isCsrf = CSRF_FIELDS.test(fi.name);
+        const isCaptcha = CAPTCHA_FIELDS.test(fi.name);
+        const isFrozen = isCsrf || isCaptcha || fi.type === 'hidden';
+        const isInteresting = /password|secret|token|auth|key|admin|role|email|user|login|search|query|q\b|name/i.test(fi.name);
+        const defaultChecked = !isFrozen && (isInteresting || fi.type === 'text' || fi.type === 'email' || fi.type === 'password' || fi.type === 'search' || fi.type === 'tel' || fi.type === 'url' || !fi.type);
+
+        if (isFrozen) {
+          bodyHTML += '<div style="display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-hover);border:1px dashed var(--border);border-radius:4px;font-size:9px;font-family:var(--font-mono);opacity:0.6">&#128274; <span style="color:var(--text-tertiary)">' + esc(fi.name) + '</span> <span style="color:var(--text-tertiary);font-size:8px">= ' + esc((fi.value || '').slice(0, 25)) + ' (frozen)</span></div>';
+        } else {
+          bodyHTML += '<label style="display:flex;align-items:center;gap:4px;padding:2px 6px;background:' + (isInteresting ? 'var(--accent-soft)' : 'var(--surface)') + ';border:1px solid ' + (isInteresting ? 'var(--accent)' : 'var(--border)') + ';border-radius:4px;font-size:9px;font-family:var(--font-mono);cursor:pointer"><input type="checkbox" class="fz-field-cb" data-field-name="' + esc(fi.name) + '" ' + (defaultChecked ? 'checked' : '') + ' style="margin:0;width:12px;height:12px">' + (isInteresting ? '&#127919;' : '') + '<strong>' + esc(fi.name) + '</strong> <span style="color:var(--text-tertiary)">' + (fi.type || 'text') + '</span></label>';
+        }
+      });
+      bodyHTML += '</div>';
+      bodyHTML += '<button class="btn-sm primary fz-select-form" style="font-size:9px;padding:3px 8px;margin-top:8px">Select for Fuzzing</button></div>';
+
+      card.innerHTML = headerHTML + bodyHTML;
+      listEl.appendChild(card);
+
+      // Toggle
+      card.querySelector('div[style*="cursor:pointer"]').addEventListener('click', () => {
+        const body = card.querySelector('.fz-form-body');
+        const chev = card.querySelector('.fz-chev');
         const isOpen = body.style.display !== 'none';
         body.style.display = isOpen ? 'none' : 'block';
         if (chev) chev.style.transform = isOpen ? '' : 'rotate(90deg)';
       });
-    });
 
-    let selectedFormIdx = -1;
-    listEl.querySelectorAll('[data-select-form]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        selectedFormIdx = +btn.dataset.selectForm;
-        const f = pageForms[selectedFormIdx];
+      // Select all/none/interesting
+      card.querySelector('.fz-sel-all')?.addEventListener('click', () => card.querySelectorAll('.fz-field-cb').forEach(cb => cb.checked = true));
+      card.querySelector('.fz-sel-none')?.addEventListener('click', () => card.querySelectorAll('.fz-field-cb').forEach(cb => cb.checked = false));
+      card.querySelector('.fz-sel-interesting')?.addEventListener('click', () => {
+        card.querySelectorAll('.fz-field-cb').forEach(cb => {
+          cb.checked = /password|secret|token|auth|key|admin|role|email|user|login|search|query|name/i.test(cb.dataset.fieldName);
+        });
+      });
+
+      // Select for fuzzing
+      card.querySelector('.fz-select-form')?.addEventListener('click', () => {
         const det = mc.querySelector('#fz-form-detail');
         det.style.display = 'block';
-        mc.querySelector('#fz-form-label').textContent = 'Fuzzing: ' + (f.method?.toUpperCase() || 'GET') + ' -> ' + (f.action || '(self)');
-        mc.querySelector('#fz-form-hint').textContent = 'Payloads submitted through each of ' + f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button').length + ' fields via ' + (f.method?.toUpperCase() || 'GET') + '. Other fields keep defaults.';
+        det.dataset.formIdx = i;
+        mc.querySelector('#fz-form-label').textContent = 'Fuzzing: ' + (f.method?.toUpperCase() || 'GET') + ' \u2192 ' + (f.action || '(self)');
         listEl.querySelectorAll('.fz-form-card').forEach(c => c.style.borderColor = 'var(--border)');
-        const card = listEl.querySelector('[data-form-idx="' + selectedFormIdx + '"]');
-        if (card) card.style.borderColor = 'var(--accent)';
+        card.style.borderColor = 'var(--accent)';
         det.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       });
     });
 
     mc.querySelector('#fz-rescan')?.addEventListener('click', () => renderFormMode());
 
+    // Fuzz buttons
     mc.querySelectorAll('[data-ffcat]').forEach(btn => btn.addEventListener('click', async () => {
-      if (selectedFormIdx < 0) { alert('Select a form first'); return; }
-      const f = pageForms[selectedFormIdx];
+      const det = mc.querySelector('#fz-form-detail');
+      const formIdx = +det.dataset.formIdx;
+      if (isNaN(formIdx) || formIdx < 0) { alert('Select a form first'); return; }
+      const f = pageForms[formIdx];
       const cat = btn.dataset.ffcat;
       const out = mc.querySelector('#fz-form-out');
-      const isBlind = cat === 'sqli';
-      out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Fuzzing ' + f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button').length + ' fields with ' + cat.toUpperCase() + (isBlind ? ' (includes blind timing)' : '') + '...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>';
+      const card = listEl.querySelector('[data-form-idx="' + formIdx + '"]');
+      const selectedFields = card ? [...card.querySelectorAll('.fz-field-cb:checked')].map(cb => cb.dataset.fieldName) : [];
+      if (!selectedFields.length) { out.innerHTML = '<div class="text-muted text-sm">No fields selected. Check at least one field above.</div>'; return; }
+      out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Fuzzing ' + selectedFields.length + ' field(s) with ' + cat.toUpperCase() + (cat === 'sqli' ? ' (includes blind timing)' : '') + '...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>';
       const payloadSets = {
         xss: [
           { p: '<script>alert(1)</script>', check: 'unencoded_html' },
@@ -1734,11 +1738,12 @@ async function toolParamFuzz() {
           { p: '....//....//etc/passwd', check: 'file_content' },
         ],
       };
-      const testFields = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
+      const allFields = f.fields.filter(fi => fi.name);
       const action = f.action || activeTabUrl;
       const r = await chrome.runtime.sendMessage({
         type: 'FUZZ_FORM', action, method: f.method || 'GET',
-        fields: testFields, payloads: payloadSets[cat] || payloadSets.xss, category: cat
+        fields: allFields, payloads: payloadSets[cat] || payloadSets.xss, category: cat,
+        selectedFields
       });
       if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
       renderFuzzResults(out, r, 'form');
@@ -1746,28 +1751,90 @@ async function toolParamFuzz() {
     }));
   };
 
+  // ═══ EXPANDABLE RESULTS (shared) ═══
   const renderFuzzResults = (out, r, mode) => {
     const critical = r.results.filter(x => x.severity === 'high');
     const warnings = r.results.filter(x => x.severity === 'medium' || x.severity === 'low');
     const fieldKey = mode === 'form' ? 'field' : 'param';
-    out.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + r.results.length + ' tests' + (r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ' payloads)' : '') + (r.baselineLen ? ' baseline: ' + r.baselineLen + 'b' : '') + (r.baselineTime ? ' ' + (r.baselineTime / 1000).toFixed(1) + 's' : '') + (r.method ? ' ' + r.method : '') + '</span><span class="text-sm"><span class="' + (critical.length ? 'text-accent' : 'text-muted') + '" style="font-weight:700">' + critical.length + ' critical</span>, ' + warnings.length + ' warnings</span></div><div class="codec-row mb-4"><button class="btn-sm" id="fz-show-all">All (' + r.results.length + ')</button><button class="btn-sm" id="fz-show-vuln">Findings (' + (critical.length + warnings.length) + ')</button><button class="btn-sm" id="fz-show-safe">Safe (' + r.results.filter(x => x.severity === 'safe').length + ')</button></div><div id="fz-results-list"></div>';
+    const safeCount = r.results.filter(x => x.severity === 'safe').length;
+
+    let html = '<div class="flex-between mb-6"><span class="text-sm">' + r.results.length + ' tests' + (r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ')' : '') + (r.baselineLen ? ' \u00b7 ' + r.baselineLen + 'b' : '') + (r.baselineTime ? ' \u00b7 ' + (r.baselineTime / 1000).toFixed(1) + 's' : '') + '</span><span class="text-sm"><span class="' + (critical.length ? 'text-accent' : 'text-muted') + '" style="font-weight:700">' + critical.length + ' critical</span>, ' + warnings.length + ' warn</span></div>';
+    html += '<div class="codec-row mb-4"><button class="btn-sm fz-filter" data-f="all">All (' + r.results.length + ')</button><button class="btn-sm fz-filter" data-f="vuln">Findings (' + (critical.length + warnings.length) + ')</button><button class="btn-sm fz-filter" data-f="safe">Safe (' + safeCount + ')</button></div>';
+    html += '<div id="fz-results-list"></div>';
+    out.innerHTML = html;
+
     const renderList = (filter) => {
       const items = filter === 'vuln' ? r.results.filter(x => x.severity !== 'safe' && x.severity !== 'info') : filter === 'safe' ? r.results.filter(x => x.severity === 'safe') : r.results;
-      out.querySelector('#fz-results-list').innerHTML = items.map(x => {
-        const sevColor = x.severity === 'high' ? 'high' : x.severity === 'medium' ? 'medium' : x.severity === 'low' ? 'low' : 'info';
+      const listEl = out.querySelector('#fz-results-list');
+      listEl.innerHTML = '';
+      items.forEach((x, idx) => {
+        const sev = x.severity === 'high' ? 'high' : x.severity === 'medium' ? 'medium' : x.severity === 'low' ? 'low' : 'info';
         const tagClass = x.severity === 'high' ? 'tag-high' : x.severity === 'medium' ? 'tag-medium' : x.severity === 'low' ? 'tag-low' : 'tag-safe';
         const tagText = x.severity === 'high' ? 'VULN' : x.severity === 'medium' ? 'WARN' : x.severity === 'low' ? 'NOTE' : 'SAFE';
         const target = x[fieldKey] || x.field || x.param || '?';
-        return '<div class="result-item ' + sevColor + '" style="cursor:pointer"><div class="result-label"><span class="result-tag ' + tagClass + '">' + tagText + '</span> ' + esc(target) + (x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : '') + '</div><div class="result-value" style="margin-bottom:3px">' + esc(x.payload) + '</div><div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">' + esc(x.analysis) + '</div>' + (x.status ? '<div class="text-xs text-muted">HTTP ' + x.status + ' ' + x.bodyLen + 'b' + (x.elapsed ? ' ' + (x.elapsed / 1000).toFixed(1) + 's' : '') + '</div>' : '') + (x.context ? '<div style="margin-top:4px;padding:4px 6px;background:' + (x.severity==='high'?'var(--danger-soft)':'var(--surface-hover)') + ';border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:70px;overflow:auto">' + esc(x.context) + '</div>' : '') + (x.errorBody ? '<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:80px;overflow:auto"><strong>Error:</strong><br>' + esc(x.errorBody.slice(0,400)) + '</div>' : '') + '</div>';
-      }).join('') || '<div class="text-muted text-sm">No results in this filter</div>';
+
+        const item = document.createElement('div');
+        item.className = 'result-item ' + sev;
+        item.style.cursor = 'pointer';
+
+        // Summary row
+        let summaryHTML = '<div class="result-label"><span class="result-tag ' + tagClass + '">' + tagText + '</span> ' + esc(target) + (x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : '') + '<span style="float:right;font-size:9px;color:var(--text-tertiary)">&#9660;</span></div>';
+        summaryHTML += '<div class="result-value" style="margin-bottom:3px">' + esc(x.payload) + '</div>';
+        summaryHTML += '<div class="text-xs" style="color:var(--text-secondary)">' + esc(x.analysis) + '</div>';
+        if (x.status) summaryHTML += '<div class="text-xs text-muted">HTTP ' + x.status + ' \u00b7 ' + x.bodyLen + 'b' + (x.elapsed ? ' \u00b7 ' + (x.elapsed / 1000).toFixed(1) + 's' : '') + '</div>';
+
+        // Detail drawer (hidden by default)
+        let detailHTML = '<div class="fz-detail" style="display:none;margin-top:6px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:4px">';
+        if (x.context) detailHTML += '<div class="result-label mb-4">Reflection Context</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:60px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.context) + '</pre>';
+        if (x.requestBody || x.requestUrl || x.url) {
+          detailHTML += '<div class="result-label mt-6 mb-4">Request</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.requestBody || x.url || '') + '</pre>';
+        }
+        if (x.responsePreview) {
+          detailHTML += '<div class="result-label mt-6 mb-4">Response (first 600b)</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.responsePreview) + '</pre>';
+        }
+        if (x.errorBody) {
+          detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
+        }
+        detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap"><button class="btn-sm fz-copy-curl">Copy cURL</button><button class="btn-sm fz-copy-resp">Copy Response</button><button class="btn-sm fz-copy-url">Copy URL</button></div>';
+        detailHTML += '</div>';
+
+        item.innerHTML = summaryHTML + detailHTML;
+        listEl.appendChild(item);
+
+        // Toggle detail on click
+        item.addEventListener('click', (e) => {
+          if (e.target.closest('button')) return;
+          const det = item.querySelector('.fz-detail');
+          const arrow = item.querySelector('.result-label span[style*="float:right"]');
+          const isOpen = det.style.display !== 'none';
+          det.style.display = isOpen ? 'none' : 'block';
+          if (arrow) arrow.innerHTML = isOpen ? '&#9660;' : '&#9650;';
+        });
+
+        // cURL copy
+        item.querySelector('.fz-copy-curl')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const url = x.requestUrl || x.url || '';
+          let curl = 'curl';
+          if (x.requestBody && mode === 'form') {
+            curl += " -X POST -d '" + (x.requestBody || '') + "'";
+            curl += " '" + (x.requestUrl || action || '') + "'";
+          } else {
+            curl += " '" + url + "'";
+          }
+          copyText(curl);
+        });
+        item.querySelector('.fz-copy-resp')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.responsePreview || x.errorBody || ''); });
+        item.querySelector('.fz-copy-url')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.requestUrl || x.url || ''); });
+      });
+      if (!items.length) listEl.innerHTML = '<div class="text-muted text-sm">No results in this filter</div>';
     };
     renderList('all');
-    out.querySelector('#fz-show-all')?.addEventListener('click', () => renderList('all'));
-    out.querySelector('#fz-show-vuln')?.addEventListener('click', () => renderList('vuln'));
-    out.querySelector('#fz-show-safe')?.addEventListener('click', () => renderList('safe'));
+    out.querySelectorAll('.fz-filter').forEach(btn => btn.addEventListener('click', () => renderList(btn.dataset.f)));
     log('Fuzz: ' + critical.length + ' critical, ' + warnings.length + ' warnings', critical.length ? 'warn' : 'success');
   };
 
+  // Mode switching
   b.querySelector('#fz-mode-url').addEventListener('click', () => {
     b.querySelector('#fz-mode-url').classList.add('primary');
     b.querySelector('#fz-mode-form').classList.remove('primary');

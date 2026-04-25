@@ -1383,7 +1383,7 @@ async function toolReplayer() {
   b.querySelector('#rp-clear')?.addEventListener('click', async () => {
     // Clear captured requests for this tab
     await chrome.runtime.sendMessage({ type: 'CLEAR_CAPTURED_REQUESTS', tabId: activeTabId });
-    b.querySelector('.results-body').innerHTML = '<div class="text-muted text-sm">Cleared. Browse to capture new requests.</div>';
+    b.innerHTML = '<div class="text-muted text-sm">Cleared. Browse to capture new requests.</div>';
     log('Replayer cleared', 'success');
   });
   finalizeResults('offensive');

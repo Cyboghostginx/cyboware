@@ -611,26 +611,31 @@ async function toolCookies() {
   const cookies = res.cookies;
   // Fingerprint session technology
   const techMap = { 'PHPSESSID': 'PHP', 'JSESSIONID': 'Java', 'connect.sid': 'Express/Node.js', '_session_id': 'Rails', '_app_session': 'Rails', 'csrftoken': 'Django', '.AspNetCore': '.NET Core', 'ASP.NET_SessionId': 'ASP.NET', 'CFID': 'ColdFusion', 'CFTOKEN': 'ColdFusion', 'laravel_session': 'Laravel', 'wp-settings': 'WordPress', '__cfduid': 'Cloudflare', '_ak_': 'Akamai', 'ak_bmsc': 'Akamai' };
+  const authPatterns = /^(session|sess|sid|ssid|token|auth|jwt|access|connect\.sid|PHPSESSID|JSESSIONID|_session|ASP\.NET_SessionId|laravel_session|__Host-|__Secure-|_identity|remember|login|user_session|_csrf|csrftoken)/i;
   const detectedTech = []; const securityIssues = []; const jwtCookies = [];
+  let authCookie = null;
   cookies.forEach(c => {
-    // Tech fingerprinting
     for (const [pattern, tech] of Object.entries(techMap)) {
       if (c.name.includes(pattern) || c.name.startsWith(pattern)) { if (!detectedTech.includes(tech)) detectedTech.push(tech); }
     }
-    // JWT detection
     if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(c.value)) jwtCookies.push(c.name);
-    // Security flags
     if (!c.httpOnly) securityIssues.push(`${c.name}: missing HttpOnly`);
     if (!c.secure) securityIssues.push(`${c.name}: missing Secure`);
     if (c.sameSite === 'unspecified' || c.sameSite === 'none') securityIssues.push(`${c.name}: SameSite=${c.sameSite || 'unspecified'}`);
-    // Expiry analysis
     if (c.expirationDate) {
       const daysUntilExpiry = Math.floor((c.expirationDate * 1000 - Date.now()) / 86400000);
       if (daysUntilExpiry > 365) securityIssues.push(`${c.name}: expires in ${daysUntilExpiry} days (excessive)`);
     }
+    // Identify likely auth cookie (prioritize by: HttpOnly + long value + name pattern)
+    if (authPatterns.test(c.name) && c.value.length > 10) {
+      if (!authCookie || (c.httpOnly && !authCookie.httpOnly) || c.value.length > authCookie.value.length)
+        authCookie = c;
+    }
   });
 
   let infoHtml = '';
+  // Auth status banner with test button
+  infoHtml += `<div class="result-item info" id="auth-banner"><div class="result-label">🔐 Auth Status</div><div class="result-value" id="auth-status">${authCookie ? `Likely session cookie: <strong>${esc(authCookie.name)}</strong>` : 'No session cookie pattern detected'} <button class="btn-sm primary" id="btn-test-auth" style="padding:1px 6px;font-size:9px;margin-left:4px">Test Auth</button></div></div>`;
   if (detectedTech.length) infoHtml += `<div class="result-item info"><div class="result-label">🔍 Session Technology</div><div class="result-value">${detectedTech.join(', ')}</div></div>`;
   if (jwtCookies.length) infoHtml += `<div class="result-item medium"><div class="result-label">🎟 JWT in Cookies</div><div class="result-value">${jwtCookies.join(', ')} — try JWT Editor to decode & forge</div></div>`;
   if (securityIssues.length) infoHtml += `<div class="result-item ${securityIssues.length > 3 ? 'high' : 'medium'}"><div class="result-label">⚠ Security Issues (${securityIssues.length})</div><div class="result-value" style="font-size:9.5px">${securityIssues.slice(0,8).join('<br>')}</div></div>`;
@@ -638,15 +643,23 @@ async function toolCookies() {
   b.innerHTML = `${infoHtml}<div class="flex-between mb-6 mt-6"><span class="text-sm">${cookies.length} cookies</span></div>
     <div style="overflow-x:auto"><table class="cookie-table">
     <tr><th>Name</th><th>Value</th><th></th></tr>
-    ${cookies.map((c, i) => `<tr>
-      <td title="${esc(c.name)}" style="font-weight:600;color:var(--text)">${esc(c.name)}</td>
-      <td title="${esc(c.value)}" style="max-width:140px">${esc(c.value.slice(0, 45))}</td>
+    ${cookies.map((c, i) => {
+      const isAuth = authCookie && c.name === authCookie.name;
+      return `<tr data-ci="${i}" style="cursor:pointer${isAuth ? ';background:var(--accent-soft)' : ''}">
+      <td title="${esc(c.name)}" style="font-weight:600;color:var(--text)">${isAuth ? '🔐 ' : ''}${esc(c.name)}</td>
+      <td title="${esc(c.value)}" style="max-width:140px">${esc(c.value.slice(0, 45))}${c.value.length > 45 ? '…' : ''}</td>
       <td style="white-space:nowrap">
         <button class="btn-sm cookie-cp" data-ci="${i}" style="padding:2px 5px;font-size:9px">Copy</button>
         <button class="btn-sm cookie-del" data-ci="${i}" style="padding:2px 5px;font-size:9px;color:var(--danger)">Del</button>
       </td>
-    </tr>`).join('')}
+    </tr>`;
+    }).join('')}
     </table></div>
+    <div id="ck-detail" style="display:none;margin-top:8px;padding:8px;background:var(--surface-hover);border:1px solid var(--border);border-radius:var(--radius)">
+      <div class="flex-between mb-4"><span class="text-sm" style="font-weight:600" id="ck-det-name"></span><button class="btn-sm" id="ck-det-copy" style="padding:1px 6px;font-size:9px">Copy Value</button></div>
+      <textarea class="tool-input" id="ck-det-val" rows="3" readonly style="font-size:9.5px;word-break:break-all;resize:vertical"></textarea>
+      <div class="text-xs text-muted mt-4" id="ck-det-flags"></div>
+    </div>
     <div class="result-label mt-6 mb-4">Edit / Add Cookie</div>
     <div class="tool-input-row"><input class="tool-input" id="ck-name" placeholder="Cookie name" style="width:40%"><input class="tool-input" id="ck-val" placeholder="Cookie value"></div>
     <div class="tool-input-row">
@@ -655,8 +668,70 @@ async function toolCookies() {
       <button class="btn-sm" id="ck-json">Copy JSON</button>
       <button class="btn-sm" id="ck-all">Copy name=val</button>
     </div>`;
+
+  // Test auth button — tests each cookie individually
+  b.querySelector('#btn-test-auth')?.addEventListener('click', async () => {
+    const btn = b.querySelector('#btn-test-auth');
+    btn.textContent = 'Testing each cookie…'; btn.disabled = true;
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_AUTH', url: activeTabUrl, cookies: cookies.map(c => ({ name: c.name, value: c.value })) });
+    const banner = b.querySelector('#auth-banner');
+    if (!r.ok) { btn.textContent = 'Failed'; btn.disabled = false; return; }
+    const authCookies = (r.results || []).filter(x => x.significant);
+    const notNeeded = (r.results || []).filter(x => !x.significant && x.role !== 'unknown');
+
+    if (r.siteUsesAuth && authCookies.length) {
+      banner.className = 'result-item high';
+      banner.querySelector('.result-value').innerHTML = `<strong>Authenticated session</strong> (${r.baseStatus}/${r.baseLen}b with cookies, ${r.noStatus}/${r.noLen}b without)<br>` +
+        `<span style="color:var(--accent);font-weight:600">${authCookies.length} required for auth:</span> ` +
+        authCookies.map(c => `<code style="background:var(--accent-soft);padding:1px 4px;border-radius:2px;font-size:9px">${esc(c.name)}</code>`).join(' ') +
+        `<br><button class="btn-sm primary" id="btn-copy-auth" style="padding:2px 8px;font-size:9px;margin-top:4px">Copy Auth Cookies</button>` +
+        (notNeeded.length ? `<br><span class="text-xs text-muted">${notNeeded.length} cookies not needed for auth</span>` : '');
+      // Highlight auth rows in table
+      b.querySelectorAll('tr').forEach(tr => {
+        const name = tr.querySelector('td')?.textContent?.replace('🔐 ', '');
+        if (authCookies.some(c => c.name === name)) tr.style.background = 'var(--accent-soft)';
+        else if (notNeeded.some(c => c.name === name)) tr.style.opacity = '0.5';
+      });
+      b.querySelector('#btn-copy-auth')?.addEventListener('click', () => {
+        const authOnly = cookies.filter(c => authCookies.some(a => a.name === c.name));
+        copyText(authOnly.map(c => c.name + '=' + c.value).join('; '));
+      });
+    } else if (r.siteUsesAuth) {
+      banner.className = 'result-item medium';
+      banner.querySelector('.result-value').innerHTML = `<strong>Auth detected but no single cookie is responsible</strong> (may need a combination)`;
+    } else {
+      banner.className = 'result-item info';
+      banner.querySelector('.result-value').innerHTML = `<strong>No cookie-based auth detected</strong> — page responds identically with and without cookies (SPA may use JS-based auth via localStorage)`;
+    }
+  });
   // Per-cookie copy
-  b.querySelectorAll('.cookie-cp').forEach(btn => btn.addEventListener('click', () => { const c = cookies[+btn.dataset.ci]; copyText(c.name + '=' + c.value); }));
+  b.querySelectorAll('.cookie-cp').forEach(btn => btn.addEventListener('click', (e) => { e.stopPropagation(); const c = cookies[+btn.dataset.ci]; copyText(c.name + '=' + c.value); }));
+  // Click row to show detail
+  b.querySelectorAll('tr[data-ci]').forEach(tr => tr.addEventListener('click', () => {
+    const c = cookies[+tr.dataset.ci];
+    const det = b.querySelector('#ck-detail');
+    det.style.display = 'block';
+    b.querySelector('#ck-det-name').textContent = c.name;
+    b.querySelector('#ck-det-val').value = c.value;
+    const flags = [];
+    flags.push(`Domain: ${c.domain}`);
+    flags.push(`Path: ${c.path}`);
+    flags.push(`HttpOnly: ${c.httpOnly ? '✓' : '✗'}`);
+    flags.push(`Secure: ${c.secure ? '✓' : '✗'}`);
+    flags.push(`SameSite: ${c.sameSite || 'unspecified'}`);
+    if (c.expirationDate) {
+      const exp = new Date(c.expirationDate * 1000);
+      const days = Math.floor((c.expirationDate * 1000 - Date.now()) / 86400000);
+      flags.push(`Expires: ${exp.toLocaleDateString()} (${days}d)`);
+    } else { flags.push('Session cookie (no expiry)'); }
+    b.querySelector('#ck-det-flags').textContent = flags.join(' · ');
+    // Pre-fill edit fields
+    b.querySelector('#ck-name').value = c.name;
+    b.querySelector('#ck-val').value = c.value;
+  }));
+  b.querySelector('#ck-det-copy')?.addEventListener('click', () => {
+    copyText(b.querySelector('#ck-det-val').value);
+  });
   // Per-cookie delete
   b.querySelectorAll('.cookie-del').forEach(btn => btn.addEventListener('click', async () => {
     const c = cookies[+btn.dataset.ci];
@@ -804,7 +879,7 @@ async function toolReqResp() {
     if (r.ok) {
       let respText = `HTTP/1.1 ${r.status} ${r.statusText}\r\n`;
       Object.entries(r.headers).forEach(([k,v]) => { respText += `${k}: ${v}\r\n`; });
-      respText += `\r\n${r.text.slice(0, 3000)}`;
+      respText += `\r\n${r.text}`;
       out.textContent = respText;
     } else {
       out.textContent = 'Error: ' + r.error;
@@ -997,22 +1072,73 @@ async function toolHidden() {
   const comments = await msgTab({ type: 'FIND_COMMENTS' });
   if (!res?.ok) { b.innerHTML = errMsg(res?.error||'Cannot access page'); return; }
   const d = res.data; const total = d.hiddenInputs.length+d.hiddenDivs.length+d.disabledInputs.length+d.dataAttrs.length+(comments.data?.length||0);
-  let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div><div class="flex-between mb-6"><span class="text-sm">${total} hidden items</span><button class="btn-sm primary" id="btn-reveal">Reveal All</button></div>`;
+  let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div><div class="flex-between mb-6"><span class="text-sm">${total} hidden items</span><div><button class="btn-sm primary" id="btn-reveal">Reveal All</button> <button class="btn-sm" id="btn-unreveal" style="display:none">Undo Reveal</button></div></div>`;
   const securityNames = /admin|debug|role|price|is_?admin|is_?staff|privilege|permission|internal|secret|token|api_?key|password|hidden_?id|user_?id|account/i;
+
+  // Hidden inputs
   if(d.hiddenInputs.length) {
     html += `<div class="result-label mt-4 mb-4">Hidden Inputs (${d.hiddenInputs.length})</div>`;
     html += d.hiddenInputs.map(h => {
       const isSecurity = securityNames.test(h.name) || securityNames.test(h.value);
       return `<div class="result-item ${isSecurity?'high':'medium'}" style="cursor:pointer">
         <div class="result-value">${isSecurity?'🎯 ':''}${esc(h.name)} = ${esc(h.value)}</div>
+        ${h.form ? `<div class="text-xs text-muted">Form: ${esc(h.form)}</div>` : ''}
         ${isSecurity ? `<div class="text-xs text-accent">Security-relevant — try modifying this value</div>` : ''}
       </div>`;
     }).join('');
   }
-  if(d.dataAttrs.length) { html += `<div class="result-label mt-4 mb-4">Data Attributes (${d.dataAttrs.length})</div>`; html += d.dataAttrs.slice(0,20).map(a=>`<div class="result-item low" style="cursor:pointer"><div class="result-value">${esc(a.attr)} = ${esc(a.value)}</div></div>`).join(''); }
-  if(comments.data?.length) { html += `<div class="result-label mt-4 mb-4">Comments (${comments.data.length})</div>`; html += comments.data.slice(0,20).map(c=>`<div class="result-item info"><div class="result-value">${esc(c.slice(0,120))}</div></div>`).join(''); }
+
+  // Hidden divs
+  if(d.hiddenDivs.length) {
+    html += `<div class="result-label mt-4 mb-4">Hidden Elements (${d.hiddenDivs.length})</div>`;
+    html += d.hiddenDivs.slice(0, 25).map(h => {
+      const isSecurity = securityNames.test(h.id) || securityNames.test(h.class) || securityNames.test(h.text);
+      return `<div class="result-item ${isSecurity?'medium':'low'}" style="cursor:pointer">
+        <div class="result-label">${esc(h.tag)}${h.id ? '#' + esc(h.id) : ''}${h.class?.trim() ? '.' + esc(h.class.trim().split(' ')[0]) : ''}</div>
+        <div class="result-value">${esc(h.text)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // Disabled inputs
+  if(d.disabledInputs.length) {
+    html += `<div class="result-label mt-4 mb-4">Disabled Fields (${d.disabledInputs.length})</div>`;
+    html += d.disabledInputs.map(h => {
+      return `<div class="result-item low" style="cursor:pointer">
+        <div class="result-value">${esc(h.tag)} [${esc(h.type||'text')}] ${esc(h.name)} = ${esc(h.value)}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // Data attributes
+  if(d.dataAttrs.length) {
+    html += `<div class="result-label mt-4 mb-4">Data Attributes (${d.dataAttrs.length})</div>`;
+    html += d.dataAttrs.slice(0,20).map(a => `<div class="result-item low" style="cursor:pointer"><div class="result-value">${esc(a.attr)} = ${esc(a.value)}</div></div>`).join('');
+  }
+
+  // Comments
+  if(comments.data?.length) {
+    html += `<div class="result-label mt-4 mb-4">Comments (${comments.data.length})</div>`;
+    html += comments.data.slice(0,20).map(c => `<div class="result-item info"><div class="result-value">${esc(c.slice(0,120))}</div></div>`).join('');
+  }
+
   b.innerHTML = html;
-  b.querySelector('#btn-reveal')?.addEventListener('click', async()=>{await msgTab({type:'REVEAL_HIDDEN'});log('Revealed','success')});
+
+  // Reveal toggle
+  const revealBtn = b.querySelector('#btn-reveal');
+  const unrevealBtn = b.querySelector('#btn-unreveal');
+  revealBtn?.addEventListener('click', async () => {
+    await msgTab({ type: 'REVEAL_HIDDEN' });
+    revealBtn.style.display = 'none';
+    unrevealBtn.style.display = 'inline-block';
+    log('Hidden elements revealed on page', 'success');
+  });
+  unrevealBtn?.addEventListener('click', async () => {
+    await msgTab({ type: 'UNREVEAL_HIDDEN' });
+    unrevealBtn.style.display = 'none';
+    revealBtn.style.display = 'inline-block';
+    log('Reveal undone (reload page for full restore)', 'success');
+  });
   finalizeResults('discovery');
 }
 
@@ -1073,7 +1199,7 @@ async function toolReplayer() {
     // Pre-fill headers if available
     if(r.requestHeaders){try{const h={};r.requestHeaders.forEach(rh=>{if(!['host','connection','content-length','accept-encoding'].includes(rh.name.toLowerCase()))h[rh.name]=rh.value});b.querySelector('#rp-h').value=JSON.stringify(h,null,2)}catch{}}
   }));
-  b.querySelector('#rp-send')?.addEventListener('click',async()=>{let h={};try{h=JSON.parse(b.querySelector('#rp-h').value)}catch{};const r=await chrome.runtime.sendMessage({type:'REPLAY_REQUEST',url:b.querySelector('#rp-u').value,method:b.querySelector('#rp-m').value,headers:h,body:b.querySelector('#rp-b').value||undefined});b.querySelector('#rp-out').textContent=r.ok?`HTTP ${r.status}\n${JSON.stringify(r.headers,null,2)}\n\n${r.text.slice(0,2000)}`:'Error: '+r.error});
+  b.querySelector('#rp-send')?.addEventListener('click',async()=>{let h={};try{h=JSON.parse(b.querySelector('#rp-h').value)}catch{};const r=await chrome.runtime.sendMessage({type:'REPLAY_REQUEST',url:b.querySelector('#rp-u').value,method:b.querySelector('#rp-m').value,headers:h,body:b.querySelector('#rp-b').value||undefined});b.querySelector('#rp-out').textContent=r.ok?`HTTP ${r.status}\n${JSON.stringify(r.headers,null,2)}\n\n${r.text}`:'Error: '+r.error});
   b.querySelector('#rp-curl')?.addEventListener('click',()=>{
     const m=b.querySelector('#rp-m').value, u=b.querySelector('#rp-u').value, bd=b.querySelector('#rp-b').value;
     let cmd=`curl -X ${m} '${u}'`;

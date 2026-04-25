@@ -81,9 +81,9 @@ const contentHandlers = {
     const r = { hiddenInputs: [], hiddenDivs: [], disabledInputs: [], dataAttrs: [] };
     document.querySelectorAll('input[type="hidden"]').forEach(el =>
       r.hiddenInputs.push({ name: el.name, value: el.value, form: el.form?.action || '' }));
-    document.querySelectorAll('[style*="display: none"],[style*="display:none"],[style*="visibility: hidden"],[style*="visibility:hidden"],.hidden,[hidden]').forEach(el => {
+    document.querySelectorAll('[style*="display: none"],[style*="display:none"],[style*="visibility: hidden"],[style*="visibility:hidden"],.hidden,.d-none,.sr-only,.visually-hidden,[hidden],[aria-hidden="true"]').forEach(el => {
       const t = el.textContent?.trim().slice(0, 100);
-      if (t && t.length > 2) r.hiddenDivs.push({ tag: el.tagName, id: el.id, class: el.className?.toString().slice(0, 50), text: t });
+      if (t && t.length > 1) r.hiddenDivs.push({ tag: el.tagName, id: el.id || '', class: (el.className?.toString() || '').slice(0, 50), text: t });
     });
     document.querySelectorAll('input[disabled],select[disabled],textarea[disabled]').forEach(el =>
       r.disabledInputs.push({ tag: el.tagName, name: el.name, value: el.value, type: el.type }));
@@ -96,15 +96,24 @@ const contentHandlers = {
   },
 
   REVEAL_HIDDEN: () => {
-    document.querySelectorAll('[style*="display: none"],[style*="display:none"],[style*="visibility: hidden"],[style*="visibility:hidden"],.hidden,[hidden]').forEach(el => {
+    document.body.classList.add('cyboware-revealed');
+    document.querySelectorAll('[style*="display: none"],[style*="display:none"],[style*="visibility: hidden"],[style*="visibility:hidden"],.hidden,.d-none,.sr-only,.visually-hidden,[hidden],[aria-hidden="true"]').forEach(el => {
       el.style.setProperty('display', 'block', 'important');
       el.style.setProperty('visibility', 'visible', 'important');
       el.style.setProperty('opacity', '1', 'important');
       el.removeAttribute('hidden');
       el.style.outline = '2px dashed #C4392D';
     });
-    document.querySelectorAll('input[type="hidden"]').forEach(el => { el.type = 'text'; el.style.cssText = 'border:2px dashed #C4392D;padding:4px;margin:2px;background:#fff3f3'; });
+    document.querySelectorAll('input[type="hidden"]').forEach(el => { el.dataset.cyboOrigType = 'hidden'; el.type = 'text'; el.style.cssText = 'border:2px dashed #C4392D;padding:4px;margin:2px;background:#fff3f3'; });
     document.querySelectorAll('input[disabled],select[disabled],textarea[disabled]').forEach(el => { el.disabled = false; el.style.outline = '2px dashed #2D7D46'; });
+    return true;
+  },
+  UNREVEAL_HIDDEN: () => {
+    document.body.classList.remove('cyboware-revealed');
+    // Restore hidden inputs
+    document.querySelectorAll('[data-cybo-orig-type="hidden"]').forEach(el => { el.type = 'hidden'; el.style.cssText = ''; delete el.dataset.cyboOrigType; });
+    // Remove outlines (can't perfectly restore display:none, so reload is better)
+    document.querySelectorAll('[style*="2px dashed"]').forEach(el => { el.style.outline = ''; });
     return true;
   },
 

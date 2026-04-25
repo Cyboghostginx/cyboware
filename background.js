@@ -191,8 +191,8 @@ const handlers = {
       // Build response string
       let resStr = `HTTP/1.1 ${r.status} ${r.statusText}\r\n`;
       Object.entries(respHeaders).forEach(([k, v]) => { resStr += `${k}: ${v}\r\n`; });
-      resStr += `\r\n${text.slice(0, 5000)}`;
-      sr({ ok: true, request: reqStr, response: resStr, status: r.status, headers: respHeaders, body: text.slice(0, 5000) });
+      resStr += `\r\n${text}`;
+      sr({ ok: true, request: reqStr, response: resStr, status: r.status, headers: respHeaders, body: text });
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -209,6 +209,59 @@ const handlers = {
   DELETE_COOKIE: async (msg, _, sr) => {
     try { await chrome.cookies.remove({ url: msg.url, name: msg.name }); sr({ ok: true }); }
     catch (e) { sr({ ok: false, error: e.message }); }
+  },
+
+  // Test which cookies are needed for auth by removing each one individually
+  TEST_AUTH: async (msg, _, sr) => {
+    try {
+      const cookies = msg.cookies || [];
+      if (!cookies.length) { sr({ ok: false, error: 'No cookies' }); return; }
+      // Build full cookie string
+      const fullCookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+      // Baseline: request with ALL cookies
+      const baseline = await fetch(msg.url, {
+        credentials: 'omit',
+        headers: { 'Cookie': fullCookieStr },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(6000)
+      });
+      const baseStatus = baseline.status;
+      const baseBody = await baseline.text();
+      const baseLen = baseBody.length;
+      // No-cookie baseline
+      const noCookie = await fetch(msg.url, {
+        credentials: 'omit',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(6000)
+      });
+      const noStatus = noCookie.status;
+      const noBody = await noCookie.text();
+      const noLen = noBody.length;
+      // Test each cookie by removing it
+      const results = [];
+      for (let i = 0; i < cookies.length; i += 5) {
+        const batch = cookies.slice(i, i + 5);
+        const promises = batch.map(async (c) => {
+          const without = cookies.filter(x => x.name !== c.name).map(x => `${x.name}=${x.value}`).join('; ');
+          try {
+            const r = await fetch(msg.url, {
+              credentials: 'omit',
+              headers: without ? { 'Cookie': without } : {},
+              redirect: 'manual',
+              signal: AbortSignal.timeout(5000)
+            });
+            const body = await r.text();
+            const statusChanged = r.status !== baseStatus;
+            const bodyDiff = Math.abs(body.length - baseLen);
+            const significant = statusChanged || bodyDiff > 200;
+            return { name: c.name, status: r.status, bodyLen: body.length, statusChanged, bodyDiff, significant, role: significant ? 'auth' : 'not-needed' };
+          } catch { return { name: c.name, status: 'err', significant: false, role: 'unknown' }; }
+        });
+        const batch_results = await Promise.all(promises);
+        results.push(...batch_results);
+      }
+      sr({ ok: true, baseStatus, baseLen, noStatus, noLen, siteUsesAuth: baseStatus !== noStatus || Math.abs(baseLen - noLen) > 200, results });
+    } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
   GET_TABS: async (_, __, sr) => {

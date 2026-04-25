@@ -2,7 +2,7 @@
 
 **Bug bounty toolkit in your browser sidebar. 35 tools. Zero dependencies. Zero data collection.**
 
-A Chrome extension (Manifest V3) built for bug bounty hunters, pentesters, and security researchers. Everything runs locally in your browser — no accounts, no API keys, no telemetry.
+A Chrome extension built for bug bounty hunters, pentesters, and security researchers. Everything runs locally in your browser — no accounts, no API keys, no telemetry.
 
 ---
 

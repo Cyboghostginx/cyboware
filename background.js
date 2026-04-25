@@ -93,6 +93,14 @@ const handlers = {
   GET_HEADERS: (msg, _, sr) => sr({ headers: tabHeaders[msg.tabId] || null }),
   GET_CAPTURED_REQUESTS: (msg, _, sr) => sr({ requests: capturedRequests[msg.tabId] || [] }),
 
+  CLEAR_CAPTURED_REQUESTS: (msg, _, sr) => {
+    if (msg.tabId && capturedRequests[msg.tabId]) {
+      capturedRequests[msg.tabId] = [];
+      persistRequests();
+    }
+    sr({ ok: true });
+  },
+
   FETCH_URL: async (msg, _, sr) => {
     try {
       const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: 'include' };

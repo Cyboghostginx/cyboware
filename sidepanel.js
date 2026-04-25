@@ -92,7 +92,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (sp) sp.value = stored.scratchpad || '';
 
   setupGroupToggles(); setupToolButtons(); setupPinButton(); setupDebugLog();
-  setupRefreshButton(); setupScratchpad(); setupLiveBrowse();
+  setupRefreshButton(); setupScratchpad(); setupLiveBrowse(); setupToolSearch();
   // Listen for SPA navigations and DOM mutations from content/injected scripts
   chrome.runtime.onMessage.addListener((msg) => {
     if (!liveActive) return;
@@ -482,6 +482,39 @@ function setupScratchpad() {
   document.getElementById('btn-scratch-clear')?.addEventListener('click', () => { sp.value = ''; chrome.storage.local.set({ scratchpad: '' }); });
   document.getElementById('btn-scratch-download')?.addEventListener('click', () => downloadText(sp.value, 'cyboware-scratchpad.txt'));
 }
+function setupToolSearch() {
+  const input = document.getElementById('tool-search');
+  if (!input) return;
+  input.addEventListener('input', () => {
+    const q = input.value.toLowerCase().trim();
+    if (!q) {
+      // Reset: show all groups and buttons
+      document.querySelectorAll('.feat-group').forEach(g => g.style.display = '');
+      document.querySelectorAll('.tool-btn').forEach(b => b.style.display = '');
+      return;
+    }
+    document.querySelectorAll('.feat-group').forEach(group => {
+      const buttons = group.querySelectorAll('.tool-btn');
+      let anyMatch = false;
+      buttons.forEach(btn => {
+        const name = (btn.querySelector('.tool-name')?.textContent || '').toLowerCase();
+        const desc = (btn.querySelector('.tool-desc')?.textContent || '').toLowerCase();
+        const match = name.includes(q) || desc.includes(q);
+        btn.style.display = match ? '' : 'none';
+        if (match) anyMatch = true;
+      });
+      group.style.display = anyMatch ? '' : 'none';
+      if (anyMatch) group.classList.add('open');
+    });
+    // Auto-scroll to first visible match
+    const firstMatch = document.querySelector('.tool-btn:not([style*="display: none"])');
+    if (firstMatch) firstMatch.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+  // Clear on Escape
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { input.value = ''; input.dispatchEvent(new Event('input')); input.blur(); }
+  });
+}
 
 // ═══ RESULTS PANEL — always fresh, no dead event listeners ═══
 function showResults(groupName, title, loading, toolName) {
@@ -760,7 +793,7 @@ async function toolCookies() {
     </div>
     <div class="result-label mt-6 mb-4">Edit / Add Cookie</div>
     <div class="tool-input-row"><input class="tool-input" id="ck-name" placeholder="Cookie name" style="width:40%"><input class="tool-input" id="ck-val" placeholder="Cookie value"></div>
-    <div class="tool-input-row">
+    <div class="tool-input-row" style="flex-wrap:wrap">
       <button class="btn-sm primary" id="ck-set">Set Cookie</button>
       <button class="btn-sm" id="ck-header">Copy as Header</button>
       <button class="btn-sm" id="ck-json">Copy JSON</button>
@@ -1051,6 +1084,32 @@ async function toolSecrets() {
   const findings = [];
   for (const url of sr.data.external.slice(0,20)) { try { const r = await chrome.runtime.sendMessage({type:'FETCH_JS',url}); if(r.ok) scanSecrets(r.text,url,findings); } catch{} }
   sr.data.inline.slice(0,10).forEach((txt,i) => scanSecrets(txt, activeTabUrl + ' [inline-' + i + ']', findings));
+
+  // Also scan captured XHR request headers for Bearer tokens, API keys, etc.
+  try {
+    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+    const capturedReqs = reqRes.requests || [];
+    capturedReqs.forEach(req => {
+      if (!req.requestHeaders) return;
+      req.requestHeaders.forEach(h => {
+        const name = h.name.toLowerCase();
+        const val = h.value || '';
+        if (name === 'authorization' && val.length > 10) {
+          const key = 'xhr-auth:' + val.slice(0, 40);
+          if (!findings.some(f => f.match === val.slice(0, 200))) {
+            const isBearerJwt = /^Bearer\s+eyJ/i.test(val);
+            findings.push({ name: isBearerJwt ? 'Bearer JWT (XHR)' : 'Authorization Header (XHR)', match: val.slice(0, 200), severity: 'high', source: 'XHR → ' + (req.url || '').slice(0, 80), context: req.method + ' ' + req.url, entropy: shannonEntropy(val).toFixed(1) });
+          }
+        }
+        if ((name === 'x-api-key' || name === 'api-key' || name === 'x-auth-token') && val.length > 8) {
+          if (!findings.some(f => f.match === val)) {
+            findings.push({ name: 'API Key Header (XHR)', match: val, severity: 'high', source: 'XHR → ' + (req.url || '').slice(0, 80), context: h.name + ': ' + val, entropy: shannonEntropy(val).toFixed(1) });
+          }
+        }
+      });
+    });
+  } catch {}
+
   if (findings.length) { const bd=document.getElementById('badge-discovery'); bd.textContent=findings.length; bd.classList.remove('hidden'); }
   b.innerHTML = `<div class="text-xs text-muted mb-6">Page: ${esc(activeTabUrl)}</div>` +
     (findings.length===0 ? '<div class="text-muted text-sm">No secrets detected</div>' :
@@ -1302,7 +1361,7 @@ async function toolReplayer() {
   const reqs = res.requests||[];
   if(!reqs.length){ b.innerHTML='<div class="text-muted text-sm">No requests captured. Browse first.</div>'; return; }
   const display = reqs.slice(-20).reverse();
-  b.innerHTML = `<div class="text-sm mb-6">${reqs.length} captured</div>`+display.map((r,i)=>{const u=new URL(r.url);const hasBody=r.body&&r.body.length>0;return`<div class="result-item ${hasBody?'medium':'info'}" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-${hasBody?'medium':'info'}">${r.method||'GET'}</span>${r.statusCode||'?'}</div><div class="result-value">${esc(u.pathname+u.search).slice(0,70)}</div>${hasBody?`<div class="text-xs text-muted">Body: ${esc(r.body.slice(0,60))}${r.body.length>60?'…':''}</div>`:''}</div>`}).join('')+
+  b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${reqs.length} captured</span><button class="btn-sm" id="rp-clear" style="font-size:9px">Clear All</button></div>`+display.map((r,i)=>{const u=new URL(r.url);const hasBody=r.body&&r.body.length>0;return`<div class="result-item ${hasBody?'medium':'info'}" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-${hasBody?'medium':'info'}">${r.method||'GET'}</span>${r.statusCode||'?'}</div><div class="result-value">${esc(u.pathname+u.search).slice(0,70)}</div>${hasBody?`<div class="text-xs text-muted">Body: ${esc(r.body.slice(0,60))}${r.body.length>60?'…':''}</div>`:''}</div>`}).join('')+
   `<div class="mt-8" id="rp-det" style="display:none"><div class="tool-input-row"><select class="tool-select" id="rp-m" style="width:80px"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>OPTIONS</option></select></div><input class="tool-input mb-6" id="rp-u"><textarea class="tool-input mb-6" id="rp-h" rows="2" placeholder="Headers JSON">{}</textarea><textarea class="tool-input mb-6" id="rp-b" rows="3" placeholder="Request body (form data or JSON)"></textarea><div class="tool-input-row"><button class="btn-sm primary" id="rp-send">Send</button><button class="btn-sm" id="rp-curl">Copy cURL</button></div><pre class="result-value mt-6" id="rp-out" style="max-height:200px;overflow:auto;white-space:pre-wrap"></pre></div>`;
   b.querySelectorAll('[data-ri]').forEach(el=>el.addEventListener('click',()=>{
     const r=display[+el.dataset.ri];
@@ -1320,6 +1379,12 @@ async function toolReplayer() {
     try{const h=JSON.parse(b.querySelector('#rp-h').value);Object.entries(h).forEach(([k,v])=>{cmd+=` -H '${k}: ${v}'`})}catch{}
     if(bd) cmd+=` -d '${bd}'`;
     copyText(cmd);
+  });
+  b.querySelector('#rp-clear')?.addEventListener('click', async () => {
+    // Clear captured requests for this tab
+    await chrome.runtime.sendMessage({ type: 'CLEAR_CAPTURED_REQUESTS', tabId: activeTabId });
+    b.querySelector('.results-body').innerHTML = '<div class="text-muted text-sm">Cleared. Browse to capture new requests.</div>';
+    log('Replayer cleared', 'success');
   });
   finalizeResults('offensive');
 }
@@ -1494,24 +1559,27 @@ async function toolParamFuzz() {
   const u = new URL(activeTabUrl);
   const params = [...u.searchParams.keys()];
 
-  // Auto-detect forms on the page
   let pageForms = [];
-  try {
-    const fr = await msgTab({ type: 'EXTRACT_FORMS' });
-    if (fr?.ok) pageForms = fr.data.filter(f => f.fields.length > 0);
-  } catch {}
-  const fuzzableFields = pageForms.reduce((sum, f) => sum + f.fields.filter(fi => fi.name && fi.type !== 'hidden' && fi.type !== 'submit' && fi.type !== 'button').length, 0);
+  const refreshForms = async () => {
+    try {
+      const fr = await msgTab({ type: 'EXTRACT_FORMS' });
+      if (fr?.ok) pageForms = fr.data.filter(f => f.fields.length > 0);
+    } catch {}
+    return pageForms;
+  };
+  await refreshForms();
+  const countFields = () => pageForms.reduce((sum, f) => sum + f.fields.filter(fi => fi.name && fi.type !== 'hidden' && fi.type !== 'submit' && fi.type !== 'button').length, 0);
 
   b.innerHTML = `
     <div class="codec-row mb-4" style="border-bottom:1px solid var(--border);padding-bottom:8px">
       <button class="btn-sm ${params.length ? 'primary' : ''}" id="fz-mode-url" style="font-weight:700">URL Params (${params.length})</button>
-      <button class="btn-sm ${pageForms.length ? '' : ''}" id="fz-mode-form" style="font-weight:700">Form Fields (${fuzzableFields})</button>
+      <button class="btn-sm" id="fz-mode-form" style="font-weight:700">Form Fields (<span id="fz-form-count">${countFields()}</span>)</button>
     </div>
     <div id="fz-mode-content"></div>`;
 
   const renderUrlMode = () => {
     const mc = b.querySelector('#fz-mode-content');
-    mc.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : '<span style="color:var(--warning)">No URL params found. Add ?param=value to the URL, or switch to Form Fields mode.</span>'}</div>
+    mc.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : '<span style="color:var(--warning)">No URL params. Add ?param=value or switch to Form Fields.</span>'}</div>
       <div class="tool-input-row"><input class="tool-input" id="fz-url" value="${esc(activeTabUrl)}" placeholder="URL with params"></div>
       <div class="codec-row mb-4">
         <button class="btn-sm primary" data-fzcat="xss">XSS</button>
@@ -1529,7 +1597,7 @@ async function toolParamFuzz() {
       const cat = btn.dataset.fzcat;
       const customPayloads = (mc.querySelector('#fz-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
       const isBlind = cat === 'sqli';
-      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${isBlind ? ' (includes time-based blind - may take longer)' : ''}…</div><div class="fz-progress" style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div id="fz-bar" style="height:100%;width:0%;background:var(--accent);transition:width 0.3s"></div></div>`;
+      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${isBlind ? ' (includes blind timing)' : ''}...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>`;
       const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads });
       if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
       if (r.message) { out.innerHTML = `<div class="text-muted text-sm">${esc(r.message)}</div>`; return; }
@@ -1538,25 +1606,27 @@ async function toolParamFuzz() {
     }));
   };
 
-  const renderFormMode = () => {
+  const renderFormMode = async () => {
     const mc = b.querySelector('#fz-mode-content');
+    mc.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning page for forms...</div>';
+    await refreshForms();
+    const fc = b.querySelector('#fz-form-count');
+    if (fc) fc.textContent = countFields();
+
     if (!pageForms.length) {
-      mc.innerHTML = '<div class="text-muted text-sm">No forms detected on this page. Navigate to a page with login, search, or other input forms.</div>';
+      mc.innerHTML = `<div class="text-muted text-sm" style="padding:8px 0">No forms detected on this page.</div>
+        <div class="text-xs text-muted mb-6">Navigate to a page with forms. Dynamic forms appear after re-scanning.</div>
+        <button class="btn-sm" id="fz-rescan">Re-scan Page</button>`;
+      mc.querySelector('#fz-rescan')?.addEventListener('click', () => renderFormMode());
       return;
     }
-    mc.innerHTML = `<div class="text-sm mb-6">${pageForms.length} form${pageForms.length > 1 ? 's' : ''} detected</div>` +
-      pageForms.map((f, i) => {
-        const fuzzableF = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
-        const hasPassword = f.fields.some(fi => fi.type === 'password');
-        const hasFile = f.fields.some(fi => fi.type === 'file');
-        const label = hasPassword ? '🔐 Login Form' : hasFile ? '📁 File Upload' : '📝 Form';
-        return `<div class="result-item ${hasPassword ? 'medium' : 'info'}" style="cursor:pointer" data-form-idx="${i}">
-          <div class="result-label">${label} — ${esc(f.method?.toUpperCase() || 'GET')} → ${esc(f.action || '(self)')}</div>
-          <div class="result-value">${fuzzableF.map(fi => `<span style="display:inline-block;padding:1px 5px;margin:1px;background:var(--surface-hover);border:1px solid var(--border);border-radius:3px;font-size:9px">${esc(fi.name)} <span class="text-muted">${fi.type||'text'}</span></span>`).join('')}</div>
-          <div class="text-xs text-muted mt-4">${fuzzableF.length} testable field${fuzzableF.length > 1 ? 's' : ''}${f.fields.filter(fi => fi.type === 'hidden').length ? ' + ' + f.fields.filter(fi => fi.type === 'hidden').length + ' hidden' : ''}</div>
-        </div>`;
-      }).join('') +
-      `<div id="fz-form-detail" style="display:none;margin-top:10px">
+
+    mc.innerHTML = `<div class="flex-between mb-6">
+        <span class="text-sm">${pageForms.length} form${pageForms.length > 1 ? 's' : ''} detected</span>
+        <button class="btn-sm" id="fz-rescan" title="Re-scan for dynamically loaded forms">Re-scan</button>
+      </div>
+      <div id="fz-form-list"></div>
+      <div id="fz-form-detail" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
         <div class="result-label mb-4" id="fz-form-label">Selected form</div>
         <div class="codec-row mb-4">
           <button class="btn-sm primary" data-ffcat="xss">XSS</button>
@@ -1564,21 +1634,73 @@ async function toolParamFuzz() {
           <button class="btn-sm" data-ffcat="ssti">SSTI</button>
           <button class="btn-sm" data-ffcat="path">Path Traversal</button>
         </div>
-        <div class="text-xs text-muted mb-6">Payloads will be submitted through each form field via ${pageForms[0]?.method?.toUpperCase() || 'GET'}. Other fields keep their default values.</div>
+        <div class="text-xs text-muted mb-6" id="fz-form-hint">Payloads submitted through each field. Other fields keep defaults.</div>
         <div id="fz-form-out"></div>
       </div>`;
 
+    const listEl = mc.querySelector('#fz-form-list');
+    listEl.innerHTML = pageForms.map((f, i) => {
+      const fuzzableF = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
+      const hiddenF = f.fields.filter(fi => fi.type === 'hidden');
+      const hasPassword = f.fields.some(fi => fi.type === 'password');
+      const hasFile = f.fields.some(fi => fi.type === 'file');
+      const label = hasPassword ? 'Login Form' : hasFile ? 'File Upload' : 'Form';
+      const icon = hasPassword ? '&#128274;' : hasFile ? '&#128193;' : '&#128221;';
+      const actionShort = f.action ? (f.action.length > 50 ? '...' + f.action.slice(-40) : f.action) : '(self)';
+      return `<div class="fz-form-card" data-form-idx="${i}" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:6px;background:var(--surface);overflow:hidden">
+        <div class="fz-form-header" data-toggle="${i}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;cursor:pointer;transition:background var(--transition)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:11px;font-weight:600;color:var(--text)">${icon} ${label} <span style="font-weight:400;color:var(--text-secondary);font-family:var(--font-mono);font-size:9.5px">${esc(f.method?.toUpperCase() || 'GET')}</span></div>
+            <div style="font-size:9.5px;color:var(--text-tertiary);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(actionShort)}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+            <span style="font-size:9px;color:var(--text-tertiary)">${fuzzableF.length} field${fuzzableF.length !== 1 ? 's' : ''}</span>
+            <span class="fz-chev" data-chev="${i}" style="font-size:10px;color:var(--text-tertiary);transition:transform var(--transition)">&#9654;</span>
+          </div>
+        </div>
+        <div class="fz-form-body" data-body="${i}" style="display:none;padding:6px 10px 10px;border-top:1px solid var(--border);background:var(--bg)">
+          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px">
+            ${fuzzableF.map(fi => {
+              const isInteresting = /password|secret|token|auth|key|admin|role|email|user/i.test(fi.name);
+              return '<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:' + (isInteresting ? 'var(--accent-soft)' : 'var(--surface)') + ';border:1px solid ' + (isInteresting ? 'var(--accent)' : 'var(--border)') + ';border-radius:4px;font-size:9px;font-family:var(--font-mono)">' + (isInteresting ? '&#127919;' : '') + '<strong>' + esc(fi.name) + '</strong> <span style="color:var(--text-tertiary)">' + (fi.type || 'text') + '</span>' + (fi.value ? ' <span style="color:var(--text-tertiary)">= ' + esc(fi.value.slice(0, 20)) + '</span>' : '') + '</span>';
+            }).join('')}
+          </div>
+          ${hiddenF.length ? '<div style="font-size:9px;color:var(--text-tertiary);margin-bottom:4px">' + hiddenF.length + ' hidden: ' + hiddenF.map(fi => esc(fi.name)).join(', ') + '</div>' : ''}
+          <button class="btn-sm primary" data-select-form="${i}" style="font-size:9px;padding:3px 8px;margin-top:4px">Select for Fuzzing</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    // Collapsible toggle
+    listEl.querySelectorAll('[data-toggle]').forEach(header => {
+      header.addEventListener('click', (e) => {
+        if (e.target.closest('[data-select-form]')) return;
+        const idx = header.dataset.toggle;
+        const body = listEl.querySelector('[data-body="' + idx + '"]');
+        const chev = listEl.querySelector('[data-chev="' + idx + '"]');
+        const isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : 'block';
+        if (chev) chev.style.transform = isOpen ? '' : 'rotate(90deg)';
+      });
+    });
+
     let selectedFormIdx = -1;
-    mc.querySelectorAll('[data-form-idx]').forEach(el => el.addEventListener('click', () => {
-      selectedFormIdx = +el.dataset.formIdx;
-      const f = pageForms[selectedFormIdx];
-      const det = mc.querySelector('#fz-form-detail');
-      det.style.display = 'block';
-      mc.querySelector('#fz-form-label').textContent = `Fuzzing: ${f.method?.toUpperCase() || 'GET'} → ${f.action || '(self)'}`;
-      // Highlight selected
-      mc.querySelectorAll('[data-form-idx]').forEach(x => x.style.outline = '');
-      el.style.outline = '2px solid var(--accent)';
-    }));
+    listEl.querySelectorAll('[data-select-form]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        selectedFormIdx = +btn.dataset.selectForm;
+        const f = pageForms[selectedFormIdx];
+        const det = mc.querySelector('#fz-form-detail');
+        det.style.display = 'block';
+        mc.querySelector('#fz-form-label').textContent = 'Fuzzing: ' + (f.method?.toUpperCase() || 'GET') + ' -> ' + (f.action || '(self)');
+        mc.querySelector('#fz-form-hint').textContent = 'Payloads submitted through each of ' + f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button').length + ' fields via ' + (f.method?.toUpperCase() || 'GET') + '. Other fields keep defaults.';
+        listEl.querySelectorAll('.fz-form-card').forEach(c => c.style.borderColor = 'var(--border)');
+        const card = listEl.querySelector('[data-form-idx="' + selectedFormIdx + '"]');
+        if (card) card.style.borderColor = 'var(--accent)';
+        det.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    });
+
+    mc.querySelector('#fz-rescan')?.addEventListener('click', () => renderFormMode());
 
     mc.querySelectorAll('[data-ffcat]').forEach(btn => btn.addEventListener('click', async () => {
       if (selectedFormIdx < 0) { alert('Select a form first'); return; }
@@ -1586,9 +1708,7 @@ async function toolParamFuzz() {
       const cat = btn.dataset.ffcat;
       const out = mc.querySelector('#fz-form-out');
       const isBlind = cat === 'sqli';
-      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${f.fields.length} fields with ${cat.toUpperCase()}${isBlind ? ' (includes blind timing)' : ''}…</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>`;
-
-      // Build payload list for this category
+      out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Fuzzing ' + f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button').length + ' fields with ' + cat.toUpperCase() + (isBlind ? ' (includes blind timing)' : '') + '...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>';
       const payloadSets = {
         xss: [
           { p: '<script>alert(1)</script>', check: 'unencoded_html' },
@@ -1607,7 +1727,7 @@ async function toolParamFuzz() {
         ],
         ssti: [
           { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925558641' },
-          { p: '${9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
+          { p: '$' + '{9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
         ],
         path: [
           { p: '../../../etc/passwd', check: 'file_content' },
@@ -1626,45 +1746,28 @@ async function toolParamFuzz() {
     }));
   };
 
-  // Render results (shared between URL and Form modes)
   const renderFuzzResults = (out, r, mode) => {
     const critical = r.results.filter(x => x.severity === 'high');
     const warnings = r.results.filter(x => x.severity === 'medium' || x.severity === 'low');
     const fieldKey = mode === 'form' ? 'field' : 'param';
-    out.innerHTML = `<div class="flex-between mb-6">
-        <span class="text-sm">${r.results.length} tests${r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ' payloads)' : ''}${r.baselineLen ? ' · baseline: ' + r.baselineLen + 'b' : ''}${r.baselineTime ? ' · ' + (r.baselineTime / 1000).toFixed(1) + 's' : ''}${r.method ? ' · ' + r.method : ''}</span>
-        <span class="text-sm"><span class="${critical.length ? 'text-accent' : 'text-muted'}" style="font-weight:700">${critical.length} critical</span>, ${warnings.length} warnings</span>
-      </div>
-      <div class="codec-row mb-4"><button class="btn-sm" id="fz-show-all">All (${r.results.length})</button><button class="btn-sm" id="fz-show-vuln">Findings (${critical.length + warnings.length})</button><button class="btn-sm" id="fz-show-safe">Safe (${r.results.filter(x => x.severity === 'safe').length})</button></div>
-      <div id="fz-results-list"></div>`;
-
+    out.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + r.results.length + ' tests' + (r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ' payloads)' : '') + (r.baselineLen ? ' baseline: ' + r.baselineLen + 'b' : '') + (r.baselineTime ? ' ' + (r.baselineTime / 1000).toFixed(1) + 's' : '') + (r.method ? ' ' + r.method : '') + '</span><span class="text-sm"><span class="' + (critical.length ? 'text-accent' : 'text-muted') + '" style="font-weight:700">' + critical.length + ' critical</span>, ' + warnings.length + ' warnings</span></div><div class="codec-row mb-4"><button class="btn-sm" id="fz-show-all">All (' + r.results.length + ')</button><button class="btn-sm" id="fz-show-vuln">Findings (' + (critical.length + warnings.length) + ')</button><button class="btn-sm" id="fz-show-safe">Safe (' + r.results.filter(x => x.severity === 'safe').length + ')</button></div><div id="fz-results-list"></div>';
     const renderList = (filter) => {
-      const items = filter === 'vuln' ? r.results.filter(x => x.severity !== 'safe' && x.severity !== 'info')
-        : filter === 'safe' ? r.results.filter(x => x.severity === 'safe')
-        : r.results;
+      const items = filter === 'vuln' ? r.results.filter(x => x.severity !== 'safe' && x.severity !== 'info') : filter === 'safe' ? r.results.filter(x => x.severity === 'safe') : r.results;
       out.querySelector('#fz-results-list').innerHTML = items.map(x => {
         const sevColor = x.severity === 'high' ? 'high' : x.severity === 'medium' ? 'medium' : x.severity === 'low' ? 'low' : 'info';
         const tagClass = x.severity === 'high' ? 'tag-high' : x.severity === 'medium' ? 'tag-medium' : x.severity === 'low' ? 'tag-low' : 'tag-safe';
         const tagText = x.severity === 'high' ? 'VULN' : x.severity === 'medium' ? 'WARN' : x.severity === 'low' ? 'NOTE' : 'SAFE';
         const target = x[fieldKey] || x.field || x.param || '?';
-        return `<div class="result-item ${sevColor}" style="cursor:pointer">
-          <div class="result-label"><span class="result-tag ${tagClass}">${tagText}</span> ${esc(target)}${x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : ''}</div>
-          <div class="result-value" style="margin-bottom:3px">${esc(x.payload)}</div>
-          <div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">${esc(x.analysis)}</div>
-          ${x.status ? `<div class="text-xs text-muted">HTTP ${x.status} · ${x.bodyLen}b${x.elapsed ? ' · ' + (x.elapsed / 1000).toFixed(1) + 's' : ''}</div>` : ''}
-          ${x.context ? `<div style="margin-top:4px;padding:4px 6px;background:${x.severity==='high'?'var(--danger-soft)':'var(--surface-hover)'};border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:70px;overflow:auto">${esc(x.context)}</div>` : ''}
-          ${x.errorBody ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:80px;overflow:auto"><strong>Error response:</strong><br>${esc(x.errorBody.slice(0,400))}</div>` : ''}
-        </div>`;
+        return '<div class="result-item ' + sevColor + '" style="cursor:pointer"><div class="result-label"><span class="result-tag ' + tagClass + '">' + tagText + '</span> ' + esc(target) + (x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : '') + '</div><div class="result-value" style="margin-bottom:3px">' + esc(x.payload) + '</div><div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">' + esc(x.analysis) + '</div>' + (x.status ? '<div class="text-xs text-muted">HTTP ' + x.status + ' ' + x.bodyLen + 'b' + (x.elapsed ? ' ' + (x.elapsed / 1000).toFixed(1) + 's' : '') + '</div>' : '') + (x.context ? '<div style="margin-top:4px;padding:4px 6px;background:' + (x.severity==='high'?'var(--danger-soft)':'var(--surface-hover)') + ';border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:70px;overflow:auto">' + esc(x.context) + '</div>' : '') + (x.errorBody ? '<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:80px;overflow:auto"><strong>Error:</strong><br>' + esc(x.errorBody.slice(0,400)) + '</div>' : '') + '</div>';
       }).join('') || '<div class="text-muted text-sm">No results in this filter</div>';
     };
     renderList('all');
     out.querySelector('#fz-show-all')?.addEventListener('click', () => renderList('all'));
     out.querySelector('#fz-show-vuln')?.addEventListener('click', () => renderList('vuln'));
     out.querySelector('#fz-show-safe')?.addEventListener('click', () => renderList('safe'));
-    log(`Fuzz: ${critical.length} critical, ${warnings.length} warnings`, critical.length ? 'warn' : 'success');
+    log('Fuzz: ' + critical.length + ' critical, ' + warnings.length + ' warnings', critical.length ? 'warn' : 'success');
   };
 
-  // Mode switching
   b.querySelector('#fz-mode-url').addEventListener('click', () => {
     b.querySelector('#fz-mode-url').classList.add('primary');
     b.querySelector('#fz-mode-form').classList.remove('primary');
@@ -1676,7 +1779,6 @@ async function toolParamFuzz() {
     renderFormMode();
   });
 
-  // Default: show URL mode if params exist, otherwise form mode
   if (params.length) renderUrlMode();
   else if (pageForms.length) { b.querySelector('#fz-mode-form').classList.add('primary'); b.querySelector('#fz-mode-url').classList.remove('primary'); renderFormMode(); }
   else renderUrlMode();

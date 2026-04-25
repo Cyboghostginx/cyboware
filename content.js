@@ -140,20 +140,32 @@ const contentHandlers = {
   REVEAL_HIDDEN: () => {
     document.body.classList.add('cyboware-revealed');
     document.querySelectorAll('[style*="display: none"],[style*="display:none"],[style*="visibility: hidden"],[style*="visibility:hidden"],.hidden,.d-none,.sr-only,.visually-hidden,[hidden],[aria-hidden="true"]').forEach(el => {
+      el.dataset.cyboOrigStyle = el.getAttribute('style') || '';
+      el.dataset.cyboOrigHidden = el.hasAttribute('hidden') ? '1' : '';
       el.style.setProperty('display', 'block', 'important');
       el.style.setProperty('visibility', 'visible', 'important');
       el.style.setProperty('opacity', '1', 'important');
       el.removeAttribute('hidden');
       el.style.outline = '2px dashed #C4392D';
+      el.dataset.cyboRevealed = '1';
     });
     document.querySelectorAll('input[type="hidden"]').forEach(el => { el.dataset.cyboOrigType = 'hidden'; el.type = 'text'; el.style.cssText = 'border:2px dashed #C4392D;padding:4px;margin:2px;background:#fff3f3'; });
-    document.querySelectorAll('input[disabled],select[disabled],textarea[disabled]').forEach(el => { el.disabled = false; el.style.outline = '2px dashed #2D7D46'; });
+    document.querySelectorAll('input[disabled],select[disabled],textarea[disabled]').forEach(el => { el.dataset.cyboWasDisabled = '1'; el.disabled = false; el.style.outline = '2px dashed #2D7D46'; });
     return true;
   },
   UNREVEAL_HIDDEN: () => {
     document.body.classList.remove('cyboware-revealed');
     document.querySelectorAll('[data-cybo-orig-type="hidden"]').forEach(el => { el.type = 'hidden'; el.style.cssText = ''; delete el.dataset.cyboOrigType; });
-    document.querySelectorAll('[style*="2px dashed"]').forEach(el => { el.style.outline = ''; });
+    document.querySelectorAll('[data-cybo-revealed="1"]').forEach(el => {
+      const origStyle = el.dataset.cyboOrigStyle;
+      if (origStyle) el.setAttribute('style', origStyle);
+      else el.removeAttribute('style');
+      if (el.dataset.cyboOrigHidden === '1') el.setAttribute('hidden', '');
+      delete el.dataset.cyboRevealed;
+      delete el.dataset.cyboOrigStyle;
+      delete el.dataset.cyboOrigHidden;
+    });
+    document.querySelectorAll('[data-cybo-was-disabled="1"]').forEach(el => { el.disabled = true; el.style.outline = ''; delete el.dataset.cyboWasDisabled; });
     return true;
   },
 

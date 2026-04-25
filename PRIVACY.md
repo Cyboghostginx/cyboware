@@ -36,9 +36,6 @@ No cookies, authentication tokens, personal data, or browsing history is sent to
 - **host_permissions (`<all_urls>`)** — Security analysis must work on any website the user chooses to test
 - **clipboardWrite** — Enable copy-to-clipboard functionality for all tool results
 
-## Children's Privacy
-Cyboware is not directed at children under 13. We do not knowingly collect data from children.
-
 ## Changes
 We may update this privacy policy. Changes will be posted at this URL.
 

@@ -28,11 +28,47 @@ const SECRET_PATTERNS = [
   { name: 'Basic Auth', regex: /[Bb]asic\s+[A-Za-z0-9+/]{20,}={0,2}/g, severity: 'medium' },
 ];
 const ENDPOINT_PATTERNS = [
-  /["'](\/api\/[^"']{2,})["']/g, /["'](\/v[0-9]+\/[^"']{2,})["']/g,
-  /["'](\/graphql[^"']*)["']/g, /["'](\/rest\/[^"']{2,})["']/g,
-  /["'](https?:\/\/[^"'\s]{6,})["']/g, /["'](wss?:\/\/[^"'\s]+)["']/g,
+  /["'](\/api\/[^"'\s]{2,})["']/g,
+  /["'](\/v[0-9]+\/[^"'\s]{2,})["']/g,
+  /["'](\/graphql[^"'\s]*)["']/g,
+  /["'](\/rest\/[^"'\s]{2,})["']/g,
+  /["'](\/wp-json\/[^"'\s]{2,})["']/g,
+  /["'](\/ajax\/[^"'\s]{2,})["']/g,
+  /["'](wss?:\/\/[^"'\s]+)["']/g,
   /\.(?:get|post|put|patch|delete|fetch)\s*\(\s*["']([^"']+)["']/g,
+  /(?:url|endpoint|href|action|src)\s*[:=]\s*["'](\/[a-z0-9][^"'\s]{3,})["']/gi,
+  /["'](https?:\/\/[^"'\s]{10,})["']/g,
 ];
+// Filter out noise from endpoint extraction
+const ENDPOINT_NOISE = [
+  /^[#.]/, // CSS selectors
+  /[\[\]]/, // DOM queries like input[value=
+  /^(settings|enlarge|hl|rs|rslightbox)/, // ReadSpeaker junk
+  /w3\.org|xmlns|schema\.org/, // Standards namespaces
+  /\.(css|js|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|map|webp|mp3|ogg|mp4|pdf)(\?|$)/i, // Static assets
+  /\/products\/[^/]+\.(webp|png|jpg)/i, // Product images
+  /^(a|ul|select|input|div|span|button|img|script|link|meta),?\s/i, // HTML tags
+  /^(true|false|null|undefined|none|auto|inherit|normal|block|flex|grid|popup|player|interval|length|reporter|extensions)$/i, // JS/CSS values
+  /fonts\.googleapis|fonts\.gstatic|cookiehub|google-analytics|googletagmanager|facebook\.com|cdn\.jsdelivr|doubleclick\.net|googlesyndication|googleadservices|clarity\.ms|livechatinc|openwidget/i, // Third-party services
+  /^https?:\/\/www\.(w3|xml|google\.com\/(ccm|pagead|rmkt|measurement|travel)|googletagmanager|googlesyndication|googleadservices)/, // Google tracking
+  /^https?:\/\/(pagead2|adservice|ad\.|secure\.livechat|react\.dev|github\.com\/zloirock|syncle\.com|chrome\.google\.com|addons\.mozilla)/, // Browser/dev tools
+  /^https?:\/\/media\.backend\.elko/i, // Product CDN images
+  /^[a-z][a-zA-Z]+$/,  // camelCase single words (JS vars): apiConfiguration, sessionId, etc.
+  /^[a-z]+-[a-z-]+$/i, // kebab-case: x-middleware-cache, sentry-trace, max-h
+  /^[A-Z][a-zA-Z-]+$/, // Header names: Content-Type, Retry-After, X-Request-URL
+  /^\[/, // Array-like: [...], [[...]]
+  /^https?:\/\/(www\.)?(facebook|instagram|twitter|tiktok|linkedin|youtube(-nocookie)?)\.(com|is|net)\/?($|@|channel|company)/, // Social media pages
+  /^https?:\/\/example\.com/, // Example URLs
+  /^https?:\/\/(www\.)?google\.com\/?$/, // Just google.com
+  /^https?:\/\/embed|^https?:\/\/cdn\.|^https?:\/\/dash\./i, // CDN/embed subdomains
+  /^https?:\/\/[^/]+\/?$/, // Bare domains with no path (https://elko.is/)
+];
+function isRealEndpoint(ep) {
+  if (ep.length < 5 || ep.length > 500) return false;
+  if (!ep.startsWith('/') && !ep.startsWith('http') && !ep.startsWith('ws')) return false; // Must be a path or URL
+  for (const noise of ENDPOINT_NOISE) { if (noise.test(ep)) return false; }
+  return true;
+}
 
 // ═══ INIT ═══
 document.addEventListener('DOMContentLoaded', async () => {
@@ -46,13 +82,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   setupGroupToggles(); setupToolButtons(); setupPinButton(); setupDebugLog();
   setupRefreshButton(); setupScratchpad(); setupLiveBrowse();
+  // Global click-to-copy on result items
+  document.querySelector('.app').addEventListener('click', (e) => {
+    // Click-to-copy: clicking a result-item copies its value text
+    const item = e.target.closest('.result-item');
+    if (item && !e.target.closest('button, a, input, textarea, select, code')) {
+      const val = item.querySelector('.result-value')?.textContent?.trim();
+      if (val) copyText(val);
+    }
+    // Test Google API key button
+    if (e.target.dataset.testKey) {
+      e.stopPropagation();
+      window.testGoogleKey(e.target.dataset.testKey);
+    }
+  });
 
   await updateActiveTab();
   // Track tab changes
   chrome.tabs.onActivated.addListener(() => { if (!pinnedTabId) updateActiveTab(); });
   chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
     if (info.status === 'complete') {
-      // Record browse history for ALL domains
+      // Record browse history
       if (tab.url && !tab.url.startsWith('chrome') && !tab.url.startsWith('about:')) {
         try {
           const domain = getRootDomain(new URL(tab.url).hostname);
@@ -66,16 +116,21 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         } catch {}
       }
-      if (tabId === activeTabId || tabId === pinnedTabId) updateActiveTab();
-      // Live Browse passive scan — with redirect handling
+      // Only update sidebar for the tab we're tracking
+      if (pinnedTabId) {
+        // When pinned: ONLY react to the pinned tab's own updates
+        if (tabId === pinnedTabId) updateActiveTab();
+      } else {
+        // Not pinned: react to the active tab's updates
+        if (tabId === activeTabId) updateActiveTab();
+      }
+      // Live Browse — only scan if NOT pinned to a different domain, or if pinned and matches
       if (liveActive && tab.url && !tab.url.startsWith('chrome')) {
         try {
           const host = new URL(tab.url).hostname;
           const targetRoot = getRootDomain(liveTargetDomain);
           const pageRoot = getRootDomain(host);
-          // Match same root domain (catches subdomains and redirects within the target)
           if (pageRoot === targetRoot) {
-            // Small delay for content script injection after redirects
             setTimeout(() => liveScanPage(tabId, tab.url, tab.title || ''), 600);
           }
         } catch {}
@@ -92,43 +147,66 @@ const domainPanels = {}; // rootDomain -> { groupName: panelHTML }
 async function updateActiveTab() {
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tabs || !tabs.length) { log('No active tab found', 'warn'); return; }
-    const tab = tabs[0];
+    if (!tabs || !tabs.length) return;
+    const visibleTab = tabs[0]; // Tab the user is currently looking at
 
     if (pinnedTabId) {
-      try { const pt = await chrome.tabs.get(pinnedTabId); activeTabId = pt.id; activeTabUrl = pt.url || ''; }
-      catch { pinnedTabId = null; document.getElementById('btn-pin').classList.remove('pinned'); document.getElementById('btn-pin').textContent = 'PIN'; activeTabId = tab.id; activeTabUrl = tab.url || ''; }
+      // PINNED: always use pinned tab data, ignore visible tab
+      try {
+        const pt = await chrome.tabs.get(pinnedTabId);
+        activeTabId = pt.id;
+        activeTabUrl = pt.url || '';
+      } catch {
+        // Pinned tab was closed — auto-unpin
+        pinnedTabId = null;
+        document.getElementById('btn-pin').classList.remove('pinned');
+        document.getElementById('btn-pin').textContent = 'PIN';
+        activeTabId = visibleTab.id;
+        activeTabUrl = visibleTab.url || '';
+        log('Pinned tab closed — unpinned', 'warn');
+      }
     } else {
-      activeTabId = tab.id;
-      activeTabUrl = tab.url || '';
+      activeTabId = visibleTab.id;
+      activeTabUrl = visibleTab.url || '';
     }
 
     try { activeTabDomain = new URL(activeTabUrl).hostname; } catch { activeTabDomain = ''; }
 
-    // Show full URL in context bar
+    // Show URL + pin status in context bar
     document.getElementById('tab-url').textContent = activeTabUrl || '—';
     document.getElementById('tab-url').title = activeTabUrl;
 
-    const currentHost = activeTabDomain; // Full hostname — algo.elko.is ≠ elko.is
+    const currentHost = activeTabDomain;
 
-    // ── Domain switch: save current → restore new ──
+    // ── Domain switch: save → clear → restore ──
     if (lastDomain && currentHost !== lastDomain) {
-      // Save current domain's open panels
+      // Save current panels
       domainPanels[lastDomain] = {};
       document.querySelectorAll('.results-panel.active').forEach(p => {
-        const group = p.id.replace('results-', '');
-        domainPanels[lastDomain][group] = p.innerHTML;
+        domainPanels[lastDomain][p.id.replace('results-', '')] = p.innerHTML;
       });
-      // Save live browse data for current domain
+      // Save live browse
       if (liveFindings.length || liveSeenItems.size) {
         liveDomainData[lastDomain] = { findings: [...liveFindings], seenItems: new Set(liveSeenItems), feedHTML: document.getElementById('live-feed')?.innerHTML || '' };
       }
 
-      // Clear all panels
+      // Clear panels
       document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
       document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
 
-      // Restore live browse for new domain
+      // Restore for new domain
+      if (domainPanels[currentHost]) {
+        Object.entries(domainPanels[currentHost]).forEach(([group, html]) => {
+          const panel = document.getElementById('results-' + group);
+          if (panel && html) {
+            panel.innerHTML = html; panel.classList.add('active');
+            wireResultsClose(panel); wireResultsCopyJson(panel);
+            panel.closest('.feat-group')?.classList.add('open');
+          }
+        });
+        log('Restored: ' + currentHost);
+      }
+      // Restore live browse
       if (liveDomainData[currentHost]) {
         const ld = liveDomainData[currentHost];
         liveFindings = ld.findings; liveSeenItems.clear(); ld.seenItems.forEach(s => liveSeenItems.add(s));
@@ -142,24 +220,6 @@ async function updateActiveTab() {
         const feed = document.getElementById('live-feed');
         if (feed) feed.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">Click Start to begin</div>';
         document.getElementById('live-count').textContent = '0 findings';
-      }
-
-      // Restore panels for new domain if we have them
-      if (domainPanels[currentHost]) {
-        Object.entries(domainPanels[currentHost]).forEach(([group, html]) => {
-          const panel = document.getElementById('results-' + group);
-          if (panel && html) {
-            panel.innerHTML = html;
-            panel.classList.add('active');
-            wireResultsClose(panel);
-            wireResultsCopyJson(panel);
-            // Open the parent group
-            panel.closest('.feat-group')?.classList.add('open');
-          }
-        });
-        log('Restored session for ' + currentHost);
-      } else {
-        log('New domain: ' + currentHost);
       }
     }
     lastDomain = currentHost;
@@ -190,11 +250,17 @@ function renderDomainPills() {
     pill.addEventListener('click', async () => {
       const domain = pill.dataset.domain;
       if (domain === currentHost) return;
+      // Auto-unpin when switching via domain pills
+      if (pinnedTabId) {
+        pinnedTabId = null;
+        document.getElementById('btn-pin').classList.remove('pinned');
+        document.getElementById('btn-pin').textContent = 'PIN';
+      }
       // Find a tab with this domain
       const tabs = await chrome.tabs.query({ currentWindow: true });
       const match = tabs.find(t => { try { return new URL(t.url).hostname === domain; } catch { return false; } });
       if (match) {
-        await chrome.tabs.update(match.id, { active: true }); // Switch to that tab
+        await chrome.tabs.update(match.id, { active: true });
       } else {
         // No tab found — just restore the cached session
         // Save current first
@@ -227,18 +293,33 @@ function updateScopeIndicator() {
   dot.className = 'scope-dot ' + (inScope ? 'in-scope' : 'out-scope');
 }
 
-// ═══ GUARD: safe message to content script ═══
+// ═══ GUARD: safe message to content script — auto-injects if needed ═══
 async function msgTab(msg) {
   if (!activeTabId) { log('No active tab', 'warn'); return { ok: false, error: 'No active tab' }; }
   if (activeTabUrl.startsWith('chrome://') || activeTabUrl.startsWith('chrome-extension://') || activeTabUrl.startsWith('about:')) {
     return { ok: false, error: 'Cannot access this page type' };
   }
   try { return await chrome.tabs.sendMessage(activeTabId, msg); }
-  catch (e) { log('Content script error: ' + e.message, 'error'); return { ok: false, error: e.message }; }
+  catch (e) {
+    // Content script not injected — try injecting it
+    if (e.message?.includes('Receiving end does not exist') || e.message?.includes('Could not establish connection')) {
+      log('Injecting content script…', 'warn');
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ['content.js'] });
+        // Retry after injection
+        return await chrome.tabs.sendMessage(activeTabId, msg);
+      } catch (e2) {
+        log('Auto-inject failed: ' + e2.message, 'error');
+        return { ok: false, error: 'Content script injection failed. Try reloading the page.' };
+      }
+    }
+    log('Content script error: ' + e.message, 'error');
+    return { ok: false, error: e.message };
+  }
 }
 
 // ═══ UI SETUP ═══
-function setupGroupToggles() { document.querySelectorAll('.feat-group-header').forEach(h => h.addEventListener('click', () => h.parentElement.classList.toggle('open'))); }
+function setupGroupToggles() { document.querySelectorAll('.feat-group-header').forEach(h => h.addEventListener('click', () => { const parent = h.parentElement; const wasOpen = parent.classList.contains('open'); document.querySelectorAll('.feat-group.open').forEach(g => g.classList.remove('open')); if (!wasOpen) parent.classList.add('open'); })); }
 function setupPinButton() {
   const btn = document.getElementById('btn-pin');
   btn.addEventListener('click', async () => {
@@ -250,14 +331,18 @@ function setupRefreshButton() {
   document.getElementById('btn-refresh').addEventListener('click', () => { Object.keys(cache).forEach(k => delete cache[k]); updateActiveTab(); });
   // Reset button — close all panels, clear cache for current domain
   document.getElementById('btn-reset')?.addEventListener('click', () => {
-    const currentRoot = getRootDomain(activeTabDomain);
-    // Clear domain-keyed caches
-    Object.keys(cache).forEach(k => { if (k.startsWith(activeTabDomain + ':')) delete cache[k]; });
-    if (currentRoot) delete domainPanels[currentRoot];
+    const currentHost = activeTabDomain;
+    Object.keys(cache).forEach(k => { if (k.startsWith(currentHost + ':')) delete cache[k]; });
+    delete domainPanels[currentHost];
+    delete liveDomainData[currentHost];
     document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
     document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
+    liveFindings = []; liveSeenItems.clear();
+    const feed = document.getElementById('live-feed');
+    if (feed) feed.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">Cleared</div>';
+    document.getElementById('live-count').textContent = '0 findings';
     renderDomainPills();
-    log('Reset: ' + (currentRoot || 'all'), 'success');
+    log('Reset: ' + currentHost, 'success');
   });
   // Collapse / Expand all sections
   document.getElementById('btn-collapse')?.addEventListener('click', () => {
@@ -318,11 +403,13 @@ function setupScratchpad() {
 }
 
 // ═══ RESULTS PANEL — always fresh, no dead event listeners ═══
-function showResults(groupName, title, loading) {
+function showResults(groupName, title, loading, toolName) {
   const panel = document.getElementById('results-' + groupName);
   panel.classList.add('active');
-  panel.innerHTML = `<div class="results-header"><span class="results-title">${esc(title)}</span><div class="results-actions"><button class="ra-copy" title="Copy">Copy</button><button class="ra-json" title="JSON">JSON</button></div><button class="results-close">✕</button></div><div class="results-body">${loading ? '<div class="loading-text"><span class="spinner"></span> Working…</div>' : ''}</div>`;
+  panel.dataset.tool = toolName || currentToolName || '';
+  panel.innerHTML = `<div class="results-header"><span class="results-title">${esc(title)}</span><div class="results-actions"><button class="ra-rerun" title="Re-run">↻</button><button class="ra-copy" title="Copy">Copy</button><button class="ra-json" title="JSON">JSON</button></div><button class="results-close">✕</button></div><div class="results-body">${loading ? '<div class="loading-text"><span class="spinner"></span> Working…</div>' : ''}</div>`;
   wireResultsClose(panel);
+  wireResultsRerun(panel);
   return panel.querySelector('.results-body');
 }
 function finalizeResults(gn) {
@@ -332,6 +419,15 @@ function finalizeResults(gn) {
   wireResultsCopyJson(p);
 }
 function wireResultsClose(p) { p.querySelector('.results-close')?.addEventListener('click', () => p.classList.remove('active')); }
+function wireResultsRerun(p) {
+  p.querySelector('.ra-rerun')?.addEventListener('click', () => {
+    const toolName = p.dataset.tool;
+    if (toolName) {
+      const btn = document.querySelector(`[data-tool="${toolName}"]`);
+      if (btn) btn.click();
+    }
+  });
+}
 function wireResultsCopyJson(p) {
   p.querySelector('.ra-copy')?.addEventListener('click', () => {
     const items = [...p.querySelectorAll('.results-body .result-item')];
@@ -353,8 +449,10 @@ function wireResultsCopyJson(p) {
 }
 
 // ═══ DISPATCHER ═══
+let currentToolName = '';
 async function runTool(tool) {
   log('Running: ' + tool);
+  currentToolName = tool;
   try {
     switch (tool) {
       case 'tech-stack': await toolTechStack(); break;
@@ -379,6 +477,7 @@ async function runTool(tool) {
       case 'dirbrute': await toolDirBrute(); break;
       case 'idor': await toolIdor(); break;
       case 'jsbeautify': await toolJsBeautify(); break;
+      case 'storage': await toolStorage(); break;
       case 'cspeval': await toolCspEval(); break;
       case 'takeover': await toolTakeover(); break;
       case 'scope': toolScope(); break;
@@ -403,7 +502,33 @@ async function toolTechStack() {
     if (h.name.toLowerCase()==='x-powered-by') srv.push({name:h.value,category:'Backend',confidence:'high'});
   });
   const all = [...(res?.data||[]), ...srv];
-  b.innerHTML = all.length===0?'<div class="text-muted text-sm">No tech detected</div>':all.map(t=>`<div class="result-item info"><div class="result-label">${esc(t.category)}</div><div class="result-value">${esc(t.name)}</div></div>`).join('');
+  const attackHints = {
+    'WordPress': 'Try: /wp-json/wp/v2/users, xmlrpc.php brute force, plugin vulns',
+    'Next.js': 'Try: /_next/data paths, API routes, SSRF via image optimization',
+    'React': 'Check: source maps (.js.map), Redux devtools, client-side auth checks',
+    'Laravel': 'Try: /.env, /telescope, /horizon, debug mode, mass assignment',
+    'Django': 'Try: /admin/, debug toolbar, CSRF token reuse, ORM injection',
+    'Express': 'Check: prototype pollution, path traversal, debug routes',
+    'Angular': 'Check: template injection, source maps, client-side routing auth',
+    'Vue.js': 'Check: source maps, Vuex state exposure, client-side auth',
+    'Shopify': 'Check: GraphQL API, liquid template injection, admin paths',
+    'Cloudflare': 'Note: WAF in place — may need bypass techniques for payloads',
+    'Nginx': 'Try: path traversal via aliases, off-by-slash misconfiguration',
+    'Apache': 'Try: /server-status, /server-info, .htaccess bypass',
+    'PHP': 'Try: phpinfo.php, type juggling, deserialization, file inclusion',
+    'ASP.NET': 'Try: /trace.axd, /elmah.axd, viewstate deserialization',
+    'jQuery': 'Check version for known XSS (pre-3.5.0 CVEs)',
+    'Bootstrap': 'Low priority — mostly CSS, check for XSS in tooltips/popovers',
+  };
+  b.innerHTML = `<div class="text-xs text-muted mb-4">URL: ${esc(activeTabUrl)}</div>` +
+    (all.length===0?'<div class="text-muted text-sm">No tech detected</div>':all.map(t => {
+      const hint = Object.entries(attackHints).find(([k]) => t.name.toLowerCase().includes(k.toLowerCase()));
+      return `<div class="result-item info" style="cursor:pointer">
+        <div class="result-label">${esc(t.category)}</div>
+        <div class="result-value">${esc(t.name)}</div>
+        ${hint ? `<div class="text-xs" style="color:var(--warning);margin-top:2px">${hint[1]}</div>` : ''}
+      </div>`;
+    }).join(''));
   finalizeResults('recon');
 }
 
@@ -412,74 +537,201 @@ async function toolHeadersAudit() {
   const hRes = await chrome.runtime.sendMessage({ type: 'GET_HEADERS', tabId: activeTabId });
   if (!hRes.headers) { b.innerHTML = errMsg('No headers. Reload page first.'); return; }
   const hd = {}; hRes.headers.responseHeaders.forEach(h => { hd[h.name.toLowerCase()] = h.value; });
-  const checks = [
-    {name:'Content-Security-Policy',key:'content-security-policy',critical:true},{name:'Strict-Transport-Security',key:'strict-transport-security',critical:true},
-    {name:'X-Content-Type-Options',key:'x-content-type-options'},{name:'X-Frame-Options',key:'x-frame-options'},
-    {name:'Referrer-Policy',key:'referrer-policy'},{name:'Permissions-Policy',key:'permissions-policy'},
-    {name:'COOP',key:'cross-origin-opener-policy'},{name:'CORP',key:'cross-origin-resource-policy'},
-  ];
+
+  // Deep header value analysis
+  const findings = [];
   let score = 0;
-  const results = checks.map(c => { const v=hd[c.key]; if(v) score += c.critical?15:10; return{...c,value:v,present:!!v}; });
-  const leaked = []; ['server','x-powered-by','x-aspnet-version'].forEach(k=>{if(hd[k])leaked.push(k+': '+hd[k])});
-  const grade = score>=80?'A':score>=60?'B':score>=40?'C':score>=20?'D':'F';
-  b.innerHTML = `<div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade grade-${grade.toLowerCase()}">${grade}</span><span class="text-sm">Score: ${score}/100</span></div>`+results.map(r=>`<div class="result-item ${r.present?'info':(r.critical?'high':'medium')}"><div class="result-label"><span class="result-tag ${r.present?'tag-safe':(r.critical?'tag-high':'tag-medium')}">${r.present?'✓':'✗'}</span>${esc(r.name)}</div><div class="result-value">${r.present?esc(r.value).slice(0,120):'Missing'}</div></div>`).join('')+(leaked.length?`<div class="result-item medium mt-6"><div class="result-label">⚠ Info Disclosure</div><div class="result-value">${leaked.map(esc).join('<br>')}</div></div>`:'');
+
+  // CSP analysis
+  const csp = hd['content-security-policy'];
+  if (csp) {
+    score += 10;
+    if (csp.includes("'unsafe-inline'")) findings.push({ sev: 'high', text: "CSP allows 'unsafe-inline' — XSS protection bypassed" });
+    else if (csp.includes("'unsafe-eval'")) findings.push({ sev: 'high', text: "CSP allows 'unsafe-eval' — code injection possible" });
+    else if (csp.includes('*')) findings.push({ sev: 'medium', text: "CSP contains wildcard (*) — overly permissive" });
+    else score += 5;
+    if (/cdn\.jsdelivr|cdnjs\.cloudflare|unpkg\.com/.test(csp)) findings.push({ sev: 'medium', text: 'CSP trusts CDNs (jsdelivr/cdnjs/unpkg) — known bypass vectors' });
+  } else { findings.push({ sev: 'high', text: 'No Content-Security-Policy — no XSS protection' }); }
+
+  // HSTS analysis
+  const hsts = hd['strict-transport-security'];
+  if (hsts) {
+    score += 10;
+    const maxAge = hsts.match(/max-age=(\d+)/);
+    if (maxAge && parseInt(maxAge[1]) < 31536000) findings.push({ sev: 'medium', text: `HSTS max-age=${maxAge[1]} (< 1 year) — too short` });
+    if (maxAge && parseInt(maxAge[1]) === 0) findings.push({ sev: 'high', text: 'HSTS max-age=0 — HSTS disabled!' });
+    if (!hsts.includes('includeSubDomains')) findings.push({ sev: 'low', text: 'HSTS missing includeSubDomains' });
+    else score += 5;
+  } else { findings.push({ sev: 'high', text: 'No HSTS — MITM downgrade possible' }); }
+
+  // X-Frame-Options
+  if (hd['x-frame-options']) { score += 10; } else {
+    const cspFrame = csp && (csp.includes('frame-ancestors') || csp.includes("frame-src 'none'"));
+    if (!cspFrame) findings.push({ sev: 'medium', text: 'No X-Frame-Options or frame-ancestors — clickjacking possible' });
+    else score += 10;
+  }
+
+  // Other headers
+  if (hd['x-content-type-options']) score += 10; else findings.push({ sev: 'low', text: 'No X-Content-Type-Options' });
+  if (hd['referrer-policy']) score += 10; else findings.push({ sev: 'low', text: 'No Referrer-Policy — URLs may leak via Referer header' });
+  if (hd['permissions-policy']) score += 10; else findings.push({ sev: 'low', text: 'No Permissions-Policy' });
+  if (hd['cross-origin-opener-policy']) score += 10;
+  if (hd['cross-origin-resource-policy']) score += 10;
+
+  // CORS headers inline
+  const acao = hd['access-control-allow-origin'];
+  if (acao === '*') findings.push({ sev: 'medium', text: 'CORS: Access-Control-Allow-Origin: * (wildcard)' });
+  if (hd['access-control-allow-credentials'] === 'true' && acao && acao !== '*') findings.push({ sev: 'high', text: `CORS: Credentials allowed with origin ${acao} — test for reflection` });
+
+  // WAF detection
+  const wafSigs = [];
+  if (hd['cf-ray'] || hd['cf-cache-status'] || hd['server']?.includes('cloudflare')) wafSigs.push('Cloudflare');
+  if (hd['x-akamai-transformed'] || hd['akamai-grn'] || hd['server']?.includes('AkamaiGHost')) wafSigs.push('Akamai');
+  if (hd['x-amz-cf-id'] || hd['x-amz-request-id']) wafSigs.push('AWS CloudFront');
+  if (hd['x-sucuri-id'] || hd['x-sucuri-cache']) wafSigs.push('Sucuri');
+  if (hd['server']?.includes('Imperva') || hd['x-iinfo']) wafSigs.push('Imperva');
+
+  // Info disclosure
+  const leaked = [];
+  ['server','x-powered-by','x-aspnet-version','x-runtime','x-generator','x-debug-token'].forEach(k => { if (hd[k]) leaked.push(k + ': ' + hd[k]); });
+
+  const grade = score >= 70 ? 'A' : score >= 50 ? 'B' : score >= 30 ? 'C' : score >= 15 ? 'D' : 'F';
+  b.innerHTML = `<div class="text-xs text-muted mb-4">URL: ${esc(activeTabUrl)}</div>
+    <div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade grade-${grade.toLowerCase()}">${grade}</span><span class="text-sm">Score: ${score}/100</span></div>
+    ${wafSigs.length ? `<div class="result-item info"><div class="result-label">🛡 WAF Detected</div><div class="result-value">${wafSigs.join(', ')} — payloads may need bypass techniques</div></div>` : ''}
+    ${findings.map(f => `<div class="result-item ${f.sev}"><div class="result-label"><span class="result-tag tag-${f.sev}">${f.sev}</span></div><div class="result-value">${esc(f.text)}</div></div>`).join('')}
+    ${leaked.length ? `<div class="result-item medium mt-4"><div class="result-label">🔓 Info Disclosure</div><div class="result-value">${leaked.map(esc).join('<br>')}</div></div>` : ''}`;
   finalizeResults('recon');
 }
 
 async function toolCookies() {
-  const b = showResults('recon', 'Cookies', true);
+  const b = showResults('clientdata', 'Cookies', true);
   const res = await chrome.runtime.sendMessage({ type: 'GET_COOKIES', domain: activeTabDomain });
-  if (!res.ok||!res.cookies.length) { b.innerHTML = '<div class="text-muted text-sm">No cookies</div>'; finalizeResults('recon'); return; }
+  if (!res.ok||!res.cookies.length) { b.innerHTML = '<div class="text-muted text-sm">No cookies</div>'; finalizeResults('clientdata'); return; }
   const cookies = res.cookies;
-  b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${cookies.length} cookies</span></div>
+  // Fingerprint session technology
+  const techMap = { 'PHPSESSID': 'PHP', 'JSESSIONID': 'Java', 'connect.sid': 'Express/Node.js', '_session_id': 'Rails', '_app_session': 'Rails', 'csrftoken': 'Django', '.AspNetCore': '.NET Core', 'ASP.NET_SessionId': 'ASP.NET', 'CFID': 'ColdFusion', 'CFTOKEN': 'ColdFusion', 'laravel_session': 'Laravel', 'wp-settings': 'WordPress', '__cfduid': 'Cloudflare', '_ak_': 'Akamai', 'ak_bmsc': 'Akamai' };
+  const detectedTech = []; const securityIssues = []; const jwtCookies = [];
+  cookies.forEach(c => {
+    // Tech fingerprinting
+    for (const [pattern, tech] of Object.entries(techMap)) {
+      if (c.name.includes(pattern) || c.name.startsWith(pattern)) { if (!detectedTech.includes(tech)) detectedTech.push(tech); }
+    }
+    // JWT detection
+    if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(c.value)) jwtCookies.push(c.name);
+    // Security flags
+    if (!c.httpOnly) securityIssues.push(`${c.name}: missing HttpOnly`);
+    if (!c.secure) securityIssues.push(`${c.name}: missing Secure`);
+    if (c.sameSite === 'unspecified' || c.sameSite === 'none') securityIssues.push(`${c.name}: SameSite=${c.sameSite || 'unspecified'}`);
+    // Expiry analysis
+    if (c.expirationDate) {
+      const daysUntilExpiry = Math.floor((c.expirationDate * 1000 - Date.now()) / 86400000);
+      if (daysUntilExpiry > 365) securityIssues.push(`${c.name}: expires in ${daysUntilExpiry} days (excessive)`);
+    }
+  });
+
+  let infoHtml = '';
+  if (detectedTech.length) infoHtml += `<div class="result-item info"><div class="result-label">🔍 Session Technology</div><div class="result-value">${detectedTech.join(', ')}</div></div>`;
+  if (jwtCookies.length) infoHtml += `<div class="result-item medium"><div class="result-label">🎟 JWT in Cookies</div><div class="result-value">${jwtCookies.join(', ')} — try JWT Editor to decode & forge</div></div>`;
+  if (securityIssues.length) infoHtml += `<div class="result-item ${securityIssues.length > 3 ? 'high' : 'medium'}"><div class="result-label">⚠ Security Issues (${securityIssues.length})</div><div class="result-value" style="font-size:9.5px">${securityIssues.slice(0,8).join('<br>')}</div></div>`;
+
+  b.innerHTML = `${infoHtml}<div class="flex-between mb-6 mt-6"><span class="text-sm">${cookies.length} cookies</span></div>
     <div style="overflow-x:auto"><table class="cookie-table">
     <tr><th>Name</th><th>Value</th><th></th></tr>
     ${cookies.map((c, i) => `<tr>
       <td title="${esc(c.name)}" style="font-weight:600;color:var(--text)">${esc(c.name)}</td>
       <td title="${esc(c.value)}" style="max-width:140px">${esc(c.value.slice(0, 45))}</td>
-      <td style="white-space:nowrap"><button class="btn-sm cookie-cp" data-ci="${i}" style="padding:2px 6px;font-size:9px">Copy</button></td>
+      <td style="white-space:nowrap">
+        <button class="btn-sm cookie-cp" data-ci="${i}" style="padding:2px 5px;font-size:9px">Copy</button>
+        <button class="btn-sm cookie-del" data-ci="${i}" style="padding:2px 5px;font-size:9px;color:var(--danger)">Del</button>
+      </td>
     </tr>`).join('')}
     </table></div>
-    <div class="tool-input-row mt-6">
-      <button class="btn-sm primary" id="ck-header">Copy as Header</button>
+    <div class="result-label mt-6 mb-4">Edit / Add Cookie</div>
+    <div class="tool-input-row"><input class="tool-input" id="ck-name" placeholder="Cookie name" style="width:40%"><input class="tool-input" id="ck-val" placeholder="Cookie value"></div>
+    <div class="tool-input-row">
+      <button class="btn-sm primary" id="ck-set">Set Cookie</button>
+      <button class="btn-sm" id="ck-header">Copy as Header</button>
       <button class="btn-sm" id="ck-json">Copy JSON</button>
-      <button class="btn-sm" id="ck-all">Copy All (name=val)</button>
+      <button class="btn-sm" id="ck-all">Copy name=val</button>
     </div>`;
   // Per-cookie copy
-  b.querySelectorAll('.cookie-cp').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const c = cookies[parseInt(btn.dataset.ci)];
-      copyText(c.name + '=' + c.value);
-    });
+  b.querySelectorAll('.cookie-cp').forEach(btn => btn.addEventListener('click', () => { const c = cookies[+btn.dataset.ci]; copyText(c.name + '=' + c.value); }));
+  // Per-cookie delete
+  b.querySelectorAll('.cookie-del').forEach(btn => btn.addEventListener('click', async () => {
+    const c = cookies[+btn.dataset.ci];
+    const url = (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, '') + c.path;
+    await chrome.runtime.sendMessage({ type: 'DELETE_COOKIE', url, name: c.name });
+    log('Deleted cookie: ' + c.name, 'success');
+    toolCookies(); // Refresh
+  }));
+  // Set/edit cookie
+  b.querySelector('#ck-set')?.addEventListener('click', async () => {
+    const name = b.querySelector('#ck-name').value.trim();
+    const value = b.querySelector('#ck-val').value;
+    if (!name) return;
+    try {
+      await chrome.cookies.set({ url: activeTabUrl, name, value, domain: activeTabDomain, path: '/' });
+      log('Set cookie: ' + name, 'success');
+      toolCookies(); // Refresh
+    } catch (e) { log('Set cookie failed: ' + e.message, 'error'); }
   });
-  // Copy as Cookie header
-  b.querySelector('#ck-header')?.addEventListener('click', () => {
-    copyText('Cookie: ' + cookies.map(c => c.name + '=' + c.value).join('; '));
-  });
-  // Copy JSON
-  b.querySelector('#ck-json')?.addEventListener('click', () => {
-    copyText(JSON.stringify(cookies.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite })), null, 2));
-  });
-  // Copy all name=value
-  b.querySelector('#ck-all')?.addEventListener('click', () => {
-    copyText(cookies.map(c => c.name + '=' + c.value).join('\n'));
-  });
-  finalizeResults('recon');
+  b.querySelector('#ck-header')?.addEventListener('click', () => copyText('Cookie: ' + cookies.map(c => c.name + '=' + c.value).join('; ')));
+  b.querySelector('#ck-json')?.addEventListener('click', () => copyText(JSON.stringify(cookies.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite })), null, 2)));
+  b.querySelector('#ck-all')?.addEventListener('click', () => copyText(cookies.map(c => c.name + '=' + c.value).join('\n')));
+  finalizeResults('clientdata');
 }
 
 async function toolSubdomains() {
   const b = showResults('recon', 'Subdomains', true);
-  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Querying crt.sh…</div>';
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Enumerating subdomains…</div>';
   const root = getRootDomain(activeTabDomain);
   const res = await chrome.runtime.sendMessage({ type: 'ENUM_SUBDOMAINS', domain: root });
   if (!res.ok) { b.innerHTML = errMsg(res.error); return; }
   const subs = res.subdomains.filter(s => !s.startsWith('*'));
-  b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${subs.length} subdomains for ${esc(root)}</span></div>`+subs.map(s=>`<div class="result-item info"><div class="result-value">${esc(s)}</div></div>`).join('');
+  if (!subs.length) { b.innerHTML = '<div class="text-muted text-sm">No subdomains found</div>'; finalizeResults('recon'); return; }
+
+  // Show list first, then probe
+  b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${subs.length} subdomains (${res.source || 'crt.sh'})</span><button class="btn-sm primary" id="sd-probe">Probe All</button></div><div id="sd-list">${subs.map(s => `<div class="result-item info"><div class="result-value">${esc(s)}</div></div>`).join('')}</div>`;
   finalizeResults('recon');
+
+  b.querySelector('#sd-probe')?.addEventListener('click', async () => {
+    const btn = b.querySelector('#sd-probe');
+    btn.disabled = true; btn.textContent = 'Probing…';
+    const probeRes = await chrome.runtime.sendMessage({ type: 'PROBE_SUBDOMAINS', subdomains: subs });
+    if (!probeRes.ok) { btn.textContent = 'Probe Failed'; return; }
+
+    const alive = probeRes.results.filter(r => r.status !== 'dead');
+    const dead = probeRes.results.filter(r => r.status === 'dead');
+
+    b.querySelector('#sd-list').innerHTML =
+      `<div class="text-xs text-muted mb-6">${alive.length} alive, ${dead.length} dead/timeout</div>` +
+      probeRes.results.sort((a, c) => {
+        if (a.status === 'dead' && c.status !== 'dead') return 1;
+        if (a.status !== 'dead' && c.status === 'dead') return -1;
+        return 0;
+      }).map(r => {
+        const isDead = r.status === 'dead';
+        const is200 = r.status === 200;
+        const is403 = r.status === 403 || r.status === 401;
+        const is3xx = r.status >= 300 && r.status < 400;
+        const sev = isDead ? 'info' : is200 ? 'high' : is403 ? 'medium' : is3xx ? 'low' : 'info';
+        const tagClass = isDead ? 'tag-info' : is200 ? 'tag-safe' : is403 ? 'tag-medium' : is3xx ? 'tag-low' : 'tag-info';
+        const statusText = isDead ? 'DEAD' : r.status;
+        return `<div class="result-item ${sev}">
+          <div class="result-label"><span class="result-tag ${tagClass}">${statusText}</span>${r.http ? ' <span class="text-xs text-muted">HTTP</span>' : ''} ${esc(r.sub)}</div>
+          ${r.title ? `<div class="result-value">${esc(r.title)}</div>` : ''}
+          ${r.url && r.url !== 'https://' + r.sub + '/' ? `<div class="text-xs text-muted">→ ${esc(r.url)}</div>` : ''}
+        </div>`;
+      }).join('');
+    btn.textContent = 'Probed';
+    finalizeResults('recon');
+    log(`Subdomains: ${alive.length} alive, ${dead.length} dead`, 'success');
+  });
 }
 
 async function toolReqResp() {
-  const b = showResults('recon', 'Req / Resp', true);
+  const b = showResults('utility', 'Req / Resp', true);
   const hRes = await chrome.runtime.sendMessage({ type: 'GET_HEADERS', tabId: activeTabId });
   const cookieRes = await chrome.runtime.sendMessage({ type: 'GET_COOKIES', domain: activeTabDomain });
   const h = hRes.headers;
@@ -571,15 +823,26 @@ async function toolReqResp() {
     copyText(curl);
   });
 
-  finalizeResults('recon');
+  finalizeResults('utility');
 }
 
 async function toolDns() {
   const b = showResults('recon', 'DNS Lookup', true);
-  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Resolving…</div>';
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Resolving DNS + SPF/DMARC…</div>';
   const res = await chrome.runtime.sendMessage({ type: 'DNS_LOOKUP', domain: activeTabDomain });
   if (!res.ok) { b.innerHTML = errMsg(res.error); return; }
-  b.innerHTML = Object.entries(res.records).map(([t,r])=>`<div class="result-item info"><div class="result-label">${t}</div><div class="result-value">${r.map(esc).join('<br>')}</div></div>`).join('')||'<div class="text-muted text-sm">No records</div>';
+  let html = Object.entries(res.records).map(([t,r]) => `<div class="result-item info" style="cursor:pointer"><div class="result-label">${t}</div><div class="result-value">${r.map(esc).join('<br>')}</div></div>`).join('') || '';
+  // Email security
+  if (res.emailSecurity) {
+    const es = res.emailSecurity;
+    html += `<div class="result-label mt-6 mb-4">📧 Email Security (SPF/DMARC)</div>`;
+    if (es.spf) html += `<div class="result-item info"><div class="result-label">SPF</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.spf)}</div></div>`;
+    if (es.dmarc) html += `<div class="result-item info"><div class="result-label">DMARC</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.dmarc)}</div></div>`;
+    es.findings.forEach(f => {
+      html += `<div class="result-item ${f.severity}"><div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span></div><div class="result-value">${esc(f.text)}</div></div>`;
+    });
+  }
+  b.innerHTML = html || '<div class="text-muted text-sm">No records</div>';
   finalizeResults('recon');
 }
 
@@ -607,91 +870,254 @@ async function toolWpPlugins() {
 }
 
 async function toolSecrets() {
-  const b = showResults('analysis', 'Secrets', true);
+  const b = showResults('discovery', 'Secrets', true);
   b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning JS…</div>';
   const sr = await msgTab({ type: 'GET_SCRIPT_URLS' });
   if (!sr?.ok) { b.innerHTML = errMsg(sr?.error||'Cannot access page'); return; }
   const findings = [];
   for (const url of sr.data.external.slice(0,20)) { try { const r = await chrome.runtime.sendMessage({type:'FETCH_JS',url}); if(r.ok) scanSecrets(r.text,url,findings); } catch{} }
-  sr.data.inline.slice(0,10).forEach((txt,i) => scanSecrets(txt,'[inline-'+i+']',findings));
-  if (findings.length) { const bd=document.getElementById('badge-analysis'); bd.textContent=findings.length; bd.classList.remove('hidden'); }
-  b.innerHTML = findings.length===0?'<div class="text-muted text-sm">No secrets detected</div>':findings.slice(0,50).map(f=>`<div class="result-item ${f.severity}"><div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span>${esc(f.name)}</div><div class="result-value">${esc(f.match.slice(0,80))}</div><div class="text-xs text-muted">${esc(f.source.split('/').pop())}</div></div>`).join('');
-  finalizeResults('analysis');
+  sr.data.inline.slice(0,10).forEach((txt,i) => scanSecrets(txt, activeTabUrl + ' [inline-' + i + ']', findings));
+  if (findings.length) { const bd=document.getElementById('badge-discovery'); bd.textContent=findings.length; bd.classList.remove('hidden'); }
+  b.innerHTML = `<div class="text-xs text-muted mb-6">Page: ${esc(activeTabUrl)}</div>` +
+    (findings.length===0 ? '<div class="text-muted text-sm">No secrets detected</div>' :
+    findings.slice(0,50).map(f => {
+      const isGoogleKey = f.name === 'Google API Key';
+      return `<div class="result-item ${f.severity}" style="cursor:pointer">
+      <div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span>${esc(f.name)}${isGoogleKey ? ` <button class="btn-sm" data-test-key="${f.match}" style="padding:1px 5px;font-size:8px;margin-left:4px">Test Key</button>` : ''}</div>
+      <div class="result-value">${esc(f.match.slice(0,80))}</div>
+      ${f.context ? `<div style="margin-top:3px;padding:3px 6px;background:var(--surface-hover);border-radius:3px;font-family:var(--font-mono);font-size:9px;color:var(--text-tertiary);max-height:36px;overflow:hidden">…${esc(f.context)}…</div>` : ''}
+      <div class="text-xs text-muted">Found in: ${esc(f.source)}</div>
+    </div>`; }).join(''));
+  finalizeResults('discovery');
 }
-function scanSecrets(text,source,findings){for(const p of SECRET_PATTERNS){const re=new RegExp(p.regex.source,p.regex.flags);let m;while((m=re.exec(text))!==null){const v=m[1]||m[0];if(v.length<8)continue;if(p.name==='IP Address'&&(v.startsWith('0.')||v.startsWith('127.')))continue;if(!findings.some(f=>f.match===v))findings.push({name:p.name,match:v,severity:p.severity,source})}}}
+function scanSecrets(text,source,findings){
+  // Skip third-party libraries that generate tons of false positives
+  if (/openpgp\.min\.js|cookiehub\.net|google-analytics|googletagmanager/.test(source)) return;
+  for(const p of SECRET_PATTERNS){const re=new RegExp(p.regex.source,p.regex.flags);let m;while((m=re.exec(text))!==null){const v=m[1]||m[0];if(v.length<8)continue;
+  // IP Address false positive filters
+  if(p.name==='IP Address'){
+    if(v.startsWith('0.')||v.startsWith('127.')||v.startsWith('10.')||v.startsWith('192.168.'))continue;
+    // Leading zeros = not a real IP (OIDs like 045.3.1.7)
+    if(/\b0\d/.test(v))continue;
+    // Context: check surrounding chars for SVG path data (l.87.75.22.19 = SVG, not IP)
+    const before=text.slice(Math.max(0,m.index-5),m.index);
+    if(/[,\-lmcsqtaLMCSQTA]\s*\.?\d*\.?$/.test(before))continue;
+    // Context: OID strings ("1.2.840.10045.3.1.7":"p256")
+    const around=text.slice(Math.max(0,m.index-30),Math.min(text.length,m.index+v.length+30));
+    if(/["'][0-9.]+["']\s*:|curve|secp|brainpool|p256|p384|p521|oid/i.test(around))continue;
+  }
+  // Generic Secret false positive filters
+  if(p.name==='Generic Secret'){
+    if(/%filtered%|%redacted%|\[FILTERED\]|\[REDACTED\]|placeholder|example|test123|changeme|YOUR_|TODO|FIXME/i.test(v))continue;
+    // Skip CDN/third-party sources
+    if(/cdnjs\.cloudflare|cdn\.jsdelivr|fonts\.googleapis/.test(source))continue;
+  }
+  if(!findings.some(f=>f.match===v)){
+    const start=Math.max(0,m.index-80);const end=Math.min(text.length,m.index+v.length+80);
+    const ctx=text.slice(start,end).replace(/\n/g,' ').trim();
+    findings.push({name:p.name,match:v,severity:p.severity,source,context:ctx})
+  }}}
+}
 
 async function toolEndpoints() {
-  const b = showResults('analysis', 'Endpoints', true);
+  const b = showResults('discovery', 'Endpoints', true);
   b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Extracting…</div>';
   const sr = await msgTab({ type: 'GET_SCRIPT_URLS' });
   if (!sr?.ok) { b.innerHTML = errMsg(sr?.error||'Cannot access page'); return; }
-  const eps = new Set();
-  const proc = t => { for(const p of ENDPOINT_PATTERNS){const re=new RegExp(p.source,p.flags);let m;while((m=re.exec(t))!==null){const ep=m[1]||m[0];if(ep.length>4&&!/\.(js|css|png|jpg|svg|woff)$/.test(ep))eps.add(ep)}} };
-  for(const url of sr.data.external.slice(0,20)){try{const r=await chrome.runtime.sendMessage({type:'FETCH_JS',url});if(r.ok)proc(r.text)}catch{}}
-  sr.data.inline.forEach(proc);
-  const sorted = [...eps].sort();
-  b.innerHTML = sorted.length===0?'<div class="text-muted text-sm">No endpoints</div>':`<div class="text-sm mb-6">${sorted.length} endpoints</div>`+sorted.map(ep=>`<div class="result-item info"><div class="result-value">${esc(ep)}</div></div>`).join('');
-  finalizeResults('analysis');
+  const epMap = new Map();
+  const proc = (t, src) => { for(const p of ENDPOINT_PATTERNS){const re=new RegExp(p.source,p.flags);let m;while((m=re.exec(t))!==null){const ep=m[1]||m[0];if(isRealEndpoint(ep)&&!epMap.has(ep))epMap.set(ep,src)}} };
+  for(const url of sr.data.external.slice(0,20)){try{const r=await chrome.runtime.sendMessage({type:'FETCH_JS',url});if(r.ok)proc(r.text,url)}catch{}}
+  sr.data.inline.forEach((t,i) => proc(t, activeTabUrl + ' [inline]'));
+  const sorted = [...epMap.entries()].sort((a,c) => a[0].localeCompare(c[0]));
+  if (!sorted.length) { b.innerHTML = '<div class="text-muted text-sm">No endpoints</div>'; finalizeResults('discovery'); return; }
+
+  // Group by host
+  const targetDomain = getRootDomain(activeTabDomain);
+  const groups = { target: [], thirdParty: [], paths: [] };
+  const interestingPatterns = [/staging|stag\b|dev\b|test\b|sandbox|internal|debug|admin|console/i, /cognito|amazonaws|azure|firebase/i, /graphql/i, /\?key=/i];
+  const priorityPatterns = [/admin/i, /auth/i, /login/i, /password|passwd/i, /reset/i, /token/i, /delete/i, /upload/i, /export/i, /debug/i, /config/i, /internal/i, /webhook/i, /user/i, /payment/i, /checkout/i, /order/i];
+
+  sorted.forEach(([ep, src]) => {
+    const isInteresting = interestingPatterns.some(p => p.test(ep));
+    const isPriority = priorityPatterns.some(p => p.test(ep));
+    if (ep.startsWith('/')) {
+      groups.paths.push({ ep, src, interesting: isInteresting, priority: isPriority });
+    } else {
+      try {
+        const host = new URL(ep).hostname;
+        const root = getRootDomain(host);
+        if (root === targetDomain) groups.target.push({ ep, src, interesting: isInteresting, priority: isPriority });
+        else groups.thirdParty.push({ ep, src, interesting: isInteresting, priority: isPriority });
+      } catch { groups.paths.push({ ep, src, interesting: isInteresting, priority: isPriority }); }
+    }
+  });
+
+  const renderGroup = (items) => items.sort((a,c) => (c.priority?1:0) - (a.priority?1:0)).map(({ ep, src, interesting, priority }) =>
+    `<div class="result-item ${priority ? 'medium' : interesting ? 'medium' : 'info'}" style="cursor:pointer">
+      <div class="result-value">${priority ? '🎯 ' : interesting ? '⚠ ' : ''}${esc(ep)}</div>
+      <div class="text-xs text-muted">in: ${esc(src.split('/').pop() || src)}</div>
+    </div>`).join('');
+
+  let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div>
+    <div class="flex-between mb-6"><span class="text-sm">${sorted.length} endpoints</span><button class="btn-sm primary" id="ep-probe">Probe API Paths</button></div><div id="ep-list">`;
+  if (groups.paths.length) html += `<div class="result-label mt-4 mb-4">API Paths (${groups.paths.length})</div>${renderGroup(groups.paths)}`;
+  if (groups.target.length) html += `<div class="result-label mt-6 mb-4">Target URLs — ${esc(targetDomain)} (${groups.target.length})</div>${renderGroup(groups.target)}`;
+  if (groups.thirdParty.length) html += `<div class="result-label mt-6 mb-4">Third-party (${groups.thirdParty.length})</div>${renderGroup(groups.thirdParty)}`;
+  html += '</div>';
+  b.innerHTML = html;
+
+  b.querySelector('#ep-probe')?.addEventListener('click', async () => {
+    const btn = b.querySelector('#ep-probe'); btn.disabled = true; btn.textContent = 'Probing…';
+    const apiPaths = groups.paths.map(x => x.ep);
+    if (!apiPaths.length) { btn.textContent = 'No paths to probe'; return; }
+    const r = await chrome.runtime.sendMessage({ type: 'PROBE_ENDPOINTS', endpoints: apiPaths, baseUrl: activeTabUrl });
+    if (!r.ok) { btn.textContent = 'Failed'; return; }
+    const alive = r.results.filter(x => x.status >= 200 && x.status < 400);
+    // Replace just the paths section
+    const pathsEl = b.querySelector('#ep-list');
+    const existingTarget = groups.target.length ? `<div class="result-label mt-6 mb-4">Target URLs — ${esc(targetDomain)} (${groups.target.length})</div>${renderGroup(groups.target)}` : '';
+    const existingTP = groups.thirdParty.length ? `<div class="result-label mt-6 mb-4">Third-party (${groups.thirdParty.length})</div>${renderGroup(groups.thirdParty)}` : '';
+    pathsEl.innerHTML = `<div class="result-label mt-4 mb-4">API Paths — ${alive.length} alive / ${r.results.length} probed</div>` +
+      r.results.sort((a,c) => (typeof a.status==='number'?a.status:999) - (typeof c.status==='number'?c.status:999))
+      .map(x => {
+        const sev = x.status === 200 ? 'high' : x.status === 403 || x.status === 401 ? 'medium' : x.status >= 200 && x.status < 400 ? 'low' : 'info';
+        return `<div class="result-item ${sev}" style="cursor:pointer">
+          <div class="result-label"><span class="result-tag tag-${sev}">${x.status}</span> ${esc(x.endpoint)}</div>
+          ${x.size ? `<div class="text-xs text-muted">${x.size}b</div>` : ''}
+        </div>`;
+      }).join('') + existingTarget + existingTP;
+    btn.textContent = 'Probed'; finalizeResults('discovery');
+  });
+  finalizeResults('discovery');
 }
 
 async function toolHidden() {
-  const b = showResults('analysis', 'Hidden', true);
+  const b = showResults('discovery', 'Hidden', true);
   const res = await msgTab({ type: 'FIND_HIDDEN_ELEMENTS' });
   const comments = await msgTab({ type: 'FIND_COMMENTS' });
   if (!res?.ok) { b.innerHTML = errMsg(res?.error||'Cannot access page'); return; }
   const d = res.data; const total = d.hiddenInputs.length+d.hiddenDivs.length+d.disabledInputs.length+d.dataAttrs.length+(comments.data?.length||0);
-  let html = `<div class="flex-between mb-6"><span class="text-sm">${total} hidden items</span><button class="btn-sm primary" id="btn-reveal">Reveal All</button></div>`;
-  if(d.hiddenInputs.length) html += d.hiddenInputs.map(h=>`<div class="result-item medium"><div class="result-value">${esc(h.name)} = ${esc(h.value)}</div></div>`).join('');
-  if(d.dataAttrs.length) html += d.dataAttrs.map(a=>`<div class="result-item low"><div class="result-value">${esc(a.attr)} = ${esc(a.value)}</div></div>`).join('');
-  if(comments.data?.length) html += comments.data.slice(0,20).map(c=>`<div class="result-item info"><div class="result-value">${esc(c)}</div></div>`).join('');
+  let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div><div class="flex-between mb-6"><span class="text-sm">${total} hidden items</span><button class="btn-sm primary" id="btn-reveal">Reveal All</button></div>`;
+  const securityNames = /admin|debug|role|price|is_?admin|is_?staff|privilege|permission|internal|secret|token|api_?key|password|hidden_?id|user_?id|account/i;
+  if(d.hiddenInputs.length) {
+    html += `<div class="result-label mt-4 mb-4">Hidden Inputs (${d.hiddenInputs.length})</div>`;
+    html += d.hiddenInputs.map(h => {
+      const isSecurity = securityNames.test(h.name) || securityNames.test(h.value);
+      return `<div class="result-item ${isSecurity?'high':'medium'}" style="cursor:pointer">
+        <div class="result-value">${isSecurity?'🎯 ':''}${esc(h.name)} = ${esc(h.value)}</div>
+        ${isSecurity ? `<div class="text-xs text-accent">Security-relevant — try modifying this value</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+  if(d.dataAttrs.length) { html += `<div class="result-label mt-4 mb-4">Data Attributes (${d.dataAttrs.length})</div>`; html += d.dataAttrs.slice(0,20).map(a=>`<div class="result-item low" style="cursor:pointer"><div class="result-value">${esc(a.attr)} = ${esc(a.value)}</div></div>`).join(''); }
+  if(comments.data?.length) { html += `<div class="result-label mt-4 mb-4">Comments (${comments.data.length})</div>`; html += comments.data.slice(0,20).map(c=>`<div class="result-item info"><div class="result-value">${esc(c.slice(0,120))}</div></div>`).join(''); }
   b.innerHTML = html;
   b.querySelector('#btn-reveal')?.addEventListener('click', async()=>{await msgTab({type:'REVEAL_HIDDEN'});log('Revealed','success')});
-  finalizeResults('analysis');
+  finalizeResults('discovery');
 }
 
 async function toolLinks() {
-  const b = showResults('analysis', 'Links', true);
+  const b = showResults('discovery', 'Links', true);
   const res = await msgTab({ type: 'EXTRACT_LINKS' });
   if (!res?.ok) { b.innerHTML = errMsg(res?.error||'Cannot access page'); return; }
   const d = res.data;
-  b.innerHTML = `<div class="codec-row mb-6"><button class="btn-sm" data-lk="internal">Internal (${d.internal.length})</button><button class="btn-sm" data-lk="external">External (${d.external.length})</button><button class="btn-sm" data-lk="interesting">Files (${d.interesting.length})</button><button class="btn-sm" data-lk="emails">Emails (${d.emails.length})</button></div><div id="lk-c"></div>`;
-  const show = type => { const c=b.querySelector('#lk-c'); const items=type==='emails'?d.emails:d[type].map(l=>l.url||l);
-    c.innerHTML=items.slice(0,60).map(i=>`<div class="result-item ${type==='interesting'?'medium':'info'}"><div class="result-value">${esc(i)}</div></div>`).join('')+`<div class="mt-6"><button class="btn-sm" id="cp-lk">Copy All (${items.length})</button></div>`;
-    c.querySelector('#cp-lk')?.addEventListener('click',()=>copyText(items.join('\n'))); };
-  b.querySelectorAll('[data-lk]').forEach(btn=>btn.addEventListener('click',()=>show(btn.dataset.lk)));
-  show('internal'); finalizeResults('analysis');
+  let currentType = 'internal';
+  b.innerHTML = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div>
+    <div class="codec-row mb-6"><button class="btn-sm" data-lk="internal">Internal (${d.internal.length})</button><button class="btn-sm" data-lk="external">External (${d.external.length})</button><button class="btn-sm" data-lk="interesting">Files (${d.interesting.length})</button><button class="btn-sm" data-lk="emails">Emails (${d.emails.length})</button></div>
+    <div id="lk-c"></div>`;
+  const show = type => {
+    currentType = type;
+    const c = b.querySelector('#lk-c');
+    const items = type === 'emails' ? d.emails : d[type].map(l => l.url || l);
+    c.innerHTML = items.slice(0, 60).map(i => `<div class="result-item ${type==='interesting'?'medium':'info'}" style="cursor:pointer"><div class="result-value">${esc(i)}</div></div>`).join('') +
+      `<div class="tool-input-row mt-6"><button class="btn-sm" id="cp-lk">Copy All (${items.length})</button>${type !== 'emails' ? `<button class="btn-sm primary" id="probe-lk">Probe Status</button>` : ''}</div>`;
+    c.querySelector('#cp-lk')?.addEventListener('click', () => copyText(items.join('\n')));
+    c.querySelector('#probe-lk')?.addEventListener('click', async () => {
+      const probeBtn = c.querySelector('#probe-lk'); probeBtn.disabled = true; probeBtn.textContent = 'Probing…';
+      const r = await chrome.runtime.sendMessage({ type: 'PROBE_LINKS', links: items.slice(0, 30) });
+      if (!r.ok) { probeBtn.textContent = 'Failed'; return; }
+      const alive = r.results.filter(x => x.status >= 200 && x.status < 400);
+      const dead = r.results.filter(x => x.status === 'dead');
+      // Replace list with probed results
+      const listHtml = r.results.map(x => {
+        const sev = x.status === 'dead' ? 'info' : x.status === 200 ? 'high' : x.status >= 300 && x.status < 400 ? 'low' : x.status >= 400 ? 'medium' : 'info';
+        const tag = x.status === 'dead' ? 'DEAD' : x.status;
+        return `<div class="result-item ${sev}" style="cursor:pointer">
+          <div class="result-label"><span class="result-tag tag-${sev}">${tag}</span></div>
+          <div class="result-value">${esc(x.url)}</div>
+          ${x.finalUrl && x.finalUrl !== x.url ? `<div class="text-xs text-muted">→ ${esc(x.finalUrl)}</div>` : ''}
+        </div>`;
+      }).join('');
+      c.innerHTML = `<div class="text-xs text-muted mb-6">${alive.length} alive, ${dead.length} dead</div>${listHtml}<div class="mt-6"><button class="btn-sm" id="cp-lk2">Copy Alive</button></div>`;
+      c.querySelector('#cp-lk2')?.addEventListener('click', () => copyText(alive.map(x => x.url).join('\n')));
+    });
+  };
+  b.querySelectorAll('[data-lk]').forEach(btn => btn.addEventListener('click', () => show(btn.dataset.lk)));
+  show('internal'); finalizeResults('discovery');
 }
 
 async function toolReplayer() {
-  const b = showResults('active', 'Replayer', true);
+  const b = showResults('utility', 'Replayer', true);
   const res = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
   const reqs = res.requests||[];
   if(!reqs.length){ b.innerHTML='<div class="text-muted text-sm">No requests captured. Browse first.</div>'; return; }
-  const display = reqs.slice(-15).reverse();
-  b.innerHTML = `<div class="text-sm mb-6">${reqs.length} captured</div>`+display.map((r,i)=>{const u=new URL(r.url);return`<div class="result-item info" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-info">${r.method||'GET'}</span>${r.statusCode||'?'}</div><div class="result-value">${esc(u.pathname+u.search).slice(0,70)}</div></div>`}).join('')+
-  `<div class="mt-8" id="rp-det" style="display:none"><div class="tool-input-row"><select class="tool-select" id="rp-m" style="width:80px"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>OPTIONS</option></select></div><input class="tool-input mb-6" id="rp-u"><textarea class="tool-input mb-6" id="rp-h" rows="2" placeholder="Headers JSON">{}</textarea><textarea class="tool-input mb-6" id="rp-b" rows="2" placeholder="Body"></textarea><div class="tool-input-row"><button class="btn-sm primary" id="rp-send">Send</button><button class="btn-sm" id="rp-curl">cURL</button></div><pre class="result-value mt-6" id="rp-out" style="max-height:200px;overflow:auto;white-space:pre-wrap"></pre></div>`;
-  b.querySelectorAll('[data-ri]').forEach(el=>el.addEventListener('click',()=>{const r=display[+el.dataset.ri];b.querySelector('#rp-det').style.display='block';b.querySelector('#rp-m').value=r.method||'GET';b.querySelector('#rp-u').value=r.url}));
+  const display = reqs.slice(-20).reverse();
+  b.innerHTML = `<div class="text-sm mb-6">${reqs.length} captured</div>`+display.map((r,i)=>{const u=new URL(r.url);const hasBody=r.body&&r.body.length>0;return`<div class="result-item ${hasBody?'medium':'info'}" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-${hasBody?'medium':'info'}">${r.method||'GET'}</span>${r.statusCode||'?'}</div><div class="result-value">${esc(u.pathname+u.search).slice(0,70)}</div>${hasBody?`<div class="text-xs text-muted">Body: ${esc(r.body.slice(0,60))}${r.body.length>60?'…':''}</div>`:''}</div>`}).join('')+
+  `<div class="mt-8" id="rp-det" style="display:none"><div class="tool-input-row"><select class="tool-select" id="rp-m" style="width:80px"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>OPTIONS</option></select></div><input class="tool-input mb-6" id="rp-u"><textarea class="tool-input mb-6" id="rp-h" rows="2" placeholder="Headers JSON">{}</textarea><textarea class="tool-input mb-6" id="rp-b" rows="3" placeholder="Request body (form data or JSON)"></textarea><div class="tool-input-row"><button class="btn-sm primary" id="rp-send">Send</button><button class="btn-sm" id="rp-curl">Copy cURL</button></div><pre class="result-value mt-6" id="rp-out" style="max-height:200px;overflow:auto;white-space:pre-wrap"></pre></div>`;
+  b.querySelectorAll('[data-ri]').forEach(el=>el.addEventListener('click',()=>{
+    const r=display[+el.dataset.ri];
+    b.querySelector('#rp-det').style.display='block';
+    b.querySelector('#rp-m').value=r.method||'GET';
+    b.querySelector('#rp-u').value=r.url;
+    if(r.body) b.querySelector('#rp-b').value=r.body;
+    // Pre-fill headers if available
+    if(r.requestHeaders){try{const h={};r.requestHeaders.forEach(rh=>{if(!['host','connection','content-length','accept-encoding'].includes(rh.name.toLowerCase()))h[rh.name]=rh.value});b.querySelector('#rp-h').value=JSON.stringify(h,null,2)}catch{}}
+  }));
   b.querySelector('#rp-send')?.addEventListener('click',async()=>{let h={};try{h=JSON.parse(b.querySelector('#rp-h').value)}catch{};const r=await chrome.runtime.sendMessage({type:'REPLAY_REQUEST',url:b.querySelector('#rp-u').value,method:b.querySelector('#rp-m').value,headers:h,body:b.querySelector('#rp-b').value||undefined});b.querySelector('#rp-out').textContent=r.ok?`HTTP ${r.status}\n${JSON.stringify(r.headers,null,2)}\n\n${r.text.slice(0,2000)}`:'Error: '+r.error});
-  b.querySelector('#rp-curl')?.addEventListener('click',()=>{copyText(`curl -X ${b.querySelector('#rp-m').value} '${b.querySelector('#rp-u').value}'`)});
-  finalizeResults('active');
+  b.querySelector('#rp-curl')?.addEventListener('click',()=>{
+    const m=b.querySelector('#rp-m').value, u=b.querySelector('#rp-u').value, bd=b.querySelector('#rp-b').value;
+    let cmd=`curl -X ${m} '${u}'`;
+    try{const h=JSON.parse(b.querySelector('#rp-h').value);Object.entries(h).forEach(([k,v])=>{cmd+=` -H '${k}: ${v}'`})}catch{}
+    if(bd) cmd+=` -d '${bd}'`;
+    copyText(cmd);
+  });
+  finalizeResults('offensive');
 }
 
 async function toolCors() {
-  const b = showResults('active','CORS',false);
-  b.innerHTML=`<div class="tool-input-row mb-6"><input class="tool-input" id="cors-u" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="cors-go">Test</button></div><div id="cors-o"></div>`;
-  b.querySelector('#cors-go').addEventListener('click',async()=>{const url=b.querySelector('#cors-u').value,o=b.querySelector('#cors-o');o.innerHTML='<div class="loading-text"><span class="spinner"></span></div>';const r=await chrome.runtime.sendMessage({type:'TEST_CORS',url,targetOrigin:new URL(url).origin});if(!r.ok){o.innerHTML=errMsg('Failed');return}o.innerHTML=r.results.map(x=>{const v=x.acao&&(x.acao==='*'||x.acao===x.origin)&&x.acac==='true';return`<div class="result-item ${v?'high':'info'}"><div class="result-label">${x.type||'OPTIONS'} Origin: ${esc(x.origin||'?')}</div><div class="result-value">ACAO: ${esc(x.acao||'none')} | ACAC: ${esc(x.acac||'none')}</div>${v?'<div class="text-xs text-accent" style="font-weight:600">⚠ CORS misconfiguration!</div>':''}</div>`}).join('');finalizeResults('active')});
+  const b = showResults('offensive','CORS',false);
+  b.innerHTML=`<div class="tool-input-row mb-6"><input class="tool-input" id="cors-u" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="cors-go">Test 9 Origins</button></div><div id="cors-o"></div>`;
+  b.querySelector('#cors-go').addEventListener('click', async () => {
+    const url = b.querySelector('#cors-u').value, o = b.querySelector('#cors-o');
+    o.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing CORS origins…</div>';
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_CORS', url });
+    if (!r.ok) { o.innerHTML = errMsg('Failed'); return; }
+    const criticals = r.results.filter(x => x.critical);
+    const vulns = r.results.filter(x => x.vuln);
+    o.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tested</span><span class="text-sm ${criticals.length?'text-accent':''}" style="font-weight:700">${criticals.length} critical, ${vulns.length} reflected</span></div>` +
+      r.results.map(x => {
+        const sev = x.critical ? 'high' : x.vuln ? 'medium' : 'info';
+        return `<div class="result-item ${sev}">
+          <div class="result-label"><span class="result-tag tag-${sev}">${x.critical ? 'CRIT' : x.vuln ? 'VULN' : x.status || 'OK'}</span> ${esc(x.label)}</div>
+          <div class="result-value">Origin: ${esc(x.origin)}<br>ACAO: ${esc(x.acao || 'none')} | ACAC: ${esc(x.acac || 'none')}</div>
+          ${x.critical ? '<div class="text-xs text-accent" style="font-weight:600">⚠ Origin reflected WITH credentials — exploitable CORS!</div>' : ''}
+          ${x.vuln && !x.critical ? '<div class="text-xs" style="color:var(--warning)">Origin reflected (no credentials — lower impact)</div>' : ''}
+        </div>`;
+      }).join('');
+    finalizeResults('offensive');
+  });
 }
 
 async function toolRedirect() {
-  const b = showResults('active','Redirect',true);
+  const b = showResults('offensive','Redirect',true);
   const r = await msgTab({ type: 'CHECK_PASSIVE_VULNS' });
   const rf = (r?.data||[]).filter(f=>f.type==='Potential Open Redirect');
   b.innerHTML = rf.length?rf.map(f=>`<div class="result-item medium"><div class="result-label"><span class="result-tag tag-medium">POTENTIAL</span>${esc(f.type)}</div><div class="result-value">${esc(f.detail)}</div></div>`).join(''):'<div class="text-muted text-sm">No redirect params</div>';
-  finalizeResults('active');
+  finalizeResults('offensive');
 }
 
 function toolCodec() {
-  const b = showResults('active','Codec',false);
+  const b = showResults('utility','Codec',false);
   b.innerHTML=`<textarea class="tool-input mb-6" id="ci" rows="3" placeholder="Input…"></textarea><div class="codec-row"><button class="btn-sm" data-e="b64e">B64 Enc</button><button class="btn-sm" data-e="b64d">B64 Dec</button><button class="btn-sm" data-e="urle">URL Enc</button><button class="btn-sm" data-e="urld">URL Dec</button><button class="btn-sm" data-e="htmle">HTML Ent</button><button class="btn-sm" data-e="htmld">HTML Dec</button><button class="btn-sm" data-e="hex">Hex</button><button class="btn-sm" data-e="unhex">Unhex</button><button class="btn-sm" data-e="jwt">JWT</button><button class="btn-sm" data-e="rot13">ROT13</button><button class="btn-sm" data-e="len">Length</button></div><textarea class="tool-input mt-6" id="co" rows="3" readonly placeholder="Output…"></textarea><div class="mt-6"><button class="btn-sm" id="cc-cp">Copy</button> <button class="btn-sm" id="cc-sw">↕ Swap</button></div>`;
   const i=b.querySelector('#ci'),o=b.querySelector('#co');
   b.querySelectorAll('[data-e]').forEach(btn=>btn.addEventListener('click',()=>{const v=i.value;try{switch(btn.dataset.e){case'b64e':o.value=btoa(unescape(encodeURIComponent(v)));break;case'b64d':o.value=decodeURIComponent(escape(atob(v)));break;case'urle':o.value=encodeURIComponent(v);break;case'urld':o.value=decodeURIComponent(v);break;case'htmle':o.value=v.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));break;case'htmld':{const d=document.createElement('div');d.innerHTML=v;o.value=d.textContent;break}case'hex':o.value=[...v].map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join(' ');break;case'unhex':o.value=v.replace(/\s/g,'').match(/.{2}/g)?.map(x=>String.fromCharCode(parseInt(x,16))).join('')||'';break;case'jwt':{const p=v.split('.');o.value=JSON.stringify({header:JSON.parse(atob(p[0].replace(/-/g,'+').replace(/_/g,'/'))),payload:JSON.parse(atob(p[1].replace(/-/g,'+').replace(/_/g,'/')))},null,2);break}case'rot13':o.value=v.replace(/[a-zA-Z]/g,c=>String.fromCharCode(c.charCodeAt(0)+(c.toLowerCase()<'n'?13:-13)));break;case'len':o.value=`${v.length} chars, ${new Blob([v]).size} bytes`;break}}catch(e){o.value='Error: '+e.message}}));
@@ -700,7 +1126,7 @@ function toolCodec() {
 }
 
 function toolScope() {
-  const b = showResults('workflow','Scope',false);
+  const b = showResults('scope','Scope',false);
   const render = () => {
     b.innerHTML=`<div class="tool-input-row mb-6"><input class="tool-input" id="sc-i" placeholder="Add domain"><button class="btn-sm primary" id="sc-a">Add</button></div><div class="flex-between mb-6"><span class="text-sm">${scopeDomains.length} in scope</span><button class="btn-sm" id="sc-ac">+ Current</button></div><ul class="scope-list">${scopeDomains.map((d,i)=>`<li class="scope-item"><button class="remove-scope" data-idx="${i}">✕</button><span>${esc(d)}</span></li>`).join('')}</ul>`;
     b.querySelector('#sc-a')?.addEventListener('click',()=>{const v=b.querySelector('#sc-i').value.trim();if(v&&!scopeDomains.includes(v)){scopeDomains.push(v);chrome.storage.local.set({scopeDomains});updateScopeIndicator();render()}});
@@ -711,7 +1137,7 @@ function toolScope() {
 }
 
 function toolNotes() {
-  const b = showResults('workflow','Notes',false);
+  const b = showResults('scope','Notes',false);
   const key = getRootDomain(activeTabDomain)||'global';
   b.innerHTML=`<textarea class="notes-editor" id="nt" placeholder="Notes for ${key}…">${esc(notes[key]||'')}</textarea><div class="tool-input-row mt-6"><button class="btn-sm primary" id="ns">Save</button><button class="btn-sm" id="nc">Copy</button><button class="btn-sm" id="ne">Export</button></div>`;
   b.querySelector('#ns')?.addEventListener('click',()=>{notes[key]=b.querySelector('#nt').value;chrome.storage.local.set({notes});log('Saved: '+key,'success')});
@@ -748,25 +1174,66 @@ async function toolScreenshot() {
 }
 
 async function toolPassive() {
-  const b = showResults('smart','Vuln Hints',true);
+  const b = showResults('discovery','Vuln Hints',true);
   const r = await msgTab({ type: 'CHECK_PASSIVE_VULNS' });
   const f = r?.data||[];
-  if(f.length){const bd=document.getElementById('badge-smart');bd.textContent=f.length;bd.classList.remove('hidden')}
-  b.innerHTML = f.length===0?'<div class="text-muted text-sm">No passive findings</div>':f.map(x=>`<div class="result-item ${x.severity}"><div class="result-label"><span class="result-tag tag-${x.severity}">${x.severity}</span>${esc(x.type)}</div><div class="result-value">${esc(x.detail)}</div></div>`).join('');
-  finalizeResults('smart');
+
+  // Additional checks from sidepanel
+  // CSRF: check forms
+  try {
+    const formRes = await msgTab({ type: 'EXTRACT_FORMS' });
+    (formRes?.data || []).forEach(form => {
+      if (form.method?.toLowerCase() === 'post' || !form.method) {
+        const hasCSRF = form.fields.some(fi => /csrf|_token|authenticity_token|__RequestVerification|_xsrf/i.test(fi.name));
+        if (!hasCSRF && form.fields.length > 0) {
+          f.push({ severity: 'high', type: 'Missing CSRF Token', detail: `POST form (${form.fields.length} fields) → ${form.action || '(self)'} — no CSRF protection detected` });
+        }
+      }
+      // Autocomplete on sensitive fields
+      form.fields.forEach(fi => {
+        if (['password','credit-card','cc-number','cvv','ssn'].includes(fi.type) || /password|card|cvv|ssn|credit/i.test(fi.name)) {
+          if (fi.autocomplete !== 'off') f.push({ severity: 'low', type: 'Autocomplete Enabled', detail: `Field "${fi.name}" (${fi.type}) allows autocomplete — PCI concern` });
+        }
+      });
+    });
+  } catch {}
+
+  // Clickjacking: check headers
+  try {
+    const hRes = await chrome.runtime.sendMessage({ type: 'GET_HEADERS', tabId: activeTabId });
+    if (hRes.headers) {
+      const hd = {}; hRes.headers.responseHeaders.forEach(h => { hd[h.name.toLowerCase()] = h.value; });
+      if (!hd['x-frame-options'] && !(hd['content-security-policy']||'').includes('frame-ancestors')) {
+        f.push({ severity: 'medium', type: 'Clickjacking', detail: 'No X-Frame-Options or CSP frame-ancestors — page can be embedded in iframe' });
+      }
+      // Sensitive data in URL params
+      const u = new URL(activeTabUrl);
+      u.searchParams.forEach((v, k) => {
+        if (/password|token|secret|key|ssn|credit|auth/i.test(k)) {
+          f.push({ severity: 'medium', type: 'Sensitive URL Param', detail: `"${k}" in URL — leaks via Referer header and browser history` });
+        }
+      });
+    }
+  } catch {}
+
+  if(f.length){const bd=document.getElementById('badge-discovery');bd.textContent=f.length;bd.classList.remove('hidden')}
+  b.innerHTML = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div>` +
+    (f.length===0 ? '<div class="text-muted text-sm">No passive findings</div>' :
+    f.map(x=>`<div class="result-item ${x.severity}" style="cursor:pointer"><div class="result-label"><span class="result-tag tag-${x.severity}">${x.severity}</span>${esc(x.type)}</div><div class="result-value">${esc(x.detail)}</div></div>`).join(''));
+  finalizeResults('discovery');
 }
 
 async function toolWayback() {
-  const b = showResults('smart','Wayback',true);
+  const b = showResults('recon','Wayback',true);
   b.innerHTML='<div class="loading-text"><span class="spinner"></span> Querying…</div>';
   const r = await chrome.runtime.sendMessage({ type: 'WAYBACK_LOOKUP', url: activeTabUrl });
   if(!r.ok){b.innerHTML=errMsg(r.error);return}
   b.innerHTML=!r.snapshots.length?'<div class="text-muted text-sm">No snapshots</div>':`<div class="text-sm mb-6">${r.snapshots.length} snapshots</div>`+r.snapshots.map(s=>{const d=s[0].slice(0,4)+'-'+s[0].slice(4,6)+'-'+s[0].slice(6,8);return`<div class="result-item info"><a href="https://web.archive.org/web/${s[0]}/${s[1]}" target="_blank" style="color:var(--accent);text-decoration:none"><div class="result-label">${d}</div><div class="result-value">${esc(s[1]).slice(0,60)} (${s[2]})</div></a></div>`}).join('');
-  finalizeResults('smart');
+  finalizeResults('discovery');
 }
 
 function toolDiff() {
-  const b = showResults('smart','Diff',false);
+  const b = showResults('utility','Diff',false);
   b.innerHTML=`<div class="text-sm mb-6">Fetch same URL with different headers</div><div class="tool-input-row"><input class="tool-input" id="df-u" value="${esc(activeTabUrl)}"></div><textarea class="tool-input mb-6" id="df-h" rows="2" placeholder='{"Cookie":"a=1"}'>{}</textarea><div class="tool-input-row mb-6"><button class="btn-sm primary" id="df-a">→ A</button><button class="btn-sm primary" id="df-b">→ B</button><button class="btn-sm success" id="df-c" ${!diffStore.a||!diffStore.b?'disabled':''}>Compare</button></div><div class="text-xs mb-6">A: ${diffStore.a?'✓ '+diffStore.a.status:'—'} | B: ${diffStore.b?'✓ '+diffStore.b.status:'—'}</div><pre class="result-value" id="df-o" style="max-height:250px;overflow:auto;white-space:pre-wrap;font-size:10px"></pre>`;
   const fetch_ = async s=>{let h={};try{h=JSON.parse(b.querySelector('#df-h').value)}catch{};const r=await chrome.runtime.sendMessage({type:'FETCH_URL',url:b.querySelector('#df-u').value,headers:h});diffStore[s]={text:r.text||'',status:r.status};toolDiff()};
   b.querySelector('#df-a')?.addEventListener('click',()=>fetch_('a'));
@@ -776,24 +1243,29 @@ function toolDiff() {
 
 // ═══ PARAMETER FUZZER ═══
 async function toolParamFuzz() {
-  const b = showResults('active', 'Param Fuzzer', false);
+  const b = showResults('offensive', 'Param Fuzzer', false);
   const u = new URL(activeTabUrl);
   const params = [...u.searchParams.keys()];
-  b.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params detected: ' + params.map(esc).join(', ') : 'No URL params — paste a URL with parameters'}</div>
+  b.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : 'No URL params found'}</div>
     <div class="tool-input-row"><input class="tool-input" id="fz-url" value="${esc(activeTabUrl)}" placeholder="URL with params"></div>
-    <div class="codec-row mb-6">
+    <div class="codec-row mb-4">
       <button class="btn-sm primary" data-fzcat="xss">XSS</button>
       <button class="btn-sm" data-fzcat="sqli">SQLi</button>
       <button class="btn-sm" data-fzcat="ssti">SSTI</button>
       <button class="btn-sm" data-fzcat="path">Path Traversal</button>
     </div>
+    <details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary>
+      <textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line. Use with any category button — these will be tested IN ADDITION to the built-in payloads."></textarea>
+      <div class="text-xs text-muted mt-4">Tip: target specific params by editing the URL above</div>
+    </details>
     <div id="fz-out"></div>`;
   b.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
     const out = b.querySelector('#fz-out');
     const url = b.querySelector('#fz-url').value;
     const cat = btn.dataset.fzcat;
-    out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()} payloads…</div>`;
-    const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat });
+    const customPayloads = (b.querySelector('#fz-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+    out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${customPayloads.length ? ' + ' + customPayloads.length + ' custom' : ''}…</div>`;
+    const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads });
     if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
     if (r.message) { out.innerHTML = `<div class="text-muted text-sm">${esc(r.message)}</div>`; return; }
     const critical = r.results.filter(x => x.severity === 'high');
@@ -803,22 +1275,23 @@ async function toolParamFuzz() {
         const sevColor = x.severity === 'high' ? 'high' : x.severity === 'medium' ? 'medium' : x.severity === 'low' ? 'low' : 'info';
         const tagClass = x.severity === 'high' ? 'tag-high' : x.severity === 'medium' ? 'tag-medium' : x.severity === 'low' ? 'tag-low' : 'tag-safe';
         const tagText = x.severity === 'high' ? 'VULN' : x.severity === 'medium' ? 'WARN' : x.severity === 'low' ? 'NOTE' : 'SAFE';
-        return `<div class="result-item ${sevColor}">
+        return `<div class="result-item ${sevColor}" style="cursor:pointer">
           <div class="result-label"><span class="result-tag ${tagClass}">${tagText}</span> ${esc(x.param)}</div>
           <div class="result-value" style="margin-bottom:3px">${esc(x.payload)}</div>
           <div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">${esc(x.analysis)}</div>
           ${x.status ? `<div class="text-xs text-muted">HTTP ${x.status} · ${x.bodyLen} bytes</div>` : ''}
           ${x.context ? `<div style="margin-top:4px;padding:4px 6px;background:${x.severity==='high'?'var(--danger-soft)':'var(--surface-hover)'};border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:70px;overflow:auto">${esc(x.context)}</div>` : ''}
+          ${x.errorBody ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:80px;overflow:auto"><strong>Error response:</strong><br>${esc(x.errorBody.slice(0,400))}</div>` : ''}
         </div>`;
       }).join('');
-    finalizeResults('active');
+    finalizeResults('offensive');
     log(`Fuzz: ${critical.length} critical, ${warnings.length} warnings (${cat})`, critical.length ? 'warn' : 'success');
   }));
 }
 
 // ═══ JS BEAUTIFIER ═══
 async function toolJsBeautify() {
-  const b = showResults('analysis', 'JS Beautifier', false);
+  const b = showResults('utility', 'JS Beautifier', false);
   const sr = await msgTab({ type: 'GET_SCRIPT_URLS' });
   const scripts = sr?.ok ? sr.data.external : [];
   b.innerHTML = `<div class="text-sm mb-6">${scripts.length} external JS files</div>
@@ -862,9 +1335,59 @@ function jsBeautify(code) {
   return out;
 }
 
+// ═══ STORAGE VIEWER ═══
+async function toolStorage() {
+  const b = showResults('clientdata', 'Storage', true);
+  const res = await msgTab({ type: 'GET_STORAGE' });
+  if (!res?.ok) { b.innerHTML = errMsg(res?.error || 'Cannot access page storage'); return; }
+  const ls = Object.entries(res.data.localStorage || {});
+  const ss = Object.entries(res.data.sessionStorage || {});
+  const jwtPattern = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/;
+
+  let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div>`;
+  // Flag JWTs and interesting keys
+  const securityKeys = /token|jwt|auth|session|key|secret|password|credential|access|refresh|api/i;
+
+  if (ls.length) {
+    html += `<div class="result-label mt-4 mb-4">localStorage (${ls.length})</div>`;
+    ls.forEach(([k, v]) => {
+      const isJwt = jwtPattern.test(v);
+      const isSecurity = securityKeys.test(k);
+      html += `<div class="result-item ${isJwt ? 'high' : isSecurity ? 'medium' : 'info'}" style="cursor:pointer">
+        <div class="result-label">${isJwt ? '🎟 ' : isSecurity ? '🔑 ' : ''}${esc(k)}</div>
+        <div class="result-value" style="font-size:9.5px;word-break:break-all">${esc((v || '').slice(0, 120))}</div>
+        ${isJwt ? '<div class="text-xs text-accent">JWT detected — use JWT Editor to decode</div>' : ''}
+      </div>`;
+    });
+  }
+  if (ss.length) {
+    html += `<div class="result-label mt-6 mb-4">sessionStorage (${ss.length})</div>`;
+    ss.forEach(([k, v]) => {
+      const isJwt = jwtPattern.test(v);
+      const isSecurity = securityKeys.test(k);
+      html += `<div class="result-item ${isJwt ? 'high' : isSecurity ? 'medium' : 'info'}" style="cursor:pointer">
+        <div class="result-label">${isJwt ? '🎟 ' : isSecurity ? '🔑 ' : ''}${esc(k)}</div>
+        <div class="result-value" style="font-size:9.5px;word-break:break-all">${esc((v || '').slice(0, 120))}</div>
+        ${isJwt ? '<div class="text-xs text-accent">JWT detected — use JWT Editor to decode</div>' : ''}
+      </div>`;
+    });
+  }
+  if (!ls.length && !ss.length) html += '<div class="text-muted text-sm">No data in localStorage or sessionStorage</div>';
+  else {
+    html += `<div class="tool-input-row mt-6"><button class="btn-sm" id="st-copy">Copy All</button><button class="btn-sm" id="st-json">Copy JSON</button></div>`;
+  }
+  b.innerHTML = html;
+  b.querySelector('#st-copy')?.addEventListener('click', () => {
+    const lines = [...ls.map(([k,v]) => `[localStorage] ${k} = ${v}`), ...ss.map(([k,v]) => `[sessionStorage] ${k} = ${v}`)];
+    copyText(lines.join('\n'));
+  });
+  b.querySelector('#st-json')?.addEventListener('click', () => copyText(JSON.stringify(res.data, null, 2)));
+  finalizeResults('discovery');
+}
+
 // ═══ CSP EVALUATOR ═══
 async function toolCspEval() {
-  const b = showResults('smart', 'CSP Evaluator', true);
+  const b = showResults('discovery', 'CSP Evaluator', true);
   const hRes = await chrome.runtime.sendMessage({ type: 'GET_HEADERS', tabId: activeTabId });
   let csp = null;
   if (hRes.headers?.responseHeaders) {
@@ -872,22 +1395,33 @@ async function toolCspEval() {
     if (cspH) csp = cspH.value;
   }
   if (!csp) {
-    b.innerHTML = '<div class="result-item medium"><div class="result-label">No CSP Header</div><div class="result-value">This page has no Content-Security-Policy header — all resources allowed from any origin.</div></div>';
-    finalizeResults('smart'); return;
+    // Check meta tag CSP (common in SPAs)
+    try {
+      const metaRes = await msgTab({ type: 'GET_META_CSP' });
+      if (metaRes?.csp) {
+        csp = metaRes.csp;
+        // Will show source below
+      }
+    } catch {}
   }
+  if (!csp) {
+    b.innerHTML = '<div class="result-item high"><div class="result-label">No CSP</div><div class="result-value">No Content-Security-Policy header or meta tag found. All resources allowed from any origin. XSS has no mitigation.</div></div>';
+    finalizeResults('discovery'); return;
+  }
+  const cspSource = csp === (hRes.headers?.responseHeaders?.find(h => h.name.toLowerCase() === 'content-security-policy')?.value) ? 'HTTP header' : '<meta> tag';
   const r = await chrome.runtime.sendMessage({ type: 'EVALUATE_CSP', csp });
   if (!r.ok) { b.innerHTML = errMsg(r.error); return; }
   const gradeClass = 'grade-' + r.grade.toLowerCase();
-  b.innerHTML = `<div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade ${gradeClass}">${r.grade}</span><span class="text-sm">${r.findings.length} finding${r.findings.length===1?'':'s'}</span></div>` +
+  b.innerHTML = `<div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade ${gradeClass}">${r.grade}</span><span class="text-sm">${r.findings.length} finding${r.findings.length===1?'':'s'} · Source: ${cspSource}</span></div>` +
     `<div class="result-item info mb-6"><div class="result-label">Raw CSP</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(r.raw)}</div></div>` +
     r.findings.map(f => `<div class="result-item ${f.severity}"><div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span>${esc(f.directive)}: ${esc(f.issue)}</div><div class="result-value">${esc(f.detail)}</div></div>`).join('');
-  finalizeResults('smart');
+  finalizeResults('discovery');
   log('CSP: Grade ' + r.grade + ' (' + r.findings.length + ' findings)', r.grade <= 'B' ? 'success' : 'warn');
 }
 
 // ═══ SUBDOMAIN TAKEOVER ═══
 async function toolTakeover() {
-  const b = showResults('smart', 'Takeover Check', true);
+  const b = showResults('recon', 'Takeover Check', true);
   // First get subdomains
   b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Step 1: Enumerating subdomains…</div>';
   const root = getRootDomain(activeTabDomain);
@@ -899,7 +1433,7 @@ async function toolTakeover() {
   if (!r.ok) { b.innerHTML = errMsg(r.error); return; }
   if (!r.results.length) {
     b.innerHTML = `<div class="text-muted text-sm">No dangling CNAMEs found across ${subs.length} subdomains</div>`;
-    finalizeResults('smart'); return;
+    finalizeResults('discovery'); return;
   }
   const vulns = r.results.filter(x => x.vulnerable);
   b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} CNAME matches, <span class="${vulns.length?'text-accent':'text-muted'}" style="font-weight:700">${vulns.length} potentially vulnerable</span></span></div>` +
@@ -907,13 +1441,13 @@ async function toolTakeover() {
       <div class="result-label"><span class="result-tag ${x.vulnerable ? 'tag-high' : 'tag-low'}">${x.vulnerable ? 'VULN' : 'OK'}</span>${esc(x.service)}</div>
       <div class="result-value">${esc(x.subdomain)} → ${esc(x.cname)}</div>
     </div>`).join('');
-  finalizeResults('smart');
+  finalizeResults('discovery');
   log(`Takeover: ${vulns.length} vulnerable of ${r.results.length} checked`, vulns.length ? 'warn' : 'success');
 }
 
 // ═══ 403 BYPASS TESTER ═══
 async function tool403Bypass() {
-  const b = showResults('active', '403 Bypass', true);
+  const b = showResults('offensive', '403 Bypass', true);
   b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="bp-url" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="bp-go">Test 17 Bypasses</button></div><div id="bp-out"></div>`;
   b.querySelector('#bp-go').addEventListener('click', async () => {
     const out = b.querySelector('#bp-out');
@@ -927,14 +1461,14 @@ async function tool403Bypass() {
         <div class="result-value">${esc(x.technique)}</div>
         ${x.bypass?'<div class="text-xs text-accent" style="font-weight:600">⚠ BYPASS — got '+x.status+' instead of '+r.baseStatus+'!</div>':''}
       </div>`).join('');
-    finalizeResults('active');
+    finalizeResults('offensive');
     log(`403 bypass: ${bypasses.length} found`, bypasses.length ? 'warn' : 'success');
   });
 }
 
 // ═══ HTTP METHOD TESTER ═══
 async function toolMethodTest() {
-  const b = showResults('active', 'Method Tester', true);
+  const b = showResults('offensive', 'Method Tester', true);
   b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 8 HTTP methods…</div>';
   const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url: activeTabUrl });
   if (!r.ok) { b.innerHTML = errMsg(r.error); return; }
@@ -956,12 +1490,12 @@ async function toolMethodTest() {
         ${x.preview ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;max-height:50px;overflow:auto">${esc(x.preview)}</div>` : ''}
       </div>`;
     }).join('');
-  finalizeResults('active');
+  finalizeResults('offensive');
 }
 
 // ═══ JWT EDITOR ═══
 function toolJwtEditor() {
-  const b = showResults('active', 'JWT Editor', false);
+  const b = showResults('clientdata', 'JWT Editor', false);
   b.innerHTML = `<div class="text-sm mb-6">Paste a JWT token or auto-detect from cookies</div>
     <div class="tool-input-row"><textarea class="tool-input" id="jwt-in" rows="3" placeholder="eyJhbGciOiJIUzI1NiIs…"></textarea></div>
     <div class="codec-row mb-6">
@@ -989,8 +1523,12 @@ function toolJwtEditor() {
       const expiry = payload.exp ? new Date(payload.exp * 1000).toISOString() : 'none';
       const expired = payload.exp ? payload.exp * 1000 < Date.now() : false;
 
+      const authClaims = ['role','admin','is_admin','is_staff','permissions','groups','scope','aud','tenant_id','user_id','userId','uid','email','username'];
+      const flaggedClaims = Object.keys(payload).filter(k => authClaims.includes(k));
+
       out.innerHTML = `<div class="result-item ${expired?'medium':'info'}"><div class="result-label">Header (alg: ${esc(header.alg)})</div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(header,null,2))}</pre></div></div>
         <div class="result-item info"><div class="result-label">Payload${expired?' — EXPIRED':''}</div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(payload,null,2))}</pre></div><div class="text-xs text-muted">Expires: ${expiry}</div></div>
+        ${flaggedClaims.length ? `<div class="result-item medium"><div class="result-label">🎯 Auth Claims Detected</div><div class="result-value">${flaggedClaims.map(k => `<strong>${esc(k)}</strong>: ${esc(String(payload[k]))}`).join(' · ')}</div><div class="text-xs" style="color:var(--warning)">These control authorization — modify with quick edits below</div></div>` : ''}
         <div class="result-label mt-6 mb-4">Edit & Re-encode</div>
         <textarea class="tool-input mb-4" id="jwt-edit" rows="6" style="font-size:10px">${esc(JSON.stringify(payload,null,2))}</textarea>
         <div class="codec-row">
@@ -998,9 +1536,45 @@ function toolJwtEditor() {
           <button class="btn-sm" id="jwt-resign">Re-encode (keep alg)</button>
           <button class="btn-sm" id="jwt-copy">Copy token</button>
         </div>
+        <div class="text-xs" style="color:var(--warning);margin-top:4px">Note: "Re-encode (keep alg)" reuses the original signature. The token will be invalid unless the server doesn't verify signatures. Use "alg:none" to strip the signature entirely.</div>
+        <div class="result-label mt-6 mb-4">Quick Edits</div>
+        <div class="codec-row mb-4">
+          <button class="btn-sm jwt-qe" data-qe="admin">role→admin</button>
+          <button class="btn-sm jwt-qe" data-qe="uid1">user_id→1</button>
+          <button class="btn-sm jwt-qe" data-qe="expiry">+1yr expiry</button>
+          <button class="btn-sm jwt-qe" data-qe="email">email→admin@</button>
+        </div>
         <textarea class="tool-input mt-6" id="jwt-result" rows="2" readonly placeholder="Modified token…"></textarea>`;
 
-      const b64url = (s) => btoa(s).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+      const b64url = (s) => btoa(unescape(encodeURIComponent(s))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+      // Quick edit presets
+      out.querySelectorAll('.jwt-qe').forEach(btn => btn.addEventListener('click', () => {
+        try {
+          const ed = out.querySelector('#jwt-edit');
+          const p = JSON.parse(ed.value);
+          switch (btn.dataset.qe) {
+            case 'admin':
+              if (p.role) p.role = 'admin';
+              else if (p.roles) p.roles = ['admin'];
+              else if (p.is_admin !== undefined) p.is_admin = true;
+              else p.role = 'admin';
+              break;
+            case 'uid1':
+              ['user_id','userId','uid','sub','id','user'].forEach(k => { if (p[k] !== undefined) p[k] = typeof p[k] === 'number' ? 1 : '1'; });
+              if (!['user_id','userId','uid','sub','id','user'].some(k => p[k] !== undefined)) p.sub = '1';
+              break;
+            case 'expiry':
+              p.exp = Math.floor(Date.now()/1000) + 365*24*60*60;
+              p.iat = Math.floor(Date.now()/1000);
+              break;
+            case 'email':
+              ['email','mail','e-mail'].forEach(k => { if (p[k]) p[k] = 'admin@' + (p[k].split('@')[1] || 'target.com'); });
+              if (!p.email) p.email = 'admin@target.com';
+              break;
+          }
+          ed.value = JSON.stringify(p, null, 2);
+        } catch {}
+      }));
       out.querySelector('#jwt-none')?.addEventListener('click', () => {
         try {
           const newPayload = JSON.parse(out.querySelector('#jwt-edit').value);
@@ -1023,11 +1597,12 @@ function toolJwtEditor() {
 
 // ═══ DIRECTORY BRUTEFORCER ═══
 async function toolDirBrute() {
-  const b = showResults('recon', 'Dir Brute', false);
-  b.innerHTML = `<div class="text-sm mb-6">Scan for sensitive paths on ${esc(getRootDomain(activeTabDomain))}</div>
-    <div class="tool-input-row mb-6">
+  const b = showResults('discovery', 'Dir Brute', false);
+  const u = new URL(activeTabUrl);
+  b.innerHTML = `<div class="text-sm mb-6">Scan: ${esc(u.origin)}</div>
+    <div class="tool-input-row mb-4">
       <select class="tool-select" id="db-cat" style="font-size:10px">
-        <option value="common">Common (17 paths)</option>
+        <option value="common">Common (17)</option>
         <option value="wordpress">WordPress (17)</option>
         <option value="php_laravel">PHP / Laravel (14)</option>
         <option value="java_spring">Java / Spring (14)</option>
@@ -1035,75 +1610,147 @@ async function toolDirBrute() {
         <option value="dotnet">.NET / ASP (11)</option>
         <option value="devops">DevOps / VCS (14)</option>
         <option value="backups">Backups (12)</option>
-        <option value="all">All categories (~100)</option>
+        <option value="all">All (~100)</option>
+      </select>
+      <select class="tool-select" id="db-scope" style="font-size:10px;max-width:100px">
+        <option value="root">Root only</option>
+        <option value="current">Current path</option>
+        <option value="both" selected>Both</option>
       </select>
       <button class="btn-sm primary" id="db-go">Scan</button>
     </div>
+    <details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom paths</summary>
+      <textarea class="tool-input mt-4" id="db-custom" rows="3" placeholder="One path per line, e.g.:\n/api/v2/admin\n/internal/debug\n/graphql/console"></textarea>
+      <button class="btn-sm mt-4" id="db-custom-go">Scan Custom Only</button>
+    </details>
     <div id="db-out"></div>`;
-  b.querySelector('#db-go').addEventListener('click', async () => {
-    const cat = b.querySelector('#db-cat').value;
+
+  const runScan = async (category) => {
     const out = b.querySelector('#db-out');
-    out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Scanning ${cat === 'all' ? '~100' : ''} paths (parallel)…</div>`;
-    const r = await chrome.runtime.sendMessage({ type: 'DIR_BRUTE', url: activeTabUrl, category: cat });
+    const scope = b.querySelector('#db-scope')?.value || 'both';
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning…</div>';
+    const scanUrl = scope === 'root' ? new URL(activeTabUrl).origin + '/' : activeTabUrl;
+    const r = await chrome.runtime.sendMessage({ type: 'DIR_BRUTE', url: scanUrl, category, scope });
     if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
-    if (!r.results.length) {
-      out.innerHTML = `<div class="text-muted text-sm">Nothing found across ${r.total} paths (${cat})</div>`;
-      finalizeResults('recon'); return;
-    }
+    renderDirResults(out, r);
+  };
+  const renderDirResults = (out, r) => {
+    if (!r.results.length) { out.innerHTML = `<div class="text-muted text-sm">Nothing found across ${r.total} paths</div>`; finalizeResults('discovery'); return; }
     out.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} found / ${r.total} tested</span></div>` +
       r.results.map(x => {
         const sev = x.status === 200 ? 'high' : x.status === 403 || x.status === 401 ? 'medium' : 'low';
         const statusLabel = x.status === 200 ? 'OPEN' : x.status === 403 ? 'FORBIDDEN' : x.status === 401 ? 'AUTH REQ' : x.status;
-        return `<div class="result-item ${sev}">
-          <div class="result-label"><span class="result-tag tag-${sev}">${statusLabel}</span> ${esc(x.path)}</div>
+        const fullUrl = new URL(activeTabUrl).origin + x.path;
+        return `<div class="result-item ${sev}" style="cursor:pointer">
+          <div class="result-label"><span class="result-tag tag-${sev}">${statusLabel}</span> <a href="${esc(fullUrl)}" target="_blank" style="color:var(--accent);text-decoration:none">${esc(x.path)}</a></div>
           ${x.preview ? `<div class="result-value" style="font-size:9px;max-height:50px;overflow:hidden;margin-top:3px">${esc(x.preview.slice(0,180))}</div>` : ''}
+          <div class="text-xs text-muted">${esc(fullUrl)}</div>
         </div>`;
       }).join('');
-    finalizeResults('recon');
-    log(`Dir brute [${cat}]: ${r.results.length}/${r.total}`, r.results.length ? 'warn' : 'success');
+    finalizeResults('discovery');
+  };
+
+  b.querySelector('#db-go').addEventListener('click', () => runScan(b.querySelector('#db-cat').value));
+  b.querySelector('#db-custom-go')?.addEventListener('click', async () => {
+    const paths = (b.querySelector('#db-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean).map(p => p.startsWith('/') ? p : '/' + p);
+    if (!paths.length) return;
+    const out = b.querySelector('#db-out');
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning custom paths…</div>';
+    const origin = new URL(activeTabUrl).origin;
+    const results = [];
+    for (let i = 0; i < paths.length; i += 8) {
+      const batch = paths.slice(i, i + 8);
+      const promises = batch.map(async path => {
+        try {
+          const r = await fetch(origin + path, { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+          const interesting = r.status === 200 || r.status === 301 || r.status === 302 || r.status === 401 || r.status === 403;
+          if (interesting) { let preview = ''; if (r.status === 200) { try { preview = (await r.text()).slice(0, 200); } catch {} } return { path, status: r.status, preview }; }
+          return null;
+        } catch { return null; }
+      });
+      (await Promise.all(promises)).forEach(r => { if (r) results.push(r); });
+    }
+    renderDirResults(out, { results, total: paths.length });
+    log(`Custom dir scan: ${results.length}/${paths.length}`, 'success');
   });
 }
 
 // ═══ IDOR DETECTOR ═══
 async function toolIdor() {
-  const b = showResults('smart', 'IDOR Detector', true);
-  // Analyze current URL and captured XHR for numeric/UUID params
-  const u = new URL(activeTabUrl);
+  const b = showResults('offensive', 'IDOR Detector', true);
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning URLs, XHR, and page links…</div>';
   const findings = [];
-  // URL params
-  u.searchParams.forEach((v, k) => {
-    if (/^\d+$/.test(v)) findings.push({ source: 'URL param', param: k, value: v, type: 'numeric', suggest: [String(+v-1), String(+v+1), '0', '1'] });
-    else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) findings.push({ source: 'URL param', param: k, value: v, type: 'UUID', suggest: ['Try another user UUID'] });
-    else if (/^[0-9a-f]{24}$/i.test(v)) findings.push({ source: 'URL param', param: k, value: v, type: 'MongoDB ObjectId', suggest: ['Try incrementing last chars'] });
-  });
-  // Path segments
-  u.pathname.split('/').forEach((seg, i) => {
-    if (/^\d+$/.test(seg) && seg.length < 10) findings.push({ source: 'URL path', param: `segment[${i}]`, value: seg, type: 'numeric', suggest: [String(+seg-1), String(+seg+1), '0'] });
-    else if (/^[0-9a-f]{8}-[0-9a-f]{4}/i.test(seg)) findings.push({ source: 'URL path', param: `segment[${i}]`, value: seg, type: 'UUID', suggest: ['Try another UUID'] });
-  });
-  // Check captured XHR requests
-  const reqs = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
-  (reqs.requests || []).slice(-20).forEach(r => {
+  const seen = new Set();
+
+  // Params that are NEVER IDOR candidates
+  const ignoreParams = /^(sentry_|utm_|_ga|gclid|fbclid|dclid|msclkid|__cf|__utm|_gid|_gcl|gtm_|mc_|yclid|twclid|li_|ref|locale|lang|page|per_page|limit|offset|sort|order|format|callback|v|ver|version|t|timestamp|ts|nonce|rand|cache|_$|__)/i;
+  const ignoreHosts = /sentry\.io|google-analytics|analytics|doubleclick|facebook\.com|googletagmanager|hotjar|clarity\.ms|newrelic|datadog/i;
+  const idorPathHints = /users?|orders?|accounts?|profiles?|invoices?|tickets?|messages?|posts?|comments?|products?|items?|documents?|files?|reports?|transactions?|payments?|pantanir|notendur|vidskiptavinir|customers?|bookings?|reservations?/i;
+
+  const analyzeUrl = (urlStr, source) => {
     try {
-      const ru = new URL(r.url);
-      ru.searchParams.forEach((v, k) => {
-        if (/^\d+$/.test(v) && !findings.some(f => f.param === k && f.value === v))
-          findings.push({ source: 'XHR ' + r.method, param: k, value: v, type: 'numeric', suggest: [String(+v-1), String(+v+1)] });
+      const u = new URL(urlStr);
+      if (ignoreHosts.test(u.hostname)) return;
+      // Query params
+      u.searchParams.forEach((v, k) => {
+        if (ignoreParams.test(k)) return;
+        const key = k + '=' + v;
+        if (seen.has(key)) return; seen.add(key);
+        if (/^\d{1,15}$/.test(v) && v.length >= 2) {
+          findings.push({ source, param: k, value: v, type: 'numeric', url: urlStr, suggest: [String(BigInt(v)-1n), String(BigInt(v)+1n), '0', '1'], predictability: 'Sequential integers — trivially enumerable', priority: /id|num|order|user|account/i.test(k) ? 'high' : 'medium' });
+        }
+        else if (/^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) findings.push({ source, param: k, value: v, type: 'UUID v1', url: urlStr, suggest: ['Time-based — partially predictable'], predictability: 'UUID v1 encodes timestamp — adjacent UUIDs predictable', priority: 'high' });
+        else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) findings.push({ source, param: k, value: v, type: 'UUID v4', url: urlStr, suggest: ['Random — check if app leaks others'], predictability: 'UUID v4 (random) — not enumerable alone', priority: /id|page/i.test(k) ? 'high' : 'medium' });
+        else if (/^[0-9a-f]{24}$/i.test(v)) findings.push({ source, param: k, value: v, type: 'ObjectId', url: urlStr, suggest: ['Increment last hex chars'], predictability: 'MongoDB ObjectId — timestamp in first 4 bytes', priority: 'high' });
+      });
+      // Path segments with context
+      const segments = u.pathname.split('/').filter(Boolean);
+      segments.forEach((seg, i) => {
+        const key = 'path:' + seg;
+        if (seen.has(key)) return; seen.add(key);
+        const prevSeg = i > 0 ? segments[i - 1] : '';
+        const contextHint = idorPathHints.test(prevSeg) ? prevSeg : '';
+        if (/^\d{2,15}$/.test(seg)) {
+          findings.push({
+            source: source + (contextHint ? ' (/' + contextHint + '/)' : ''),
+            param: contextHint ? contextHint + '/' + seg : 'path[' + (i+1) + ']',
+            value: seg, type: 'numeric', url: urlStr,
+            suggest: [String(BigInt(seg)-1n), String(BigInt(seg)+1n), '0', '1'],
+            predictability: 'Sequential ID' + (contextHint ? ' in /' + contextHint + '/ — high-value IDOR target' : ' in URL path'),
+            priority: contextHint ? 'high' : 'medium'
+          });
+        }
+        else if (/^[0-9a-f]{8}-[0-9a-f]{4}/i.test(seg)) {
+          findings.push({ source, param: contextHint ? contextHint + '/' + seg.slice(0,8) + '…' : 'path[' + (i+1) + ']', value: seg, type: 'UUID', url: urlStr, suggest: ['Try another UUID'], predictability: contextHint ? 'UUID in /' + contextHint + '/' : 'UUID in path', priority: contextHint ? 'high' : 'medium' });
+        }
       });
     } catch {}
+  };
+
+  analyzeUrl(activeTabUrl, 'Current URL');
+  const reqs = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+  (reqs.requests || []).slice(-30).forEach(r => analyzeUrl(r.url, 'XHR ' + (r.method || 'GET')));
+  try {
+    const linkRes = await msgTab({ type: 'EXTRACT_LINKS' });
+    if (linkRes?.ok) {
+      [...(linkRes.data.internal || []), ...(linkRes.data.external || [])].forEach(l => analyzeUrl(l.url || l, 'Page link'));
+    }
+  } catch {}
+
+  findings.sort((a, c) => {
+    if (a.priority === 'high' && c.priority !== 'high') return -1;
+    if (c.priority === 'high' && a.priority !== 'high') return 1;
+    if (a.source.startsWith('Current')) return -1;
+    return 0;
   });
 
   if (!findings.length) {
-    b.innerHTML = '<div class="text-muted text-sm">No numeric or UUID parameters detected in URL or recent XHR requests</div>';
-    finalizeResults('smart'); return;
+    b.innerHTML = '<div class="text-xs text-muted mb-4">Page: ' + esc(activeTabUrl) + '</div><div class="text-muted text-sm">No IDOR candidates in URL, XHR, or page links</div>';
+    finalizeResults('discovery'); return;
   }
-  b.innerHTML = `<div class="text-sm mb-6">${findings.length} potential IDOR parameters</div>` +
-    findings.map(f => `<div class="result-item medium">
-      <div class="result-label"><span class="result-tag tag-medium">${esc(f.type)}</span> ${esc(f.source)}</div>
-      <div class="result-value">${esc(f.param)} = ${esc(f.value)}</div>
-      <div class="text-xs text-muted mt-4">Try: ${f.suggest.map(s => `<code style="background:var(--surface-hover);padding:1px 4px;border-radius:2px">${esc(s)}</code>`).join(' ')}</div>
-    </div>`).join('');
-  finalizeResults('smart');
+  b.innerHTML = '<div class="text-xs text-muted mb-4">Page: ' + esc(activeTabUrl) + '</div><div class="text-sm mb-6">' + findings.length + ' potential IDOR parameters</div>' +
+    findings.map(f => '<div class="result-item ' + (f.priority === 'high' ? 'high' : 'medium') + '" style="cursor:pointer"><div class="result-label"><span class="result-tag tag-' + (f.priority === 'high' ? 'high' : 'medium') + '">' + esc(f.type) + '</span> ' + esc(f.source) + '</div><div class="result-value">' + esc(f.param) + ' = ' + esc(f.value) + '</div>' + (f.url ? '<div class="text-xs text-muted">' + esc(f.url).slice(0, 100) + '</div>' : '') + '<div class="text-xs mt-4" style="color:var(--warning)">Try: ' + f.suggest.map(s => '<code style="background:var(--surface-hover);padding:1px 4px;border-radius:2px">' + esc(s) + '</code>').join(' ') + '</div>' + (f.predictability ? '<div class="text-xs text-muted mt-4">\ud83d\udcca ' + esc(f.predictability) + '</div>' : '') + '</div>').join('');
+  finalizeResults('discovery');
 }
 
 // ═══ LIVE BROWSE ═══
@@ -1178,7 +1825,7 @@ async function liveScanPage(tabId, url, title) {
       const sr = await chrome.tabs.sendMessage(tabId, { type: 'GET_SCRIPT_URLS' });
       if (sr?.ok) {
         const eps = new Set();
-        const proc = t => { for (const p of ENDPOINT_PATTERNS) { const re = new RegExp(p.source, p.flags); let m; while ((m = re.exec(t)) !== null) { const ep = m[1] || m[0]; if (ep.length > 4 && !/\.(js|css|png|jpg|svg)$/.test(ep)) eps.add(ep); } } };
+        const proc = t => { for (const p of ENDPOINT_PATTERNS) { const re = new RegExp(p.source, p.flags); let m; while ((m = re.exec(t)) !== null) { const ep = m[1] || m[0]; if (isRealEndpoint(ep)) eps.add(ep); } } };
         for (const u of sr.data.external.slice(0, 8)) { try { const r = await chrome.runtime.sendMessage({ type: 'FETCH_JS', url: u }); if (r.ok) proc(r.text); } catch {} }
         sr.data.inline.forEach(proc);
         eps.forEach(ep => {
@@ -1287,6 +1934,25 @@ async function liveScanPage(tabId, url, title) {
   document.getElementById('live-count').textContent = totalItems + ' findings, ' + liveSeenItems.size + ' unique';
   if (totalItems > 0) { const badge = document.getElementById('badge-live'); badge.textContent = totalItems; badge.classList.remove('hidden'); }
 }
+
+// ═══ KEY VALIDATION ═══
+window.testGoogleKey = async function(key) {
+  log('Testing Google API key…');
+  try {
+    const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?key=${key}&address=test`);
+    const d = await r.json();
+    if (d.status === 'OK' || d.status === 'ZERO_RESULTS') {
+      log('⚠ Google API key is ACTIVE and unrestricted!', 'warn');
+      alert('⚠ KEY IS LIVE!\n\nThis Google API key is active and unrestricted.\nThis is a confirmed vulnerability — report it.');
+    } else if (d.error_message?.includes('API key')) {
+      log('Google key restricted or invalid: ' + d.status, 'success');
+      alert('Key is restricted or invalid: ' + d.status + '\n' + (d.error_message || ''));
+    } else {
+      log('Google key status: ' + d.status);
+      alert('Key status: ' + d.status);
+    }
+  } catch (e) { log('Key test failed: ' + e.message, 'error'); }
+};
 
 // ═══ HELPERS ═══
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}

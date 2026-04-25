@@ -153,5 +153,15 @@ const contentHandlers = {
         findings.push({ type: 'postMessage Listener', detail: 'Page listens for postMessage events', severity: 'low' });
     });
     return findings;
+  },
+  GET_META_CSP: () => {
+    const meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+    return { ok: true, csp: meta ? meta.getAttribute('content') : null };
+  },
+  GET_STORAGE: () => {
+    const data = { localStorage: {}, sessionStorage: {} };
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); data.localStorage[k] = localStorage.getItem(k)?.slice(0, 500); } } catch {}
+    try { for (let i = 0; i < sessionStorage.length; i++) { const k = sessionStorage.key(i); data.sessionStorage[k] = sessionStorage.getItem(k)?.slice(0, 500); } } catch {}
+    return { ok: true, data };
   }
 };

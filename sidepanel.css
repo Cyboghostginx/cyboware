@@ -63,3 +63,4 @@ footer{flex-shrink:0;border-top:1px solid var(--border);background:var(--surface
 .domain-pill:hover{border-color:var(--accent);color:var(--accent)}
 .domain-pill.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 .domain-pill .pill-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--success);margin-right:3px}
+.ra-rerun{background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:all var(--transition)}.ra-rerun:hover{color:var(--accent);background:var(--surface-hover)}

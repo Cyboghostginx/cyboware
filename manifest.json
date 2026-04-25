@@ -12,7 +12,6 @@
     "storage",
     "scripting",
     "contextMenus",
-    "notifications",
     "clipboardWrite"
   ],
   "host_permissions": [

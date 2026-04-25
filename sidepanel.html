@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cyboware</title><link rel="stylesheet" href="sidepanel.css"></head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo-row">
+      <span class="wordmark">Cyboware<span class="dot">.</span></span>
+      <div class="header-actions"><button class="btn-sm" id="btn-collapse" title="Collapse / Expand all">▽</button><button class="btn-sm" id="btn-copy-all" title="Copy all results as JSON">📋</button><button class="btn-sm" id="btn-reset" title="Reset all panels">🗑</button><button class="btn-sm" id="btn-refresh" title="Re-scan">↻</button></div>
+    </div>
+    <div class="context-bar">
+      <span class="scope-dot" id="scope-indicator"></span>
+      <span id="tab-url" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary);font-family:var(--font-mono);font-size:10.5px">—</span>
+      <button class="pin-btn" id="btn-pin">PIN</button>
+    </div>
+    <div id="domain-sessions" style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap;padding:0 2px"></div>
+  </header>
+  <main>
+    <!-- LIVE BROWSE -->
+    <div class="feat-group" data-group="live">
+      <div class="feat-group-header">
+        <span class="chevron">▶</span>
+        <span class="group-title">📡 Live Browse</span>
+        <span class="badge hidden" id="badge-live">0</span>
+      </div>
+      <div class="feat-group-body">
+        <div class="flex-between mb-6">
+          <span class="text-sm" id="live-target">Target: —</span>
+          <button class="btn-sm primary" id="btn-live-toggle">Start Monitoring</button>
+        </div>
+        <div style="max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)" id="live-feed">
+          <div class="text-muted text-sm" style="padding:12px;text-align:center">Click Start to begin passive scanning as you browse</div>
+        </div>
+        <div class="tool-input-row mt-6">
+          <button class="btn-sm" id="btn-live-copy">Copy All</button>
+          <button class="btn-sm" id="btn-live-json">Export JSON</button>
+          <button class="btn-sm" id="btn-live-clear">Clear</button>
+          <span class="text-xs text-muted" id="live-count" style="margin-left:auto">0 findings</span>
+        </div>
+      </div>
+    </div>
+    <!-- RECON -->
+    <div class="feat-group open" data-group="recon">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🔍 Recon & Fingerprinting</span></div>
+      <div class="feat-group-body">
+        <div class="tool-grid">
+          <button class="tool-btn" data-tool="tech-stack"><span class="tool-icon">📡</span><span class="tool-name">Tech Stack</span><span class="tool-desc">CMS, frameworks, CDN</span></button>
+          <button class="tool-btn" data-tool="headers-audit"><span class="tool-icon">🛡</span><span class="tool-name">Headers Audit</span><span class="tool-desc">Security headers grade</span></button>
+          <button class="tool-btn" data-tool="cookies"><span class="tool-icon">🍪</span><span class="tool-name">Cookie Inspector</span><span class="tool-desc">Flags, scope, edit</span></button>
+          <button class="tool-btn" data-tool="subdomains"><span class="tool-icon">🌐</span><span class="tool-name">Subdomains</span><span class="tool-desc">crt.sh enumeration</span></button>
+          <button class="tool-btn" data-tool="reqresp"><span class="tool-icon">📋</span><span class="tool-name">Req / Resp</span><span class="tool-desc">Copy request-response pair</span></button>
+          <button class="tool-btn" data-tool="dns"><span class="tool-icon">🔎</span><span class="tool-name">DNS Lookup</span><span class="tool-desc">A, AAAA, MX, NS, TXT</span></button>
+          <button class="tool-btn" data-tool="wpplugins"><span class="tool-icon">🔌</span><span class="tool-name">WP Plugins</span><span class="tool-desc">WordPress plugins & versions</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="dirbrute"><span class="tool-icon">📂</span><span class="tool-name">Directory Bruteforcer</span><span class="tool-desc">.git, .env, admin, backups, actuator — 60+ paths</span></button>
+        </div>
+        <div class="results-panel" id="results-recon"></div>
+      </div>
+    </div>
+    <!-- PAGE ANALYSIS -->
+    <div class="feat-group" data-group="analysis">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🕵️ Page Analysis</span><span class="badge hidden" id="badge-analysis">0</span></div>
+      <div class="feat-group-body">
+        <div class="tool-grid">
+          <button class="tool-btn" data-tool="secrets"><span class="tool-icon">🔑</span><span class="tool-name">Secret Scanner</span><span class="tool-desc">API keys, tokens, creds</span></button>
+          <button class="tool-btn" data-tool="endpoints"><span class="tool-icon">🔗</span><span class="tool-name">Endpoints</span><span class="tool-desc">APIs, paths from JS</span></button>
+          <button class="tool-btn" data-tool="hidden"><span class="tool-icon">👁</span><span class="tool-name">Hidden Elements</span><span class="tool-desc">Hidden inputs, comments</span></button>
+          <button class="tool-btn" data-tool="links"><span class="tool-icon">🔗</span><span class="tool-name">Link Harvester</span><span class="tool-desc">Internal, external, files</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="jsbeautify"><span class="tool-icon">✨</span><span class="tool-name">JS Beautifier</span><span class="tool-desc">Deobfuscate & format JS files</span></button>
+        </div>
+        <div class="results-panel" id="results-analysis"></div>
+      </div>
+    </div>
+    <!-- ACTIVE TOOLS -->
+    <div class="feat-group" data-group="active">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🔧 Active Tools</span></div>
+      <div class="feat-group-body">
+        <div class="tool-grid">
+          <button class="tool-btn" data-tool="replayer"><span class="tool-icon">🔄</span><span class="tool-name">Request Replayer</span><span class="tool-desc">Capture & replay XHR</span></button>
+          <button class="tool-btn" data-tool="cors"><span class="tool-icon">🚧</span><span class="tool-name">CORS Tester</span><span class="tool-desc">Origin reflection check</span></button>
+          <button class="tool-btn" data-tool="redirect"><span class="tool-icon">↗️</span><span class="tool-name">Redirect Tester</span><span class="tool-desc">Open redirect params</span></button>
+          <button class="tool-btn" data-tool="codec"><span class="tool-icon">🔣</span><span class="tool-name">Encode / Decode</span><span class="tool-desc">Base64, URL, JWT, hex</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="paramfuzz"><span class="tool-icon">💉</span><span class="tool-name">Parameter Fuzzer</span><span class="tool-desc">Auto-test XSS, SQLi, SSTI, path traversal</span></button>
+          <button class="tool-btn" data-tool="bypass403"><span class="tool-icon">🚪</span><span class="tool-name">403 Bypass</span><span class="tool-desc">Headers & path tricks</span></button>
+          <button class="tool-btn" data-tool="methodtest"><span class="tool-icon">🔀</span><span class="tool-name">Method Tester</span><span class="tool-desc">GET/POST/PUT/DELETE/TRACE</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="jwteditor"><span class="tool-icon">🎟</span><span class="tool-name">JWT Editor</span><span class="tool-desc">Decode, edit payload, re-encode with alg:none</span></button>
+        </div>
+        <div class="results-panel" id="results-active"></div>
+      </div>
+    </div>
+    <!-- WORKFLOW -->
+    <div class="feat-group" data-group="workflow">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">📝 Workflow</span></div>
+      <div class="feat-group-body">
+        <div class="tool-grid">
+          <button class="tool-btn" data-tool="scope"><span class="tool-icon">🎯</span><span class="tool-name">Scope Manager</span><span class="tool-desc">In/out scope domains</span></button>
+          <button class="tool-btn" data-tool="notes"><span class="tool-icon">📓</span><span class="tool-name">Bug Notes</span><span class="tool-desc">Per-domain notes</span></button>
+          <button class="tool-btn" data-tool="history"><span class="tool-icon">📜</span><span class="tool-name">Browse History</span><span class="tool-desc">URLs visited on target</span></button>
+          <button class="tool-btn" data-tool="screenshot"><span class="tool-icon">📸</span><span class="tool-name">Screenshot</span><span class="tool-desc">Capture visible area</span></button>
+        </div>
+        <div class="results-panel" id="results-workflow"></div>
+      </div>
+    </div>
+    <!-- SMART FEATURES -->
+    <div class="feat-group" data-group="smart">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🎯 Smart Features</span><span class="badge hidden" id="badge-smart">0</span></div>
+      <div class="feat-group-body">
+        <div class="tool-grid">
+          <button class="tool-btn" data-tool="passive"><span class="tool-icon">⚡</span><span class="tool-name">Vuln Hints</span><span class="tool-desc">Passive detection</span></button>
+          <button class="tool-btn" data-tool="wayback"><span class="tool-icon">⏳</span><span class="tool-name">Wayback</span><span class="tool-desc">Historical snapshots</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="diff"><span class="tool-icon">⚖️</span><span class="tool-name">Response Diff</span><span class="tool-desc">Save & compare responses</span></button>
+          <button class="tool-btn" data-tool="cspeval"><span class="tool-icon">🧱</span><span class="tool-name">CSP Evaluator</span><span class="tool-desc">Parse & find bypasses</span></button>
+          <button class="tool-btn" data-tool="takeover"><span class="tool-icon">🏴</span><span class="tool-name">Subdomain Takeover</span><span class="tool-desc">Dangling CNAME check</span></button>
+          <button class="tool-btn tool-btn-wide" data-tool="idor"><span class="tool-icon">🆔</span><span class="tool-name">IDOR Detector</span><span class="tool-desc">Find numeric/UUID params, suggest ±1 tests</span></button>
+        </div>
+        <div class="results-panel" id="results-smart"></div>
+      </div>
+    </div>
+    <!-- SCRATCHPAD -->
+    <div class="feat-group" data-group="scratchpad">
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">✏️ Scratchpad</span></div>
+      <div class="feat-group-body">
+        <textarea class="notes-editor" id="scratchpad" placeholder="Quick notes, payloads, URLs… saved automatically" rows="8"></textarea>
+        <div class="tool-input-row mt-6">
+          <button class="btn-sm" id="btn-scratch-copy">Copy</button>
+          <button class="btn-sm" id="btn-scratch-clear">Clear</button>
+          <button class="btn-sm" id="btn-scratch-download">Download .txt</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <footer>
+    <div class="footer-top">
+      <span class="footer-note">Powered by <a href="https://github.com/Cyboghostginx" target="_blank" rel="noopener">Cyboghostginx</a></span>
+      <button class="btn-text" id="toggle-log">Log ▾</button>
+    </div>
+    <div class="debug-log" id="debug-log"><div class="debug-log-entries" id="debug-log-entries"></div><button class="btn-text" id="clear-log" style="margin-top:4px">Clear</button></div>
+  </footer>
+  <div class="copy-toast" id="copy-toast">Copied!</div>
+</div>
+<script src="sidepanel.js"></script>
+</body>
+</html>

@@ -656,7 +656,7 @@ async function toolCookies() {
     }).join('')}
     </table></div>
     <div id="ck-detail" style="display:none;margin-top:8px;padding:8px;background:var(--surface-hover);border:1px solid var(--border);border-radius:var(--radius)">
-      <div class="flex-between mb-4"><span class="text-sm" style="font-weight:600" id="ck-det-name"></span><button class="btn-sm" id="ck-det-copy" style="padding:1px 6px;font-size:9px">Copy Value</button></div>
+      <div class="flex-between mb-4"><span class="text-sm" style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%" id="ck-det-name"></span><button class="btn-sm" id="ck-det-copy" style="padding:1px 6px;font-size:9px;flex-shrink:0">Copy Value</button></div>
       <textarea class="tool-input" id="ck-det-val" rows="3" readonly style="font-size:9.5px;word-break:break-all;resize:vertical"></textarea>
       <div class="text-xs text-muted mt-4" id="ck-det-flags"></div>
     </div>
@@ -672,8 +672,8 @@ async function toolCookies() {
   // Test auth button — tests each cookie individually
   b.querySelector('#btn-test-auth')?.addEventListener('click', async () => {
     const btn = b.querySelector('#btn-test-auth');
-    btn.textContent = 'Testing each cookie…'; btn.disabled = true;
-    const r = await chrome.runtime.sendMessage({ type: 'TEST_AUTH', url: activeTabUrl, cookies: cookies.map(c => ({ name: c.name, value: c.value })) });
+    btn.textContent = `Testing ${cookies.length} cookies…`; btn.disabled = true;
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_AUTH', url: activeTabUrl, domain: activeTabDomain });
     const banner = b.querySelector('#auth-banner');
     if (!r.ok) { btn.textContent = 'Failed'; btn.disabled = false; return; }
     const authCookies = (r.results || []).filter(x => x.significant);

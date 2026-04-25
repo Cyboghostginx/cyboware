@@ -211,54 +211,54 @@ const handlers = {
     catch (e) { sr({ ok: false, error: e.message }); }
   },
 
-  // Test which cookies are needed for auth by removing each one individually
+  // Test which cookies are needed for auth by temporarily removing each one
   TEST_AUTH: async (msg, _, sr) => {
     try {
-      const cookies = msg.cookies || [];
-      if (!cookies.length) { sr({ ok: false, error: 'No cookies' }); return; }
-      // Build full cookie string
-      const fullCookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+      const domain = msg.domain;
+      const url = msg.url;
       // Baseline: request with ALL cookies
-      const baseline = await fetch(msg.url, {
-        credentials: 'omit',
-        headers: { 'Cookie': fullCookieStr },
-        redirect: 'manual',
-        signal: AbortSignal.timeout(6000)
-      });
+      const baseline = await fetch(url, { credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(6000) });
       const baseStatus = baseline.status;
-      const baseBody = await baseline.text();
-      const baseLen = baseBody.length;
-      // No-cookie baseline
-      const noCookie = await fetch(msg.url, {
-        credentials: 'omit',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(6000)
-      });
-      const noStatus = noCookie.status;
-      const noBody = await noCookie.text();
-      const noLen = noBody.length;
-      // Test each cookie by removing it
+      const baseLen = (await baseline.text()).length;
+      // No-cookie baseline: temporarily remove ALL, test, restore ALL
+      const allCookies = await chrome.cookies.getAll({ domain });
+      // Remove all
+      for (const c of allCookies) {
+        const cUrl = (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, '') + c.path;
+        try { await chrome.cookies.remove({ url: cUrl, name: c.name }); } catch {}
+      }
+      const noCookieRes = await fetch(url, { credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(6000) });
+      const noStatus = noCookieRes.status;
+      const noLen = (await noCookieRes.text()).length;
+      // Restore all
+      for (const c of allCookies) {
+        const cUrl = (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, '') + c.path;
+        try { await chrome.cookies.set({ url: cUrl, name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite === 'unspecified' ? 'no_restriction' : c.sameSite, expirationDate: c.expirationDate || undefined }); } catch {}
+      }
+      // Test each cookie individually
       const results = [];
-      for (let i = 0; i < cookies.length; i += 5) {
-        const batch = cookies.slice(i, i + 5);
-        const promises = batch.map(async (c) => {
-          const without = cookies.filter(x => x.name !== c.name).map(x => `${x.name}=${x.value}`).join('; ');
-          try {
-            const r = await fetch(msg.url, {
-              credentials: 'omit',
-              headers: without ? { 'Cookie': without } : {},
-              redirect: 'manual',
-              signal: AbortSignal.timeout(5000)
-            });
-            const body = await r.text();
-            const statusChanged = r.status !== baseStatus;
-            const bodyDiff = Math.abs(body.length - baseLen);
-            const significant = statusChanged || bodyDiff > 200;
-            return { name: c.name, status: r.status, bodyLen: body.length, statusChanged, bodyDiff, significant, role: significant ? 'auth' : 'not-needed' };
-          } catch { return { name: c.name, status: 'err', significant: false, role: 'unknown' }; }
-        });
-        const batch_results = await Promise.all(promises);
-        results.push(...batch_results);
+      const testCookies = msg.cookieNames || allCookies.map(c => c.name);
+      for (const name of testCookies) {
+        const c = allCookies.find(x => x.name === name);
+        if (!c) { results.push({ name, status: 'skip', significant: false, role: 'unknown' }); continue; }
+        const cUrl = (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, '') + c.path;
+        try {
+          // Remove this one cookie
+          await chrome.cookies.remove({ url: cUrl, name: c.name });
+          // Request without it
+          const r = await fetch(url, { credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(5000) });
+          const body = await r.text();
+          const statusChanged = r.status !== baseStatus;
+          const bodyDiff = Math.abs(body.length - baseLen);
+          const significant = statusChanged || bodyDiff > 200;
+          results.push({ name, status: r.status, bodyLen: body.length, statusChanged, bodyDiff, significant, role: significant ? 'auth' : 'not-needed' });
+          // Restore it immediately
+          await chrome.cookies.set({ url: cUrl, name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite === 'unspecified' ? 'no_restriction' : c.sameSite, expirationDate: c.expirationDate || undefined });
+        } catch (e) {
+          // Restore on error
+          try { await chrome.cookies.set({ url: cUrl, name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite === 'unspecified' ? 'no_restriction' : c.sameSite, expirationDate: c.expirationDate || undefined }); } catch {}
+          results.push({ name, status: 'err', significant: false, role: 'unknown' });
+        }
       }
       sr({ ok: true, baseStatus, baseLen, noStatus, noLen, siteUsesAuth: baseStatus !== noStatus || Math.abs(baseLen - noLen) > 200, results });
     } catch (e) { sr({ ok: false, error: e.message }); }

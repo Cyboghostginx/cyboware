@@ -1,5 +1,6 @@
 /* ═══════════════════════════════════════════════════════════════
-   CYBOWARE — Content Script v2
+   CYBOWARE — Content Script v4
+   Enhanced: SPA events, DOM mutations, framework globals bridge
    ═══════════════════════════════════════════════════════════════ */
 (() => {
   const s = document.createElement('script');
@@ -10,13 +11,31 @@
 
 window.addEventListener('message', (e) => {
   if (e.source !== window || e.data?.source !== 'CYBOWARE_INJECTED') return;
-  chrome.runtime.sendMessage({ type: 'INTERCEPTED_REQUEST', payload: e.data.payload });
+  const p = e.data.payload;
+  // Forward all injected events to service worker / sidepanel
+  if (p.type === 'fetch' || p.type === 'xhr') {
+    chrome.runtime.sendMessage({ type: 'INTERCEPTED_REQUEST', payload: p });
+  } else if (p.type === 'spa_navigate') {
+    chrome.runtime.sendMessage({ type: 'SPA_NAVIGATE', payload: p });
+  } else if (p.type === 'dom_mutation') {
+    chrome.runtime.sendMessage({ type: 'DOM_MUTATION', payload: p });
+  } else if (p.type === 'globals_detected') {
+    chrome.runtime.sendMessage({ type: 'GLOBALS_DETECTED', payload: p });
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   try {
     const fn = contentHandlers[msg.type];
-    if (fn) sendResponse({ ok: true, data: fn() });
+    if (fn) {
+      const result = fn(msg);
+      // Handle promise returns
+      if (result && typeof result.then === 'function') {
+        result.then(data => sendResponse({ ok: true, data })).catch(err => sendResponse({ ok: false, error: err.message }));
+        return true;
+      }
+      sendResponse({ ok: true, data: result });
+    }
     else sendResponse({ ok: false, error: 'Unknown type' });
   } catch (e) { sendResponse({ ok: false, error: e.message }); }
   return true;
@@ -37,7 +56,11 @@ const contentHandlers = {
       [() => !!document.querySelector('script[src*="wp-content"],link[href*="wp-content"]'), 'WordPress', 'CMS'],
       [() => !!document.querySelector('script[src*="shopify"]'), 'Shopify', 'Platform'],
       [() => !!document.querySelector('link[href*="bootstrap"]'), 'Bootstrap', 'CSS'],
-      [() => !!document.querySelector('[class*="tw-"],link[href*="tailwind"]'), 'Tailwind CSS', 'CSS'],
+      [() => {
+        // Better Tailwind detection: check for actual Tailwind utility classes
+        const el = document.querySelector('[class*="flex "],[class*="grid "],[class*="bg-"],[class*="text-"],[class*="p-"],[class*="m-"],[class*="rounded"]');
+        return !!el || !!document.querySelector('link[href*="tailwind"]');
+      }, 'Tailwind CSS', 'CSS'],
       [() => !!document.querySelector('script[src*="gtag"],script[src*="googletagmanager"]'), 'Google Analytics/GTM', 'Analytics'],
       [() => !!document.querySelector('script[src*="cloudflare"]'), 'Cloudflare', 'CDN'],
       [() => !!document.querySelector('script[src*="recaptcha"],div.g-recaptcha'), 'reCAPTCHA', 'Security'],
@@ -48,9 +71,28 @@ const contentHandlers = {
       [() => !!document.querySelector('script[src*="hotjar"]'), 'Hotjar', 'Analytics'],
       [() => !!document.querySelector('script[src*="sentry"]'), 'Sentry', 'Monitoring'],
       [() => !!document.querySelector('script[src*="segment"]'), 'Segment', 'Analytics'],
+      [() => !!document.querySelector('script[src*="alpine"]'), 'Alpine.js', 'Framework'],
+      [() => !!document.querySelector('script[src*="htmx"]'), 'HTMX', 'Framework'],
+      [() => !!document.querySelector('meta[name="csrf-token"]'), 'Rails CSRF', 'Security'],
+      [() => !!document.querySelector('script[src*="livewire"]'), 'Laravel Livewire', 'Framework'],
     ];
     for (const [test, name, cat] of checks) { try { if (test()) tech.push({ name, category: cat, confidence: 'medium' }); } catch {} }
     return tech;
+  },
+
+  // Request framework globals from injected (main world) script
+  DETECT_GLOBALS: () => {
+    return new Promise((resolve) => {
+      const handler = (e) => {
+        if (e.source !== window || e.data?.source !== 'CYBOWARE_INJECTED' || e.data?.payload?.type !== 'globals_detected') return;
+        window.removeEventListener('message', handler);
+        resolve(e.data.payload.globals);
+      };
+      window.addEventListener('message', handler);
+      window.postMessage({ source: 'CYBOWARE_CONTENT', type: 'DETECT_GLOBALS' }, '*');
+      // Timeout fallback
+      setTimeout(() => { window.removeEventListener('message', handler); resolve([]); }, 1500);
+    });
   },
 
   EXTRACT_LINKS: () => {
@@ -110,9 +152,7 @@ const contentHandlers = {
   },
   UNREVEAL_HIDDEN: () => {
     document.body.classList.remove('cyboware-revealed');
-    // Restore hidden inputs
     document.querySelectorAll('[data-cybo-orig-type="hidden"]').forEach(el => { el.type = 'hidden'; el.style.cssText = ''; delete el.dataset.cyboOrigType; });
-    // Remove outlines (can't perfectly restore display:none, so reload is better)
     document.querySelectorAll('[style*="2px dashed"]').forEach(el => { el.style.outline = ''; });
     return true;
   },
@@ -127,8 +167,8 @@ const contentHandlers = {
     const forms = [];
     document.querySelectorAll('form').forEach(f => {
       const fields = [];
-      f.querySelectorAll('input,select,textarea').forEach(el => fields.push({ tag: el.tagName, name: el.name, type: el.type, value: el.value?.slice(0, 50) }));
-      forms.push({ action: f.action, method: f.method, fields });
+      f.querySelectorAll('input,select,textarea').forEach(el => fields.push({ tag: el.tagName, name: el.name, type: el.type, value: el.value?.slice(0, 50), autocomplete: el.autocomplete || '' }));
+      forms.push({ action: f.action, method: f.method, fields, id: f.id || '', enctype: f.enctype || '' });
     });
     return forms;
   },

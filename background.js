@@ -400,7 +400,7 @@ const handlers = {
       ],
       ssti: [
         // Enhanced: use much larger/unique numbers to reduce false positives
-        { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925558641' },
+        { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925920740741' },
         { p: '${9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
         { p: '<%= 8372615*7 %>', check: 'ssti_eval', expect: '58608305' },
         { p: '#{6192837+4}', check: 'ssti_eval', expect: '6192841' },

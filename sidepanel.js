@@ -370,17 +370,9 @@ async function msgTab(msg) {
   }
   try { return await chrome.tabs.sendMessage(activeTabId, msg); }
   catch (e) {
-    // Content script not injected — try injecting it
     if (e.message?.includes('Receiving end does not exist') || e.message?.includes('Could not establish connection')) {
-      log('Injecting content script…', 'warn');
-      try {
-        await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ['content.js'] });
-        // Retry after injection
-        return await chrome.tabs.sendMessage(activeTabId, msg);
-      } catch (e2) {
-        log('Auto-inject failed: ' + e2.message, 'error');
-        return { ok: false, error: 'Content script injection failed. Try reloading the page.' };
-      }
+      log('Content script not loaded. Reload the page.', 'warn');
+      return { ok: false, error: 'Content script not loaded. Reload the page (F5) and try again.' };
     }
     log('Content script error: ' + e.message, 'error');
     return { ok: false, error: e.message };
@@ -398,21 +390,6 @@ function setupPinButton() {
 }
 function setupRefreshButton() {
   document.getElementById('btn-refresh').addEventListener('click', () => { Object.keys(cache).forEach(k => delete cache[k]); updateActiveTab(); });
-  // Quick Audit — runs the 5 most critical tools in sequence
-  document.getElementById('btn-quick-audit')?.addEventListener('click', async () => {
-    const btn = document.getElementById('btn-quick-audit');
-    btn.disabled = true; btn.textContent = 'Scanning…';
-    const tools = ['headers-audit', 'secrets', 'passive', 'cookies', 'tech-stack'];
-    for (let i = 0; i < tools.length; i++) {
-      btn.textContent = `${i + 1}/${tools.length}…`;
-      try { await runTool(tools[i]); } catch {}
-      // Open the relevant group
-      const toolBtn = document.querySelector(`[data-tool="${tools[i]}"]`);
-      if (toolBtn) toolBtn.closest('.feat-group')?.classList.add('open');
-    }
-    btn.disabled = false; btn.textContent = 'Quick Audit';
-    log('Quick Audit complete: ' + tools.length + ' tools', 'success');
-  });
   // Reset button — close all panels, clear cache for current domain
   document.getElementById('btn-reset')?.addEventListener('click', () => {
     const currentHost = activeTabDomain;
@@ -1556,7 +1533,7 @@ async function toolRedirect() {
   const b = showResults('offensive','Redirect',false);
   // Auto-detect redirect params from current URL
   const u = new URL(activeTabUrl);
-  const redirParams = ['url', 'redirect', 'redirect_uri', 'next', 'return', 'returnTo', 'goto', 'dest', 'destination', 'redir', 'return_url', 'continue', 'retUrl', 'forward', 'target', 'link', 'to'];
+  const redirParams = ['url', 'redirect', 'redirect_uri', 'next', 'return', 'returnTo', 'goto', 'dest', 'destination', 'redir', 'return_url', 'continue', 'retUrl', 'forward', 'target'];
   const detected = [...u.searchParams.keys()].filter(k => redirParams.includes(k.toLowerCase()));
 
   b.innerHTML = `<div class="text-sm mb-6">Active redirect testing with 12 bypass payloads</div>
@@ -1911,7 +1888,7 @@ async function toolParamFuzz() {
           { p: "' || pg_sleep(4)--", check: 'sqli_blind_time' },
         ],
         ssti: [
-          { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925558641' },
+          { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925920740741' },
           { p: '$' + '{9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
         ],
         path: [

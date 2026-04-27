@@ -99,7 +99,3 @@ Everything runs locally. No data leaves your browser except when you explicitly 
 ## License
 
 MIT
-
----
-
-**Powered by [Cyboghostginx](https://github.com/Cyboghostginx)**

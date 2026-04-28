@@ -10,7 +10,7 @@ A Chrome extension built for bug bounty hunters, pentesters, and security resear
 
 ## Install
 
-**Chrome Web Store:** [Coming soon]
+**Chrome Web Store:** [Coming soon] (Verification, review and all)
 
 **Manual:**
 1. Download or clone this repo
@@ -18,7 +18,9 @@ A Chrome extension built for bug bounty hunters, pentesters, and security resear
 3. Click **Load unpacked** → select the folder (Unzipped)
 4. Click the Cyboware icon — sidebar opens
 
-# Sometimes you need to refresh your page in case some of the tools is not detecting anything.
+When new version drops, and you want to install manually, you have to remove the existing one at `chrome://extensions/` then re install with instuction above with the new downloaded unpacked.
+
+**Sometimes you need to refresh your page in case some of the tools is not detecting anything.**
 
 ---
 

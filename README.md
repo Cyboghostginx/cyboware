@@ -15,7 +15,7 @@ A Chrome extension built for bug bounty hunters, pentesters, and security resear
 **Manual:**
 1. Download or clone this repo
 2. Go to `chrome://extensions/` → enable Developer mode
-3. Click **Load unpacked** → select the folder
+3. Click **Load unpacked** → select the folder (Unzipped)
 4. Click the Cyboware icon — sidebar opens
 
 ---

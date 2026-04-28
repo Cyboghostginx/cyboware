@@ -1,7 +1,40 @@
 /* ═══ CYBOWARE — Sidepanel v3 ═══ */
 
+// Keep the service worker alive while sidepanel is open. Without this, MV3 kills the
+// worker after 30s idle — and if you'd kicked off a fuzz then switched apps, the
+// worker dies mid-flight, in-flight fetches are dropped, sidepanel hangs on the
+// loading spinner forever. Reconnects automatically if the port drops.
+function openKeepalivePort() {
+  let port;
+  try { port = chrome.runtime.connect({ name: 'cyboware-keepalive' }); }
+  catch { setTimeout(openKeepalivePort, 1000); return; }
+  port.onDisconnect.addListener(() => {
+    // Service worker reset (extension update or browser restart) — reconnect
+    setTimeout(openKeepalivePort, 500);
+  });
+}
+openKeepalivePort();
+
+// When the user switches apps and comes back, check for stuck operations. If a fuzz
+// or scan was in-flight when the worker died, the spinner will sit there forever.
+// On visibility change, scan all loading spinners and replace any that have been
+// alive >2 minutes with a recovery prompt.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  const spinners = document.querySelectorAll('.loading-text');
+  spinners.forEach(el => {
+    const ts = +(el.dataset.ts || 0);
+    if (!ts) return;
+    const ageS = (Date.now() - ts) / 1000;
+    if (ageS > 120) {
+      // Likely orphaned — service worker died mid-operation while user was away
+      el.innerHTML = '<div class="result-item medium" style="margin:0"><div class="result-label">⚠ Operation may have stalled</div><div class="result-value">This was running for ' + Math.round(ageS / 60) + ' min when the browser went inactive. The service worker may have been suspended. Re-run the tool to retry.</div></div>';
+    }
+  });
+});
+
 let activeTabId = null, activeTabUrl = '', activeTabDomain = '';
-let pinnedTabId = null, scopeDomains = [], notes = {}, diffStore = { a: null, b: null };
+let pinnedTabId = null, pinnedRootDomain = null, scopeDomains = [], notes = {}, diffStore = { a: null, b: null };
 let liveActive = false, liveTargetDomain = '', liveFindings = [];
 const liveSeenItems = new Set(); // dedup: skip already-found items
 const liveDomainData = {}; // domain → { findings, seenItems, feedHTML }
@@ -117,7 +150,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupGroupToggles(); setupToolButtons(); setupPinButton(); setupDebugLog();
   setupRefreshButton(); setupScratchpad(); setupLiveBrowse(); setupToolSearch();
   // Listen for SPA navigations and DOM mutations from content/injected scripts
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender) => {
+    // SPA navigation: refresh the URL display + domain switch logic regardless of liveActive.
+    // Otherwise the sidepanel keeps showing the original URL while the user clicks around
+    // inside React/Next/Vue routes (no `tabs.onUpdated` fires for pushState).
+    if (msg?.type === 'SPA_NAVIGATE' && msg.payload && sender.tab) {
+      const tabId = sender.tab.id;
+      if (pinnedTabId ? tabId === pinnedTabId : tabId === activeTabId) {
+        updateActiveTab();
+      }
+    }
     if (!liveActive) return;
     if (msg.type === 'SPA_NAVIGATE' && msg.payload) {
       try {
@@ -189,9 +231,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   await updateActiveTab();
   // Track tab changes
   chrome.tabs.onActivated.addListener(() => { if (!pinnedTabId) updateActiveTab(); });
+
+  // Throttled browseHistory persistence. Was fired on every tab `status:complete` event,
+  // even when the sidepanel was closed — burning CPU and serialized storage writes against
+  // a hundreds-of-KB object. Now batched at 1Hz, dropped if no changes.
+  let _historyDirty = false;
+  let _historyTimer = null;
+  const flushBrowseHistory = () => {
+    if (!_historyDirty) return;
+    _historyDirty = false;
+    try { chrome.storage.local.set({ browseHistory }); } catch {}
+  };
+
   chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
     if (info.status === 'complete') {
-      // Record browse history
+      // Record browse history (throttled write)
       if (tab.url && !tab.url.startsWith('chrome') && !tab.url.startsWith('about:')) {
         try {
           const domain = getRootDomain(new URL(tab.url).hostname);
@@ -200,7 +254,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!browseHistory[domain].some(e => e.url === tab.url)) {
               browseHistory[domain].push({ url: tab.url, title: tab.title || '', timestamp: Date.now() });
               if (browseHistory[domain].length > 200) browseHistory[domain] = browseHistory[domain].slice(-200);
-              chrome.storage.local.set({ browseHistory });
+              _historyDirty = true;
+              if (!_historyTimer) _historyTimer = setTimeout(() => { _historyTimer = null; flushBrowseHistory(); }, 1000);
             }
           }
         } catch {}
@@ -231,6 +286,28 @@ document.addEventListener('DOMContentLoaded', async () => {
 let lastDomain = '';
 const visitedDomains = new Set();
 const domainPanels = {}; // rootDomain -> { groupName: panelHTML }
+const DOMAIN_CAP = 50;
+
+// LRU eviction: when the per-domain caches exceed the cap, drop the oldest entries.
+// Without this, an hours-long bug bounty session that touches many subdomains
+// accumulates panel HTML and live findings indefinitely (potentially many MB).
+function capDomainState() {
+  // visitedDomains is a Set, so we use insertion order for eviction
+  while (visitedDomains.size > DOMAIN_CAP) {
+    const oldest = visitedDomains.values().next().value;
+    visitedDomains.delete(oldest);
+    delete domainPanels[oldest];
+    delete liveDomainData[oldest];
+  }
+  // domainPanels can also grow via switch logic. Trim to cap by deletion order.
+  const panelKeys = Object.keys(domainPanels);
+  if (panelKeys.length > DOMAIN_CAP) {
+    panelKeys.slice(0, panelKeys.length - DOMAIN_CAP).forEach(k => {
+      delete domainPanels[k];
+      delete liveDomainData[k];
+    });
+  }
+}
 
 // ═══ TAB TRACKING ═══
 async function updateActiveTab() {
@@ -265,11 +342,33 @@ async function updateActiveTab() {
     document.getElementById('tab-url').textContent = activeTabUrl || '—';
     document.getElementById('tab-url').title = activeTabUrl;
 
-    const currentHost = activeTabDomain;
+    // Pinned-tab drift detection — keep the pin badge in sync with where the pinned tab
+    // actually IS. Was set once on pin and never updated, so a redirect could leave you
+    // testing evil.com while the badge claimed app.target.com.
+    if (pinnedTabId) {
+      const pinBtn = document.getElementById('btn-pin');
+      const currentPinnedRoot = getRootDomain(activeTabDomain) || activeTabDomain;
+      pinBtn.textContent = '📌 ' + activeTabDomain;
+      if (pinnedRootDomain && currentPinnedRoot !== pinnedRootDomain) {
+        // The pinned tab navigated to a different root domain. Surface this clearly.
+        pinBtn.classList.add('drift');
+        pinBtn.title = 'Pinned tab navigated from ' + pinnedRootDomain + ' to ' + currentPinnedRoot + '. Click to unpin.';
+      } else {
+        pinBtn.classList.remove('drift');
+        pinBtn.title = 'Pinned to ' + activeTabDomain;
+      }
+    }
 
-    // ── Domain switch: save → clear → restore ──
-    if (lastDomain && currentHost !== lastDomain) {
-      // Save current panels
+    const currentHost = activeTabDomain;
+    // Use root domain (eTLD+1) as the panel-state key. Previously this used the raw hostname,
+    // so navigating from app.target.com to admin.target.com triggered a full save/clear/restore
+    // cycle — discarding event listeners on every result, blanking expanded fuzz panels, and
+    // generally feeling like a hang. Same-root-domain navigation now preserves all panel state.
+    const currentRoot = getRootDomain(currentHost) || currentHost;
+
+    // ── Domain switch: save → clear → restore — only on actual root-domain changes ──
+    if (lastDomain && currentRoot !== lastDomain) {
+      // Save current panels under the LAST root domain
       domainPanels[lastDomain] = {};
       document.querySelectorAll('.results-panel.active').forEach(p => {
         domainPanels[lastDomain][p.id.replace('results-', '')] = p.innerHTML;
@@ -284,8 +383,8 @@ async function updateActiveTab() {
       document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
 
       // Restore for new domain
-      if (domainPanels[currentHost]) {
-        Object.entries(domainPanels[currentHost]).forEach(([group, html]) => {
+      if (domainPanels[currentRoot]) {
+        Object.entries(domainPanels[currentRoot]).forEach(([group, html]) => {
           const panel = document.getElementById('results-' + group);
           if (panel && html) {
             panel.innerHTML = html; panel.classList.add('active');
@@ -293,11 +392,11 @@ async function updateActiveTab() {
             panel.closest('.feat-group')?.classList.add('open');
           }
         });
-        log('Restored: ' + currentHost);
+        log('Restored: ' + currentRoot);
       }
       // Restore live browse
-      if (liveDomainData[currentHost]) {
-        const ld = liveDomainData[currentHost];
+      if (liveDomainData[currentRoot]) {
+        const ld = liveDomainData[currentRoot];
         liveFindings = ld.findings; liveSeenItems.clear(); ld.seenItems.forEach(s => liveSeenItems.add(s));
         const feed = document.getElementById('live-feed');
         if (feed) feed.innerHTML = ld.feedHTML;
@@ -311,9 +410,10 @@ async function updateActiveTab() {
         document.getElementById('live-count').textContent = '0 findings';
       }
     }
-    lastDomain = currentHost;
+    lastDomain = currentRoot;
 
     if (activeTabDomain) visitedDomains.add(activeTabDomain);
+    capDomainState();
     updateScopeIndicator();
     renderDomainPills();
   } catch (e) {
@@ -324,13 +424,15 @@ async function updateActiveTab() {
 function renderDomainPills() {
   const bar = document.getElementById('domain-sessions');
   if (!bar) return;
+  // Pills are keyed by root domain (eTLD+1) so app.target.com and admin.target.com
+  // share one pill. Activating a pill brings any tab in that root domain to the foreground.
   const domainsWithData = Object.keys(domainPanels).filter(d => Object.keys(domainPanels[d]).length > 0);
-  const currentHost = activeTabDomain;
-  const allDomains = new Set([...domainsWithData, currentHost].filter(Boolean));
+  const currentRoot = getRootDomain(activeTabDomain) || activeTabDomain;
+  const allDomains = new Set([...domainsWithData, currentRoot].filter(Boolean));
   if (allDomains.size <= 1) { bar.innerHTML = ''; return; }
 
   bar.innerHTML = [...allDomains].map(d => {
-    const isActive = d === currentHost;
+    const isActive = d === currentRoot;
     const hasData = domainPanels[d] && Object.keys(domainPanels[d]).length > 0;
     return `<button class="domain-pill ${isActive ? 'active' : ''}" data-domain="${esc(d)}">${hasData ? '<span class="pill-dot"></span>' : ''}${esc(d)}</button>`;
   }).join('');
@@ -338,21 +440,24 @@ function renderDomainPills() {
   bar.querySelectorAll('.domain-pill').forEach(pill => {
     pill.addEventListener('click', async () => {
       const domain = pill.dataset.domain;
-      if (domain === currentHost) return;
-      // Auto-unpin when switching via domain pills
+      if (domain === currentRoot) return;
       if (pinnedTabId) {
         pinnedTabId = null;
         document.getElementById('btn-pin').classList.remove('pinned');
         document.getElementById('btn-pin').textContent = 'PIN';
       }
-      // Find a tab with this domain
+      // Find any tab whose root domain matches — was looking for hostname-exact match,
+      // which missed the common case where the user has app.target.com open and clicks
+      // the target.com pill.
       const tabs = await chrome.tabs.query({ currentWindow: true });
-      const match = tabs.find(t => { try { return new URL(t.url).hostname === domain; } catch { return false; } });
+      const match = tabs.find(t => {
+        try { return getRootDomain(new URL(t.url).hostname) === domain; }
+        catch { return false; }
+      });
       if (match) {
         await chrome.tabs.update(match.id, { active: true });
       } else {
-        // No tab found — just restore the cached session
-        // Save current first
+        // No tab on this root — restore cached session in-place
         if (lastDomain) {
           domainPanels[lastDomain] = {};
           document.querySelectorAll('.results-panel.active').forEach(p => {
@@ -404,8 +509,18 @@ function setupGroupToggles() { document.querySelectorAll('.feat-group-header').f
 function setupPinButton() {
   const btn = document.getElementById('btn-pin');
   btn.addEventListener('click', async () => {
-    if (pinnedTabId) { pinnedTabId = null; btn.classList.remove('pinned'); btn.textContent = 'PIN'; await updateActiveTab(); }
-    else { pinnedTabId = activeTabId; btn.classList.add('pinned'); btn.textContent = '📌 ' + activeTabDomain; }
+    if (pinnedTabId) {
+      pinnedTabId = null;
+      pinnedRootDomain = null;
+      btn.classList.remove('pinned'); btn.textContent = 'PIN';
+      btn.classList.remove('drift');
+      await updateActiveTab();
+    } else {
+      pinnedTabId = activeTabId;
+      pinnedRootDomain = getRootDomain(activeTabDomain) || activeTabDomain;
+      btn.classList.add('pinned');
+      btn.textContent = '📌 ' + activeTabDomain;
+    }
   });
 }
 function setupRefreshButton() {
@@ -413,9 +528,11 @@ function setupRefreshButton() {
   // Reset button — close all panels, clear cache for current domain
   document.getElementById('btn-reset')?.addEventListener('click', () => {
     const currentHost = activeTabDomain;
+    const currentRoot = getRootDomain(currentHost) || currentHost;
+    // Cache is keyed by hostname, but domainPanels/liveDomainData by root.
     Object.keys(cache).forEach(k => { if (k.startsWith(currentHost + ':')) delete cache[k]; });
-    delete domainPanels[currentHost];
-    delete liveDomainData[currentHost];
+    delete domainPanels[currentRoot];
+    delete liveDomainData[currentRoot];
     document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
     document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
     liveFindings = []; liveSeenItems.clear();
@@ -423,7 +540,7 @@ function setupRefreshButton() {
     if (feed) feed.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">Cleared</div>';
     document.getElementById('live-count').textContent = '0 findings';
     renderDomainPills();
-    log('Reset: ' + currentHost, 'success');
+    log('Reset: ' + currentRoot, 'success');
   });
   // Collapse / Expand all sections
   document.getElementById('btn-collapse')?.addEventListener('click', () => {
@@ -521,7 +638,8 @@ function showResults(groupName, title, loading, toolName) {
   const panel = document.getElementById('results-' + groupName);
   panel.classList.add('active');
   panel.dataset.tool = toolName || currentToolName || '';
-  panel.innerHTML = `<div class="results-header"><span class="results-title">${esc(title)}</span><div class="results-actions"><button class="ra-rerun" title="Re-run">↻</button><button class="ra-copy" title="Copy">Copy</button><button class="ra-json" title="JSON">JSON</button></div><button class="results-close">✕</button></div><div class="results-body">${loading ? '<div class="loading-text"><span class="spinner"></span> Working…</div>' : ''}</div>`;
+  // Stamp loading indicators with a timestamp so visibility-change can detect orphans
+  panel.innerHTML = `<div class="results-header"><span class="results-title">${esc(title)}</span><div class="results-actions"><button class="ra-rerun" title="Re-run">↻</button><button class="ra-copy" title="Copy">Copy</button><button class="ra-json" title="JSON">JSON</button></div><button class="results-close">✕</button></div><div class="results-body">${loading ? '<div class="loading-text" data-ts="' + Date.now() + '"><span class="spinner"></span> Working…</div>' : ''}</div>`;
   wireResultsClose(panel);
   wireResultsRerun(panel);
   return panel.querySelector('.results-body');
@@ -971,8 +1089,40 @@ async function toolCookies() {
     const det = b.querySelector('#ck-detail');
     det.style.display = 'block';
     b.querySelector('#ck-det-name').textContent = c.name;
-    b.querySelector('#ck-det-val').value = c.value;
+
+    // Try to decode the value: URL-decode, then JSON-parse, then base64-decode if it looks like b64
+    let displayValue = c.value;
+    let decodeNote = '';
+    try {
+      const decoded = decodeURIComponent(c.value);
+      if (decoded !== c.value) {
+        displayValue = decoded;
+        decodeNote = ' (URL-decoded)';
+        // Now try JSON
+        if (/^[\[{]/.test(decoded.trim())) {
+          try {
+            const parsed = JSON.parse(decoded);
+            displayValue = JSON.stringify(parsed, null, 2);
+            decodeNote = ' (URL-decoded · JSON)';
+          } catch {}
+        }
+      }
+    } catch {}
+    // Try base64 if it looks like one and not already decoded
+    if (!decodeNote && /^[A-Za-z0-9+/=_-]{20,}$/.test(c.value)) {
+      try {
+        const b64 = atob(c.value.replace(/-/g, '+').replace(/_/g, '/'));
+        // Only show if it decodes to mostly-printable ASCII
+        if (/^[\x20-\x7E\n\r\t]+$/.test(b64) && b64.length > 4) {
+          displayValue = c.value + '\n\n→ base64-decoded:\n' + b64;
+          decodeNote = ' (base64)';
+        }
+      } catch {}
+    }
+    b.querySelector('#ck-det-val').value = displayValue;
+
     const flags = [];
+    if (decodeNote) flags.push('Format:' + decodeNote);
     flags.push(`Domain: ${c.domain}`);
     flags.push(`Path: ${c.path}`);
     flags.push(`HttpOnly: ${c.httpOnly ? '✓' : '✗'}`);
@@ -1271,7 +1421,7 @@ async function toolSecrets() {
 
   // Also scan captured XHR request headers for Bearer tokens, API keys, etc.
   try {
-    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId, domain: activeTabDomain });
     const capturedReqs = reqRes.requests || [];
     capturedReqs.forEach(req => {
       if (!req.requestHeaders) return;
@@ -1314,7 +1464,19 @@ function scanSecrets(text,source,findings){
   if (/openpgp\.min\.js|cookiehub\.net|google-analytics|googletagmanager/.test(source)) return;
   // Content-based library detection: skip crypto libraries by content signature
   if (text.length > 5000 && /BEGIN PGP|PRIVATE KEY.*ENCRYPTED|secp256k1|ed25519.*curve/i.test(text.slice(0, 2000))) return;
-  for(const p of SECRET_PATTERNS){const re=new RegExp(p.regex.source,p.regex.flags);let m;while((m=re.exec(text))!==null){const v=m[1]||m[0];if(v.length<8)continue;
+  // Cap per-source size to avoid catastrophic regex backtracking on giant inline scripts.
+  // Bundled SPAs can ship 5MB inline blobs; running ~30 patterns against that on the
+  // sidepanel main thread can freeze the UI for several seconds. 500KB is enough to find
+  // anything real (secrets typically appear near config, never in compressed blobs).
+  const MAX_SOURCE = 500_000;
+  if (text.length > MAX_SOURCE) text = text.slice(0, MAX_SOURCE);
+  for(const p of SECRET_PATTERNS){
+    const re=new RegExp(p.regex.source,p.regex.flags);
+    let m, hits = 0;
+    const PER_PATTERN_CAP = 20;
+    while((m=re.exec(text))!==null && hits < PER_PATTERN_CAP){
+      hits++;
+      const v=m[1]||m[0];if(v.length<8)continue;
   // Entropy check: skip low-entropy matches (repeated chars, sequential)
   if(p.severity==='high'||p.severity==='medium'){
     const ent=shannonEntropy(v);
@@ -1375,7 +1537,7 @@ async function toolEndpoints() {
 
   // Scan captured XHR/fetch requests (runtime API calls Burp would see)
   try {
-    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+    const reqRes = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId, domain: activeTabDomain });
     const capturedReqs = reqRes.requests || [];
     capturedReqs.forEach(req => {
       if (!req.url) return;
@@ -1575,7 +1737,7 @@ async function toolLinks() {
 
 async function toolReplayer() {
   const b = showResults('utility', 'Replayer', true);
-  const res = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+  const res = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId, domain: activeTabDomain });
   const reqs = res.requests||[];
   if(!reqs.length){ b.innerHTML='<div class="text-muted text-sm">No requests captured. Browse first.</div>'; return; }
   let display = reqs.slice(-50).reverse();
@@ -2074,6 +2236,11 @@ async function toolParamFuzz() {
     });
 
     mc.querySelectorAll('[data-fzcat]').forEach(btn => btn.addEventListener('click', async () => {
+      // Update active highlight — was set once on render and never updated, so the
+      // "primary" red highlight stayed on XSS even after clicking SQLi, etc.
+      mc.querySelectorAll('[data-fzcat]').forEach(b2 => b2.classList.remove('primary'));
+      btn.classList.add('primary');
+
       const out = mc.querySelector('#fz-out');
       const url = mc.querySelector('#fz-url').value;
       const cat = btn.dataset.fzcat;
@@ -2185,6 +2352,10 @@ async function toolParamFuzz() {
 
     // Fuzz buttons
     mc.querySelectorAll('[data-ffcat]').forEach(btn => btn.addEventListener('click', async () => {
+      // Update active highlight on form-fuzz category buttons
+      mc.querySelectorAll('[data-ffcat]').forEach(b2 => b2.classList.remove('primary'));
+      btn.classList.add('primary');
+
       const det = mc.querySelector('#fz-form-detail');
       const formIdx = +det.dataset.formIdx;
       if (isNaN(formIdx) || formIdx < 0) { alert('Select a form first'); return; }
@@ -2326,18 +2497,22 @@ async function toolParamFuzz() {
           if (x.errorBody) {
             detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
           }
-          // Three export formats live on every result. Each rebuilds the request from
-          // (a) what we sent explicitly (method + URL + body + Content-Type) and (b) what the
-          // browser attached invisibly (Cookie, User-Agent), captured up-front via
-          // chrome.cookies.getAll for the target URL. Without this, the cURL output would be
-          // an unauthenticated request that won't reproduce the auth-context finding.
-          detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap;gap:4px">'
+          // Action rows separated by purpose: (1) export REQUEST formats, (2) view/copy RESPONSE.
+          // Was a single mixed row where users mis-clicked Copy as HTTP thinking it was Copy Full
+          // Response (similar names, adjacent buttons). Each row is now intent-tagged.
+          detailHTML += '<div class="result-label mt-6 mb-4">Export request</div>'
+            + '<div class="tool-input-row" style="flex-wrap:wrap;gap:4px;margin-bottom:8px">'
             + '<button class="btn-sm fz-copy-curl" title="cURL with cookies + UA">Copy cURL</button>'
             + '<button class="btn-sm fz-copy-http" title="Raw HTTP request — paste into Burp Repeater">Copy as HTTP</button>'
             + '<button class="btn-sm fz-copy-headers" title="Just the headers (one per line)">Copy Headers</button>'
-            + '<button class="btn-sm fz-copy-resp">Copy Full Response</button>'
             + '<button class="btn-sm fz-copy-url">Copy URL</button>'
-            + '</div>';
+            + '</div>'
+            + '<div class="result-label mb-4">Response body</div>'
+            + '<div class="tool-input-row" style="flex-wrap:wrap;gap:4px;margin-bottom:6px">'
+            + '<button class="btn-sm fz-view-resp" title="Show the response body inline">▾ View Body (' + (x.responseTotalLen || x.bodyLen || 0).toLocaleString() + 'b)</button>'
+            + '<button class="btn-sm fz-copy-resp" title="Copy the full response body to clipboard">Copy Body</button>'
+            + '</div>'
+            + '<div class="fz-resp-inline" style="display:none;font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;background:var(--surface-hover);padding:6px 8px;border-radius:3px;margin-top:4px;border:1px solid var(--border)"></div>';
 
           // Builders. authCtx + requestExtras come from the parent fuzz response (r).
           const authCtx = r.authCtx || { cookies: [], userAgent: '', origin: '' };
@@ -2365,6 +2540,51 @@ async function toolParamFuzz() {
 
           // 1) cURL — single line with -H/--cookie/--user-agent flags
           det.innerHTML = detailHTML; det.dataset.built = '1';
+
+          det.querySelector('.fz-view-resp')?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            const inline = det.querySelector('.fz-resp-inline');
+            // Toggle visibility
+            if (inline.style.display !== 'none') {
+              inline.style.display = 'none';
+              btn.textContent = btn.textContent.replace('▴', '▾');
+              return;
+            }
+            // First open: fetch from background cache and render
+            if (!inline.dataset.loaded) {
+              if (!x.responseBodyId) {
+                if (x.errorBody) {
+                  inline.textContent = x.errorBody;
+                  inline.dataset.loaded = '1';
+                } else {
+                  inline.textContent = '(no response body)';
+                  inline.dataset.loaded = '1';
+                }
+              } else {
+                inline.textContent = 'Loading…';
+                inline.style.display = 'block';
+                try {
+                  const r = await chrome.runtime.sendMessage({ type: 'FUZZ_GET_RESPONSE_BODY', id: x.responseBodyId });
+                  if (!r.ok) {
+                    inline.textContent = '(' + (r.error || 'could not load response') + ')';
+                  } else {
+                    // Truncate display at 50KB so the DOM doesn't choke; full body is still
+                    // available via Copy Body which streams from the cache directly.
+                    const displayBody = r.body.length > 50_000
+                      ? r.body.slice(0, 50_000) + '\n\n/* … truncated — display capped at 50KB. Click Copy Body for full ' + r.totalLen.toLocaleString() + 'b */'
+                      : r.body;
+                    inline.textContent = displayBody;
+                  }
+                  inline.dataset.loaded = '1';
+                } catch (err) {
+                  inline.textContent = '(load failed: ' + err.message + ')';
+                }
+              }
+            }
+            inline.style.display = 'block';
+            btn.textContent = btn.textContent.replace('▾', '▴');
+          });
 
           det.querySelector('.fz-copy-curl')?.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2728,25 +2948,37 @@ async function tool403Bypass() {
 // ═══ HTTP METHOD TESTER ═══
 async function toolMethodTest() {
   const b = showResults('offensive', 'Method Tester', false);
-  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="mt-url" value="${esc(activeTabUrl)}" placeholder="URL to test"><button class="btn-sm primary" id="mt-go">Test 7 Methods</button></div><div id="mt-out"></div>`;
-  const runTest = async () => {
+  b.innerHTML = `
+    <div class="tool-input-row mb-4"><input class="tool-input" id="mt-url" value="${esc(activeTabUrl)}" placeholder="URL to test"></div>
+    <div class="tool-input-row mb-6" style="flex-wrap:wrap;gap:6px">
+      <button class="btn-sm primary" id="mt-go">Test Safe Methods</button>
+      <button class="btn-sm" id="mt-go-all" style="border-color:#c9750f;color:#c9750f">⚠ Include Destructive</button>
+    </div>
+    <div class="text-xs text-muted mb-4">Safe set: GET, POST, OPTIONS, HEAD, PROPFIND. Destructive set adds PUT, PATCH, DELETE, PROPPATCH, MKCOL, COPY, MOVE, LOCK — these can mutate state on misconfigured servers.</div>
+    <div id="mt-out"></div>`;
+  const runTest = async (confirmDestructive) => {
     const url = b.querySelector('#mt-url').value;
     const out = b.querySelector('#mt-out');
-    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 7 HTTP methods (authenticated)...</div>';
-    const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url });
+    if (confirmDestructive) {
+      if (!confirm('Destructive methods (PUT, PATCH, DELETE, PROPPATCH, MKCOL, COPY, MOVE, LOCK) can modify resources on the target server.\n\nOnly run on targets where you have explicit authorization. Continue?')) return;
+    }
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing methods (authenticated)…</div>';
+    const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url, confirmDestructive });
     if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
     const baseline = r.results[0];
-    out.innerHTML = `<div class="text-sm mb-6">${esc(url)}<br><span class="text-xs text-muted">Baseline GET: ${baseline.status} · ${baseline.bodyLen}b</span></div>` +
+    out.innerHTML = `<div class="text-sm mb-6">${esc(url)}<br><span class="text-xs text-muted">Baseline GET: ${baseline.status} · ${baseline.bodyLen}b${r.ranDestructive ? ' · destructive set ENABLED' : ''}</span></div>` +
       r.results.map(x => {
         let sev = 'info', verdict = '';
-        if (x.error) { sev = 'info'; verdict = x.error; }
+        if (x.method === 'SAFETY') { sev = 'low'; verdict = x.note; }
+        else if (x.error) { sev = 'info'; verdict = x.error; }
         else if (x.baseline) { verdict = 'Baseline reference'; }
         else if (x.traceListed) { sev = 'medium'; verdict = x.note; }
         else if (x.realDanger) { sev = 'high'; verdict = `${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
         else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (${x.bodyDiff}b) — server ignores method, not a real finding`; }
         else if (x.status === 405) { verdict = 'Method not allowed (expected)'; }
-        else if (x.status !== baseline.status) { sev = 'low'; verdict = `Different status than GET (${baseline.status})  — worth investigating`; }
-        else { verdict = 'Same as GET'; }
+        else if (x.status !== baseline.status && x.method !== 'WebDAV' && x.method !== 'SAFETY') { sev = 'low'; verdict = `Different status than GET (${baseline.status}) — worth investigating`; }
+        else if (x.method !== 'WebDAV' && x.method !== 'SAFETY') { verdict = 'Same as GET'; }
+        else if (x.method === 'WebDAV') { sev = 'medium'; verdict = x.note; }
         return `<div class="result-item ${sev}">
           <div class="result-label"><span class="result-tag tag-${sev === 'high' ? 'high' : sev === 'medium' ? 'medium' : sev === 'low' ? 'low' : 'info'}">${x.status}</span> ${x.method}</div>
           <div class="result-value">${x.bodyLen !== undefined ? x.bodyLen + 'b' : ''} ${x.allow ? '· Allow: ' + esc(x.allow) : ''}</div>
@@ -2756,7 +2988,8 @@ async function toolMethodTest() {
       }).join('');
     finalizeResults('offensive');
   };
-  b.querySelector('#mt-go')?.addEventListener('click', runTest);
+  b.querySelector('#mt-go')?.addEventListener('click', () => runTest(false));
+  b.querySelector('#mt-go-all')?.addEventListener('click', () => runTest(true));
 }
 
 // ═══ JWT EDITOR ═══
@@ -3076,7 +3309,7 @@ async function toolIdor() {
   };
 
   analyzeUrl(activeTabUrl, 'Current URL');
-  const reqs = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
+  const reqs = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId, domain: activeTabDomain });
   (reqs.requests || []).slice(-30).forEach(r => analyzeUrl(r.url, 'XHR ' + (r.method || 'GET')));
   try {
     const linkRes = await msgTab({ type: 'EXTRACT_LINKS' });
@@ -3133,18 +3366,51 @@ async function toolIdor() {
       const results = await Promise.all(tests.map(async t => {
         try {
           const r = await chrome.runtime.sendMessage({ type: 'FETCH_URL', url: t.url });
-          return { val: t.val, url: t.url, status: r.status, len: (r.text || '').length };
+          return { val: t.val, url: t.url, status: r.status, len: (r.text || '').length, body: r.text || '' };
         } catch (e) { return { val: t.val, url: t.url, error: e.message }; }
       }));
       const baseLen = (baseline.text || '').length;
+      const baseBody = baseline.text || '';
+      // Strip dynamic noise (CSRF tokens, timestamps, request IDs, nonces) before comparing
+      // bodies. Without this, every response looks slightly different and we get false
+      // positives on every 200 — which was the original bug.
+      const stripNoise = (s) => s
+        .replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/gi, 'UUID')
+        .replace(/\b\d{10,13}\b/g, 'TS')
+        .replace(/csrf[_-]?token["'\s:=]+["']?[a-zA-Z0-9_-]+/gi, 'CSRF')
+        .replace(/nonce["'\s:=]+["']?[a-zA-Z0-9_-]+/gi, 'NONCE')
+        .replace(/request[_-]?id["'\s:=]+["']?[a-zA-Z0-9_-]+/gi, 'REQID')
+        .replace(/\s+/g, ' ');
+      const baseStripped = stripNoise(baseBody.slice(0, 50000));
+      const baseShape = baseStripped.length;
+
       out.innerHTML = '<div style="margin-bottom:4px">Baseline: ' + baseline.status + ' · ' + baseLen + 'b</div>' +
         results.map(r => {
           if (r.error) return '<div style="color:var(--text-muted)">' + esc(r.val) + ': error — ' + esc(r.error) + '</div>';
           const lenDiff = Math.abs(r.len - baseLen);
-          const interesting = r.status === 200 && lenDiff < 100 && r.val !== baseVal;
+          // Similarity check: strip noise, compare shape. Two responses that differ only by
+          // a CSRF token / timestamp now correctly look identical, killing false positives.
+          let sameContent = false;
+          let differentContent = false;
+          if (r.status === 200 && r.body) {
+            const stripped = stripNoise(r.body.slice(0, 50000));
+            const lenRatio = stripped.length / Math.max(baseShape, 1);
+            sameContent = lenRatio > 0.9 && lenRatio < 1.1; // within 10% size after noise strip
+            // Genuinely different content = different IDs, different content lengths, but 200
+            differentContent = r.status === 200 && !sameContent && r.val !== baseVal;
+          }
           const blocked = r.status === 401 || r.status === 403 || r.status === 404;
-          const style = interesting ? 'color:var(--accent);font-weight:600' : blocked ? 'color:var(--text-muted)' : '';
-          return '<div style="' + style + '">' + esc(r.val) + ': ' + r.status + ' · ' + r.len + 'b (Δ' + lenDiff + 'b)' + (interesting ? ' ← worth investigating' : '') + '</div>';
+          let label = '', style = '';
+          if (differentContent) {
+            label = ' ← different data — possible IDOR';
+            style = 'color:var(--accent);font-weight:600';
+          } else if (sameContent && r.val !== baseVal) {
+            label = ' (same shape — likely error/empty response)';
+            style = 'color:var(--text-muted)';
+          } else if (blocked) {
+            style = 'color:var(--text-muted)';
+          }
+          return '<div style="' + style + '">' + esc(r.val) + ': ' + r.status + ' · ' + r.len + 'b (Δ' + lenDiff + 'b)' + label + '</div>';
         }).join('');
     } catch (e) { out.innerHTML = errMsg(e.message); }
   }));

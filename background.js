@@ -9,6 +9,22 @@ const capturedRequests = {};
 // Structure: { 'target.com': { hosts: Set, jsFiles: Map<url, {firstSeen, status, ct, size}>, requests: [], authDetectedAt: timestamp|null } }
 const domainAggregate = {};
 
+// MV3 service workers terminate after 30s of inactivity — including mid-fuzz. The sidepanel
+// opens a long-lived port on launch; while it's connected, the worker stays alive.
+// When the user switches apps and comes back, if the worker had died mid-fuzz, in-flight
+// fetches were lost (sidepanel waits forever for a response). Port keeps the worker alive
+// while the sidepanel is open. We also re-ping every 20s as belt-and-suspenders.
+let keepalivePorts = new Set();
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'cyboware-keepalive') return;
+  keepalivePorts.add(port);
+  port.onDisconnect.addListener(() => keepalivePorts.delete(port));
+});
+setInterval(() => {
+  // Keep the worker thread active while any sidepanel port is connected
+  keepalivePorts.forEach(p => { try { p.postMessage({ ping: Date.now() }); } catch {} });
+}, 20000);
+
 // Fuzzer response body cache. Bodies live HERE (in the service worker) and the sidepanel
 // asks for them on-demand via FUZZ_GET_RESPONSE_BODY when the user clicks Copy. Without this,
 // shipping 100 × 1MB responses to the sidepanel would freeze it. Keyed by a stable id we mint
@@ -202,7 +218,8 @@ function findAllReflections(body, needle, cap = 5) {
 
 // Single source of truth for the per-payload verification logic. Both URL-fuzz and form-fuzz
 // call this so the rules don't drift between the two paths.
-function evaluateFuzzResult({ check, payload, expect, body, baselineBody, baselineLen, elapsed, baselineTime, status, headers, rawReflected, context }) {
+function evaluateFuzzResult({ check, payload, expect, body, baselineBody, baselineLen, elapsed, baselineTime, status, headers, rawReflected, context, isRedirect, timeConfirmed }) {
+  const opts = { isRedirect, timeConfirmed };
   const sig = FUZZ_SIGNATURES;
   let severity = 'safe', analysis = '', outContext = context || '';
 
@@ -245,8 +262,30 @@ function evaluateFuzzResult({ check, payload, expect, body, baselineBody, baseli
     else { severity = 'safe'; analysis = 'No SQL errors detected'; }
   } else if (check === 'sqli_blind_time') {
     const timeDiff = elapsed - baselineTime;
-    if (timeDiff > 3000) { severity = 'high'; analysis = 'Response delayed ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — TIME-BASED BLIND SQLi!'; }
-    else if (timeDiff > 1500) { severity = 'medium'; analysis = 'Slight delay ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — investigate'; }
+    if (opts.isRedirect) {
+      severity = 'safe';
+      analysis = 'Redirect (' + status + ') — elapsed time reflects redirect chain, not server processing. Not SQLi.';
+    } else if (timeDiff > 3000 && opts.timeConfirmed) {
+      // We re-fired the request with a benign value. If THAT was also slow, the endpoint
+      // is just slow — not SQLi.
+      const { confirmElapsed, confirmDiff } = opts.timeConfirmed;
+      if (confirmElapsed > 3000) {
+        severity = 'low';
+        analysis = 'Slow endpoint: payload took ' + (elapsed/1000).toFixed(1) + 's, benign value also took ' + (confirmElapsed/1000).toFixed(1) + 's. Not payload-specific — likely server slowness.';
+      } else if (confirmDiff > 2000) {
+        // Payload was meaningfully slower than the benign retest — strong SQLi signal
+        severity = 'high';
+        analysis = 'Response delayed ' + (elapsed/1000).toFixed(1) + 's vs benign retest ' + (confirmElapsed/1000).toFixed(1) + 's (Δ' + (confirmDiff/1000).toFixed(1) + 's) — TIME-BASED BLIND SQLi confirmed';
+      } else {
+        severity = 'medium';
+        analysis = 'Delay ' + (elapsed/1000).toFixed(1) + 's but benign retest also slow (' + (confirmElapsed/1000).toFixed(1) + 's). Investigate — may be flaky.';
+      }
+    } else if (timeDiff > 3000) {
+      // Couldn't confirm (re-fire failed). Mark as medium with a hint, not high.
+      severity = 'medium';
+      analysis = 'Response delayed ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's). Possible TIME-BASED BLIND SQLi — confirmation re-test failed; manually verify.';
+    }
+    else if (timeDiff > 1500) { severity = 'low'; analysis = 'Slight delay ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — investigate'; }
     else { severity = 'safe'; analysis = 'No delay (' + (elapsed/1000).toFixed(1) + 's)'; }
   } else if (check === 'file_content' || check === 'file_content_win') {
     const fileIndicators = check === 'file_content'
@@ -480,7 +519,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 const handlers = {
   GET_HEADERS: (msg, _, sr) => sr({ headers: tabHeaders[msg.tabId] || null }),
-  GET_CAPTURED_REQUESTS: (msg, _, sr) => sr({ requests: capturedRequests[msg.tabId] || [] }),
+  GET_CAPTURED_REQUESTS: (msg, _, sr) => {
+    // Per-tab capture: live, fast path. When the user closes a tab and reopens the same URL,
+    // tabHeaders[oldId] / capturedRequests[oldId] were wiped on tab close. The Replayer would
+    // then start with an empty list even though the domain aggregate still has the data.
+    // Fall back to the domain aggregate's recorded requests when (a) tab data is empty and
+    // (b) we have a domain hint — so the user gets continuity across tab close/reopen.
+    const tabData = capturedRequests[msg.tabId] || [];
+    if (tabData.length || !msg.domain) { sr({ requests: tabData }); return; }
+    const root = getRootDomain(msg.domain);
+    const agg = root && domainAggregate[root];
+    if (!agg || !agg.requests) { sr({ requests: [] }); return; }
+    // Reshape aggregate.requests (which has fewer fields) into the Replayer's expected shape.
+    // Aggregate doesn't have requestHeaders/responseHeaders/body — the user gets URL+method+status.
+    const fallback = agg.requests
+      .filter(r => r.kind === 'xhr' || r.kind === 'fetch')
+      .slice(-200)
+      .map((r, i) => ({
+        requestId: 'agg-' + i,
+        url: r.url,
+        method: r.method || 'GET',
+        statusCode: r.status || null,
+        timestamp: r.ts,
+        responseHeaders: [],
+        requestHeaders: [],
+        _fromAggregate: true,
+      }));
+    sr({ requests: fallback, fromAggregate: true });
+  },
 
   // On-demand fetch of a fuzz-result response body. Bodies live in the service worker's
   // fuzzResponseCache, indexed by the responseBodyId we minted at fuzz time. The sidepanel
@@ -554,7 +620,7 @@ const handlers = {
     try {
       const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: 'include' };
       if (msg.body) opts.body = msg.body;
-      const res = await fetch(msg.url, opts);
+      const res = await fetch(msg.url, { ...opts, signal: AbortSignal.timeout(opts.signal ? 30000 : 15000) });
       const text = await res.text();
       const rh = {}; res.headers.forEach((v, k) => { rh[k] = v; });
       sr({ ok: true, status: res.status, statusText: res.statusText, text, headers: rh });
@@ -562,7 +628,7 @@ const handlers = {
   },
 
   FETCH_JS: async (msg, _, sr) => {
-    try { const r = await fetch(msg.url, { credentials: 'include' }); sr({ ok: true, text: await r.text() }); }
+    try { const r = await fetch(msg.url, { credentials: 'include', signal: AbortSignal.timeout(10000) }); sr({ ok: true, text: await r.text() }); }
     catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -614,7 +680,7 @@ const handlers = {
 
   WAYBACK_LOOKUP: async (msg, _, sr) => {
     try {
-      const r = await fetch(`https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(msg.url)}&output=json&limit=30&fl=timestamp,original,statuscode,mimetype`);
+      const r = await fetch(`https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(msg.url)}&output=json&limit=30&fl=timestamp,original,statuscode,mimetype`, { signal: AbortSignal.timeout(15000) });
       const d = await r.json();
       sr({ ok: true, snapshots: d.slice(1) });
     } catch (e) { sr({ ok: false, error: e.message }); }
@@ -676,7 +742,7 @@ const handlers = {
     try {
       const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: msg.omitCredentials ? 'omit' : 'include' };
       if (msg.body) opts.body = msg.body;
-      const r = await fetch(msg.url, opts);
+      const r = await fetch(msg.url, { ...opts, signal: AbortSignal.timeout(opts.signal ? 8000 : 8000) });
       const text = await r.text();
       const rh = {}; r.headers.forEach((v, k) => { rh[k] = v; });
       sr({ ok: true, status: r.status, statusText: r.statusText, text, headers: rh });
@@ -746,14 +812,18 @@ const handlers = {
   DNS_LOOKUP: async (msg, _, sr) => {
     try {
       const types = ['A', 'AAAA', 'MX', 'TXT', 'NS', 'CNAME', 'CAA'];
-      const results = {};
-      for (const type of types) {
+      // Parallelize record-type fetches — was sequential, costing 7× the slowest call.
+      // Now bounded by the slowest single record type (typically <500ms vs the old 3-5s).
+      const recordResults = await Promise.all(types.map(async type => {
         try {
-          const r = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(msg.domain)}&type=${type}`);
+          const r = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(msg.domain)}&type=${type}`, { signal: AbortSignal.timeout(5000) });
           const d = await r.json();
-          if (d.Answer) results[type] = d.Answer.map(a => a.data);
-        } catch {}
-      }
+          return [type, d.Answer ? d.Answer.map(a => a.data) : null];
+        } catch { return [type, null]; }
+      }));
+      const results = {};
+      recordResults.forEach(([type, val]) => { if (val) results[type] = val; });
+
       const emailSecurity = { spf: null, dmarc: null, dkim: [], mtaSts: null, bimi: null, findings: [] };
       const txts = results.TXT || [];
       const spfRecord = txts.find(t => t.toLowerCase().includes('v=spf1'));
@@ -763,67 +833,83 @@ const handlers = {
         else if (spfRecord.includes('~all')) emailSecurity.findings.push({ severity: 'medium', text: 'SPF ~all (softfail) — emails may still be delivered (spoofable with effort)' });
         else if (spfRecord.includes('?all')) emailSecurity.findings.push({ severity: 'medium', text: 'SPF ?all (neutral) — no enforcement' });
         else if (spfRecord.includes('-all')) emailSecurity.findings.push({ severity: 'low', text: 'SPF -all (hardfail) — properly configured' });
-        // SPF lookup-count check: each include/redirect/a/mx counts; >10 = SPF PermError (Records over the limit silently fail)
         const lookups = (spfRecord.match(/\b(include|redirect|a|mx|exists|ptr):/g) || []).length;
         if (lookups > 10) emailSecurity.findings.push({ severity: 'medium', text: `SPF has ${lookups} DNS lookups (>10 = PermError; record silently invalid)` });
       } else {
         emailSecurity.findings.push({ severity: 'high', text: 'No SPF record — email spoofing possible' });
       }
-      try {
-        const dr = await fetch(`https://dns.google/resolve?name=_dmarc.${encodeURIComponent(msg.domain)}&type=TXT`);
-        const dd = await dr.json();
-        if (dd.Answer) {
-          const dmarcRec = dd.Answer.find(a => a.data.includes('v=DMARC1'));
-          if (dmarcRec) {
-            emailSecurity.dmarc = dmarcRec.data;
-            if (dmarcRec.data.includes('p=none')) emailSecurity.findings.push({ severity: 'medium', text: 'DMARC p=none — monitoring only, no enforcement' });
-            else if (dmarcRec.data.includes('p=quarantine')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=quarantine — suspicious mail quarantined' });
-            else if (dmarcRec.data.includes('p=reject')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=reject — properly configured' });
-            // sp=none means subdomains are unprotected even when the apex is
-            if (dmarcRec.data.includes('sp=none')) emailSecurity.findings.push({ severity: 'medium', text: 'DMARC sp=none — subdomains unprotected (spoofable)' });
-          } else {
-            emailSecurity.findings.push({ severity: 'high', text: 'No DMARC record — email spoofing possible' });
-          }
+
+      // Run DMARC, DKIM, MTA-STS, BIMI all in parallel rather than sequentially.
+      // Total wall time drops from ~4 sequential calls × timeout to one timeout window.
+      const selectors = ['default', 'google', 'k1', 'k2', 'mail', 'selector1', 'selector2', 'mxvault', 's1', 's2', 'dkim'];
+      const [dmarcResult, dkimChecks, mtaResult, bimiResult] = await Promise.all([
+        // DMARC
+        (async () => {
+          try {
+            const dr = await fetch(`https://dns.google/resolve?name=_dmarc.${encodeURIComponent(msg.domain)}&type=TXT`, { signal: AbortSignal.timeout(5000) });
+            const dd = await dr.json();
+            return dd.Answer || null;
+          } catch { return null; }
+        })(),
+        // DKIM (parallel within itself)
+        Promise.all(selectors.map(async sel => {
+          try {
+            const r = await fetch(`https://dns.google/resolve?name=${sel}._domainkey.${encodeURIComponent(msg.domain)}&type=TXT`, { signal: AbortSignal.timeout(5000) });
+            const d = await r.json();
+            if (d.Answer) {
+              const rec = d.Answer.find(a => /v=DKIM1/i.test(a.data));
+              if (rec) return { selector: sel, value: rec.data };
+            }
+          } catch {}
+          return null;
+        })),
+        // MTA-STS
+        (async () => {
+          try {
+            const mr = await fetch(`https://dns.google/resolve?name=_mta-sts.${encodeURIComponent(msg.domain)}&type=TXT`, { signal: AbortSignal.timeout(5000) });
+            const md = await mr.json();
+            return md.Answer || null;
+          } catch { return null; }
+        })(),
+        // BIMI
+        (async () => {
+          try {
+            const br = await fetch(`https://dns.google/resolve?name=default._bimi.${encodeURIComponent(msg.domain)}&type=TXT`, { signal: AbortSignal.timeout(5000) });
+            const bd = await br.json();
+            return bd.Answer || null;
+          } catch { return null; }
+        })(),
+      ]);
+
+      // Process DMARC result
+      if (dmarcResult) {
+        const dmarcRec = dmarcResult.find(a => a.data.includes('v=DMARC1'));
+        if (dmarcRec) {
+          emailSecurity.dmarc = dmarcRec.data;
+          if (dmarcRec.data.includes('p=none')) emailSecurity.findings.push({ severity: 'medium', text: 'DMARC p=none — monitoring only, no enforcement' });
+          else if (dmarcRec.data.includes('p=quarantine')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=quarantine — suspicious mail quarantined' });
+          else if (dmarcRec.data.includes('p=reject')) emailSecurity.findings.push({ severity: 'low', text: 'DMARC p=reject — properly configured' });
+          if (dmarcRec.data.includes('sp=none')) emailSecurity.findings.push({ severity: 'medium', text: 'DMARC sp=none — subdomains unprotected (spoofable)' });
         } else {
           emailSecurity.findings.push({ severity: 'high', text: 'No DMARC record — email spoofing possible' });
         }
-      } catch {}
+      } else {
+        emailSecurity.findings.push({ severity: 'high', text: 'No DMARC record — email spoofing possible' });
+      }
 
-      // DKIM common selectors — probe in parallel
-      const selectors = ['default', 'google', 'k1', 'k2', 'mail', 'selector1', 'selector2', 'mxvault', 's1', 's2', 'dkim'];
-      const dkimChecks = await Promise.all(selectors.map(async sel => {
-        try {
-          const r = await fetch(`https://dns.google/resolve?name=${sel}._domainkey.${encodeURIComponent(msg.domain)}&type=TXT`);
-          const d = await r.json();
-          if (d.Answer) {
-            const rec = d.Answer.find(a => /v=DKIM1/i.test(a.data));
-            if (rec) return { selector: sel, value: rec.data };
-          }
-        } catch {}
-        return null;
-      }));
       emailSecurity.dkim = dkimChecks.filter(Boolean);
       if (!emailSecurity.dkim.length) emailSecurity.findings.push({ severity: 'low', text: 'No DKIM key found at common selectors — domain may not sign mail or uses non-standard selector' });
 
-      // MTA-STS: TLS enforcement for inbound mail
-      try {
-        const mr = await fetch(`https://dns.google/resolve?name=_mta-sts.${encodeURIComponent(msg.domain)}&type=TXT`);
-        const md = await mr.json();
-        if (md.Answer) {
-          const mtaRec = md.Answer.find(a => /v=STSv1/i.test(a.data));
-          if (mtaRec) emailSecurity.mtaSts = mtaRec.data;
-        }
-      } catch {}
+      if (mtaResult) {
+        const mtaRec = mtaResult.find(a => /v=STSv1/i.test(a.data));
+        if (mtaRec) emailSecurity.mtaSts = mtaRec.data;
+      }
 
-      // BIMI: brand indicator for messaging
-      try {
-        const br = await fetch(`https://dns.google/resolve?name=default._bimi.${encodeURIComponent(msg.domain)}&type=TXT`);
-        const bd = await br.json();
-        if (bd.Answer) {
-          const bimiRec = bd.Answer.find(a => /v=BIMI1/i.test(a.data));
-          if (bimiRec) emailSecurity.bimi = bimiRec.data;
-        }
-      } catch {}
+      if (bimiResult) {
+        const bimiRec = bimiResult.find(a => /v=BIMI1/i.test(a.data));
+        if (bimiRec) emailSecurity.bimi = bimiRec.data;
+      }
+
 
       // CAA findings
       if (results.CAA) {
@@ -879,7 +965,7 @@ const handlers = {
 
   DETECT_WP_PLUGINS: async (msg, _, sr) => {
     try {
-      const r = await fetch(msg.url, { credentials: 'include' });
+      const r = await fetch(msg.url, { credentials: 'include', signal: AbortSignal.timeout(12000) });
       const html = await r.text();
       const plugins = new Map();
       const re = /wp-content\/plugins\/([a-zA-Z0-9_-]+)(?:\/[^?"'\s]*)?(?:\?ver=([0-9.]+))?/g;
@@ -939,19 +1025,46 @@ const handlers = {
           const isTimeBased = check === 'sqli_blind_time';
           try {
             const t0 = Date.now();
-            const r = await fetch(testUrl.toString(), { credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 5000) });
+            // For time-based SQLi: redirect:'manual' so we measure ONLY the target's own
+            // response time, not the cumulative time across a redirect chain. Without this,
+            // a slow 302 → /login redirect inflates elapsed and produces false positives
+            // ("TIME-BASED BLIND SQLi!" on a payload that just triggered the auth gate).
+            const r = await fetch(testUrl.toString(), {
+              credentials: 'include',
+              redirect: isTimeBased ? 'manual' : 'follow',
+              signal: AbortSignal.timeout(isTimeBased ? 15000 : 5000)
+            });
             const elapsed = Date.now() - t0;
-            const body = await r.text();
+            // For time-based: a redirect (status 0 with type 'opaqueredirect', or 3xx) is
+            // a clear signal we'd be following an unrelated slow chain. Skip — not SQLi.
+            const isRedirect = isTimeBased && (r.type === 'opaqueredirect' || (r.status >= 300 && r.status < 400) || r.status === 0);
+            const body = isRedirect ? '' : await r.text();
             const rawReflected = body.includes(payload);
             let context = '';
             if (rawReflected) {
               const idx = body.indexOf(payload);
               context = body.slice(Math.max(0, idx - 80), Math.min(body.length, idx + payload.length + 80));
             }
+            // For confirmed time-based delays, fire ONE re-test with a benign value to confirm
+            // the delay is payload-specific. Without this, any slow endpoint marks every
+            // sleep payload as a vuln.
+            let timeConfirmed = null;
+            if (isTimeBased && !isRedirect && elapsed - baselineTime > 3000) {
+              try {
+                const c0 = Date.now();
+                const cu = new URL(msg.url);
+                cu.searchParams.set(param, '1'); // benign value, same param
+                const cr = await fetch(cu.toString(), { credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(15000) });
+                const cElapsed = Date.now() - c0;
+                await cr.text().catch(() => '');
+                timeConfirmed = { confirmElapsed: cElapsed, confirmDiff: elapsed - cElapsed };
+              } catch {}
+            }
             const ev = evaluateFuzzResult({
               check, payload, expect, body, baselineBody, baselineLen,
               elapsed, baselineTime, status: r.status, headers: r.headers,
               rawReflected, context,
+              isRedirect, timeConfirmed,
             });
 
             // Build a richer reflection map. For each result, find every place the relevant
@@ -1126,9 +1239,47 @@ const handlers = {
       try { const lr = await fetch(u.origin + '/login', { credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(3000) }); loginBody = await lr.text(); } catch {}
 
       const results = [{ technique: 'Baseline', status: baseStatus, type: 'baseline' }];
+
+      // WAF detection — check the baseline body and any bypass response for known WAF block
+      // pages. Without this, the tool reports "still 403" when the user has actually been
+      // WAF-blocked, and chains 25 requests in a tight loop will reliably trigger it.
+      const detectWaf = (body, status, headers) => {
+        if (!body) return null;
+        const b = body.slice(0, 4000);
+        // Cloudflare's interstitial / block pages
+        if (/Just a moment\.\.\.|cf_chl_jschl|__cf_chl_/i.test(b)) return 'Cloudflare challenge';
+        if (/Attention Required.*Cloudflare|cloudflare-static\/email-decode/i.test(b)) return 'Cloudflare block';
+        // AWS WAF
+        if (/AWS WAF|<Code>WAFTokenValidationException<\/Code>|"x-amzn-waf/i.test(b)) return 'AWS WAF';
+        // Akamai
+        if (/Reference #\d+\.[a-f0-9]+\.\d+\.[a-f0-9]+|akamai/i.test(b) && status === 403) return 'Akamai block';
+        // Imperva / Incapsula
+        if (/_Incapsula_Resource|Incapsula incident|Request unsuccessful\. Incapsula/i.test(b)) return 'Imperva/Incapsula';
+        // Sucuri
+        if (/Sucuri WebSite Firewall|Access Denied - Sucuri/i.test(b)) return 'Sucuri';
+        // F5 BIG-IP ASM
+        if (/The requested URL was rejected\. Please consult with your administrator/i.test(b)) return 'F5 BIG-IP ASM';
+        // Generic rate-limit signals
+        if (status === 429 || /rate limit|too many requests/i.test(b.slice(0, 200))) return 'Rate-limited';
+        return null;
+      };
+
+      const baselineWaf = detectWaf(baseBody, baseStatus);
+      if (baselineWaf) {
+        // Surface to results so the user sees this BEFORE all the bypass attempts come back
+        // looking like genuine 403s. Don't abort the run — they may still want to see what
+        // techniques get past the WAF — but flag prominently.
+        results.push({ technique: 'WAF DETECTED', type: 'waf', status: baseStatus, bypass: false, verdict: baselineWaf + ' detected on baseline. Bypass attempts may be misleading; results filtered.', preview: '' });
+      }
+
       for (const t of techniques) {
         try {
-          const opts = { method: t.method || 'GET', headers: t.headers || {}, redirect: 'manual', credentials: 'include', signal: AbortSignal.timeout(5000) };
+          // 200ms gap between requests. WAFs aggressively rate-limit tight loops; without this
+          // pacing, after the first ~10 attempts every subsequent request gets a cached 403
+          // and the tool reports false negatives.
+          await new Promise(r => setTimeout(r, 200));
+
+          const opts = { method: t.method || 'GET', headers: t.headers || {}, redirect: 'manual', credentials: 'include', signal: AbortSignal.timeout(8000) };
           const testUrl = t.url || url;
           const r = await fetch(testUrl, opts);
           const statusBypass = r.status >= 200 && r.status < 400 && baseStatus >= 400;
@@ -1140,16 +1291,17 @@ const handlers = {
           if (statusBypass && r.status === 200) {
             const body = await r.text();
             preview = body.slice(0, 200);
-            const similarToHome = homeBody && Math.abs(body.length - homeBody.length) < 200;
-            const similarToLogin = loginBody && Math.abs(body.length - loginBody.length) < 200;
-            if (similarToHome) {
+            // WAF check on the bypass response too
+            const waf = detectWaf(body, r.status);
+            if (waf) {
               bypass = false;
-              verdict = 'Returns homepage (not a real bypass)';
-            } else if (similarToLogin) {
-              bypass = false;
-              verdict = 'Redirects to login (not a real bypass)';
+              verdict = waf + ' — request was intercepted, not a bypass';
             } else {
-              verdict = 'Different content returned — investigate!';
+              const similarToHome = homeBody && Math.abs(body.length - homeBody.length) < 200;
+              const similarToLogin = loginBody && Math.abs(body.length - loginBody.length) < 200;
+              if (similarToHome) { bypass = false; verdict = 'Returns homepage (not a real bypass)'; }
+              else if (similarToLogin) { bypass = false; verdict = 'Redirects to login (not a real bypass)'; }
+              else { verdict = 'Different content returned — investigate!'; }
             }
           } else if (statusBypass && (r.status === 301 || r.status === 302)) {
             const loc = r.headers.get('location') || '';
@@ -1157,6 +1309,8 @@ const handlers = {
               bypass = false;
               verdict = 'Redirects to ' + loc.split('/').pop() + ' (not a real bypass)';
             }
+          } else if (r.status === 429) {
+            verdict = 'Rate-limited — slow down';
           }
 
           results.push({ technique: t.name, type: t.type, status: r.status, bypass, verdict, url: testUrl, preview: bypass ? preview : '' });
@@ -1164,7 +1318,7 @@ const handlers = {
           results.push({ technique: t.name, type: t.type, status: 'err', error: e.message });
         }
       }
-      sr({ ok: true, baseStatus, results });
+      sr({ ok: true, baseStatus, results, wafDetected: baselineWaf });
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -1174,9 +1328,23 @@ const handlers = {
     // browser fetch() — it throws TypeError immediately. Servers that still respond
     // to TRACE require a raw HTTP client to test, which extensions cannot do.
     // Use the OPTIONS Allow header below as an indirect signal for TRACE support.
-    const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
-    // WebDAV methods — fetch() may reject some of these, but most modern Chrome accepts them
-    const webdavMethods = ['PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'];
+    //
+    // Destructive method gating: PUT/DELETE/PATCH/PROPPATCH/MKCOL/COPY/MOVE/LOCK can
+    // mutate state on misconfigured servers (especially WebDAV — MKCOL with empty body
+    // can create directories on enabled DAV endpoints). The sidepanel must pass
+    // confirmDestructive:true to run them; otherwise they're skipped with a warning.
+    const safeMethods = ['GET', 'POST', 'OPTIONS', 'HEAD'];
+    const destructiveMethods = ['PUT', 'PATCH', 'DELETE'];
+    const safeWebdav = ['PROPFIND']; // read-only WebDAV
+    const destructiveWebdav = ['PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'];
+    const includeDestructive = msg.confirmDestructive === true;
+
+    const methods = includeDestructive
+      ? [...safeMethods, ...destructiveMethods]
+      : safeMethods;
+    const webdavMethods = includeDestructive
+      ? [...safeWebdav, ...destructiveWebdav]
+      : safeWebdav;
     try {
       const baseStart = performance.now();
       let baseBody = '', baseStatus = 0, baseHeaders = {}, baseElapsed = 0;
@@ -1230,7 +1398,10 @@ const handlers = {
       if (webdavSupported.length) {
         results.push({ method: 'WebDAV', status: 'info', webdavSupported, note: `WebDAV methods accepted: ${webdavSupported.map(w => `${w.method}(${w.status})`).join(', ')} — server is a WebDAV endpoint. Test for unauthenticated PUT, MKCOL with raw client.` });
       }
-      sr({ ok: true, results });
+      if (!includeDestructive) {
+        results.push({ method: 'SAFETY', status: 'info', note: 'Skipped destructive methods (PUT, PATCH, DELETE, PROPPATCH, MKCOL, COPY, MOVE, LOCK). These can mutate state on misconfigured servers. Click "Run with destructive methods" to include them — only on targets with explicit authorization.' });
+      }
+      sr({ ok: true, results, ranDestructive: includeDestructive });
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -1464,14 +1635,19 @@ const handlers = {
       { service: 'CloudFront', cnames: ['cloudfront.net'], body: 'Bad request: ERROR: The request could not be satisfied' },
     ];
     try {
+      const subs = msg.subdomains.slice(0, 30);
       const results = [];
-      for (const sub of msg.subdomains.slice(0, 30)) {
+
+      // Process subdomains in parallel batches. Was sequential which made 30 subs * 2 DNS
+      // lookups (5s timeout each) = up to ~5 minutes worst case. Batches of 6 cap concurrent
+      // DNS load while keeping total wall time reasonable (~30s worst case).
+      const checkOne = async (sub) => {
         try {
-          const dns = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(sub)}&type=CNAME`);
+          const dns = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(sub)}&type=CNAME`, { signal: AbortSignal.timeout(5000) });
           const d = await dns.json();
           const cnames = d.Answer ? d.Answer.filter(a => a.type === 5).map(a => a.data.replace(/\.$/, '')) : [];
-          if (!cnames.length) continue;
-
+          if (!cnames.length) return [];
+          const subResults = [];
           for (const cname of cnames) {
             for (const fp of fingerprints) {
               if (fp.cnames.some(c => cname.includes(c))) {
@@ -1483,35 +1659,37 @@ const handlers = {
                     const body = await r.text();
                     vulnerable = body.includes(fp.body);
                   } catch (e) {
-                    // Enhanced: classify connection errors instead of assuming vulnerable
                     const msg = e.message || '';
                     if (msg.includes('ERR_NAME_NOT_RESOLVED') || msg.includes('NXDOMAIN')) {
-                      vulnerable = true;
-                      errorType = 'DNS_NXDOMAIN';
+                      vulnerable = true; errorType = 'DNS_NXDOMAIN';
                     } else if (msg.includes('ERR_CONNECTION_REFUSED')) {
                       errorType = 'CONNECTION_REFUSED';
-                      // Moderate signal — could be takeover or just down
                     } else {
                       errorType = 'TIMEOUT';
-                      // Weak signal — don't mark as vulnerable
                     }
                   }
                 } else {
-                  // Services without body fingerprint (Azure, GCP) — check DNS only
                   try {
-                    const dnsA = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(sub)}&type=A`);
+                    const dnsA = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(sub)}&type=A`, { signal: AbortSignal.timeout(5000) });
                     const dA = await dnsA.json();
                     if (!dA.Answer || dA.Answer.length === 0) {
-                      vulnerable = true;
-                      errorType = 'NO_A_RECORD';
+                      vulnerable = true; errorType = 'NO_A_RECORD';
                     }
                   } catch {}
                 }
-                results.push({ subdomain: sub, cname, service: fp.service, vulnerable, errorType, fingerprint: fp.body || '(DNS check)' });
+                subResults.push({ subdomain: sub, cname, service: fp.service, vulnerable, errorType, fingerprint: fp.body || '(DNS check)' });
               }
             }
           }
-        } catch {}
+          return subResults;
+        } catch { return []; }
+      };
+
+      const BATCH = 6;
+      for (let i = 0; i < subs.length; i += BATCH) {
+        const batch = subs.slice(i, i + BATCH);
+        const batchResults = await Promise.all(batch.map(checkOne));
+        batchResults.forEach(r => results.push(...r));
       }
       sr({ ok: true, results });
     } catch (e) { sr({ ok: false, error: e.message }); }
@@ -1520,7 +1698,7 @@ const handlers = {
   // Test Google API key
   TEST_GOOGLE_KEY: async (msg, _, sr) => {
     try {
-      const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?key=${msg.key}&address=test`);
+      const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?key=${msg.key}&address=test`, { signal: AbortSignal.timeout(8000) });
       const d = await r.json();
       sr({ ok: true, status: d.status, error_message: d.error_message || '' });
     } catch (e) { sr({ ok: false, error: e.message }); }
@@ -1652,7 +1830,7 @@ const handlers = {
         ? { method: 'POST', body: baseData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(10000) }
         : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(10000) };
       const baseUrl = method.toUpperCase() === 'GET' ? action + '?' + baseData.toString() : action;
-      const br = await fetch(baseUrl, baseOpts);
+      const br = await fetch(baseUrl, { ...baseOpts, signal: baseOpts.signal || AbortSignal.timeout(10000) });
       baselineTime = Date.now() - t0;
       baselineBody = await br.text();
       baselineLen = baselineBody.length;
@@ -1673,23 +1851,47 @@ const handlers = {
         const isTimeBased = check === 'sqli_blind_time';
         try {
           const t0 = Date.now();
+          // For time-based: redirect:'manual' to avoid counting redirect-chain latency
+          const redirectMode = isTimeBased ? 'manual' : 'follow';
           const opts = method.toUpperCase() === 'POST'
-            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) }
-            : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) };
+            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: redirectMode, signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) }
+            : { method: 'GET', credentials: 'include', redirect: redirectMode, signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) };
           const testUrl = method.toUpperCase() === 'GET' ? action + '?' + formData.toString() : action;
           const r = await fetch(testUrl, opts);
           const elapsed = Date.now() - t0;
-          const body = await r.text();
+          const isRedirect = isTimeBased && (r.type === 'opaqueredirect' || (r.status >= 300 && r.status < 400) || r.status === 0);
+          const body = isRedirect ? '' : await r.text();
           const rawReflected = body.includes(payload);
           let context = '';
           if (rawReflected) {
             const idx = body.indexOf(payload);
             context = body.slice(Math.max(0, idx - 80), Math.min(body.length, idx + payload.length + 80));
           }
+          // Confirmation re-test for time-blind hits
+          let timeConfirmed = null;
+          if (isTimeBased && !isRedirect && elapsed - baselineTime > 3000) {
+            try {
+              const cFormData = new URLSearchParams();
+              fields.forEach(f => {
+                if (!f.name) return;
+                cFormData.append(f.name, f.name === field.name ? '1' : (f.value || 'test'));
+              });
+              const c0 = Date.now();
+              const cOpts = method.toUpperCase() === 'POST'
+                ? { method: 'POST', body: cFormData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(15000) }
+                : { method: 'GET', credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(15000) };
+              const cTestUrl = method.toUpperCase() === 'GET' ? action + '?' + cFormData.toString() : action;
+              const cr = await fetch(cTestUrl, cOpts);
+              const cElapsed = Date.now() - c0;
+              await cr.text().catch(() => '');
+              timeConfirmed = { confirmElapsed: cElapsed, confirmDiff: elapsed - cElapsed };
+            } catch {}
+          }
           const ev = evaluateFuzzResult({
             check, payload, expect, body, baselineBody, baselineLen,
             elapsed, baselineTime, status: r.status, headers: r.headers,
             rawReflected, context,
+            isRedirect, timeConfirmed,
           });
 
           // Same reflection-map enrichment as PARAM_FUZZ
@@ -1805,8 +2007,17 @@ const handlers = {
 
 // ═══ HELPER: Simple string hash for body comparison ═══
 function simpleHash(str) {
+  // Strip dynamic noise that varies between identical pages so the hash is stable.
+  // Without this, every 404 page with an embedded request-id / timestamp / nonce hashes
+  // differently, making DirBrute treat each one as a new finding.
+  const stripped = str
+    .replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/gi, 'UUID')
+    .replace(/\b\d{10,16}\b/g, 'TS')
+    .replace(/(?:request[_-]?id|trace[_-]?id|x-request-id|nonce)["'\s:=]+["']?[a-zA-Z0-9_-]+/gi, 'REQID')
+    .replace(/csrf[_-]?token["'\s:=]+["']?[a-zA-Z0-9_-]+/gi, 'CSRF')
+    .replace(/\b[A-Fa-f0-9]{32,}\b/g, 'HASH');
   let hash = 0;
-  const sample = str.length > 2000 ? str.slice(0, 1000) + str.slice(-1000) : str;
+  const sample = stripped.length > 2000 ? stripped.slice(0, 1000) + stripped.slice(-1000) : stripped;
   for (let i = 0; i < sample.length; i++) {
     const ch = sample.charCodeAt(i);
     hash = ((hash << 5) - hash) + ch;

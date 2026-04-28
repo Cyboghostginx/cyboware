@@ -18,6 +18,8 @@ A Chrome extension built for bug bounty hunters, pentesters, and security resear
 3. Click **Load unpacked** → select the folder (Unzipped)
 4. Click the Cyboware icon — sidebar opens
 
+# Sometimes you need to refresh your page in case some of the tools is not detecting anything.
+
 ---
 
 ## Tools (35)

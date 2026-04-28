@@ -106,6 +106,53 @@ const FUZZ_SIGNATURES = {
   ssrfInternalSig: ['phpmyadmin', 'redis_version:', 'jenkins', 'spring-boot', 'kibana', '<title>nginx', 'apache/', 'localhost', '127.0.0.1'],
 };
 
+// Find every place in `body` where `needle` appears, return up to `cap` matches each
+// with: byte offset, line number, column, ±120 chars of surrounding context, and a heuristic
+// "where" tag (script / attr / comment / html / json) so the user instantly sees the sink kind.
+// Used for both raw payload reflection AND for transformed reflections like SSTI's expected number.
+function findAllReflections(body, needle, cap = 5) {
+  const matches = [];
+  if (!body || !needle) return matches;
+  let from = 0;
+  while (matches.length < cap) {
+    const idx = body.indexOf(needle, from);
+    if (idx === -1) break;
+    // Line/column from byte offset
+    const before = body.slice(0, idx);
+    const line = (before.match(/\n/g) || []).length + 1;
+    const lastNewline = before.lastIndexOf('\n');
+    const column = idx - (lastNewline + 1) + 1;
+    // Wider window than the old 80, but still readable in the side panel
+    const start = Math.max(0, idx - 120);
+    const end = Math.min(body.length, idx + needle.length + 120);
+    const snippet = body.slice(start, end);
+    // Sink heuristic: scan ~400 chars before the match for the closest enclosing tag/attr context
+    const lookback = body.slice(Math.max(0, idx - 400), idx);
+    let where = 'html';
+    if (/<script[^>]*>[^<]*$/i.test(lookback)) where = 'script';
+    else if (/<style[^>]*>[^<]*$/i.test(lookback)) where = 'style';
+    else if (/<!--[^>]*$/.test(lookback)) where = 'comment';
+    else if (/<title[^>]*>[^<]*$/i.test(lookback)) where = 'title';
+    else if (/<textarea[^>]*>[^<]*$/i.test(lookback)) where = 'textarea';
+    else if (/=\s*"[^"]*$/.test(lookback)) where = 'attr-double';
+    else if (/=\s*'[^']*$/.test(lookback)) where = 'attr-single';
+    else if (/=\s*[^\s"'>]*$/.test(lookback) && /<[a-zA-Z]/.test(lookback)) where = 'attr-unquoted';
+    else if (/[{,]\s*"[^"]*"\s*:\s*"[^"]*$/.test(lookback)) where = 'json-string';
+    else if (/href\s*=\s*['"]?javascript:/i.test(lookback)) where = 'js-uri';
+    matches.push({
+      offset: idx,
+      line,
+      column,
+      snippet,
+      preStart: idx - start,        // how far into snippet the match starts
+      matchLen: needle.length,
+      where,
+    });
+    from = idx + needle.length;
+  }
+  return matches;
+}
+
 // Single source of truth for the per-payload verification logic. Both URL-fuzz and form-fuzz
 // call this so the rules don't drift between the two paths.
 function evaluateFuzzResult({ check, payload, expect, body, baselineBody, baselineLen, elapsed, baselineTime, status, headers, rawReflected, context }) {
@@ -844,6 +891,40 @@ const handlers = {
               elapsed, baselineTime, status: r.status, headers: r.headers,
               rawReflected, context,
             });
+
+            // Build a richer reflection map. For each result, find every place the relevant
+            // string appears in the body — payload itself for raw reflection, expected number
+            // for SSTI eval, error/signature string for sqli/nosql/cmdi/ssrf. This replaces
+            // the misleading "first 600b of response" preview with surgical highlights.
+            let reflections = [];
+            const isStringCheck = ['unencoded_html','unencoded_attr','reflected','crlf'].includes(check);
+            const isSstiCheck  = check === 'ssti_eval';
+            const isFileCheck  = check === 'file_content' || check === 'file_content_win';
+            if (isStringCheck && rawReflected) {
+              reflections = findAllReflections(body, payload);
+            } else if (isSstiCheck && ev.severity === 'high' && expect) {
+              reflections = findAllReflections(body, expect);
+            } else if (rawReflected) {
+              // proto/path/ssrf payloads where the literal string also reflects — show it
+              reflections = findAllReflections(body, payload);
+            }
+            // For evidence-based checks (sqli_error, nosqli, cmdi, ssrf_*, file_content),
+            // ev.context already contains the matched signature region — surface it as a single
+            // synthetic "match" so the UI renders consistently.
+            if (!reflections.length && ev.context && ev.severity !== 'safe') {
+              const sigIdx = body.indexOf(ev.context.trim().slice(0, 40));
+              if (sigIdx >= 0) {
+                const before = body.slice(0, sigIdx);
+                const line = (before.match(/\n/g) || []).length + 1;
+                reflections = [{
+                  offset: sigIdx, line, column: 1,
+                  snippet: ev.context, preStart: 0,
+                  matchLen: Math.min(80, ev.context.length),
+                  where: 'evidence',
+                }];
+              }
+            }
+
             let errorBody = '';
             if (r.status >= 500 && body.length < 5000) errorBody = body.slice(0, 500);
             results.push({
@@ -851,10 +932,9 @@ const handlers = {
               severity: ev.severity, analysis: ev.analysis,
               status: r.status, bodyLen: body.length, elapsed,
               context: ev.severity !== 'safe' ? ev.context : '',
+              reflections,
               url: testUrl.toString(), errorBody,
-              // Preview shown inline (truncated for the panel) AND full body for "Copy Response".
-              // Cap full body at 1MB to avoid blowing up message-passing on giant responses.
-              responsePreview: body.slice(0, 600),
+              // Full body retained so "Copy Response" can dump everything; no more 600b preview.
               responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
               responseTruncated: body.length > 1_000_000,
               responseTotalLen: body.length,
@@ -1532,6 +1612,32 @@ const handlers = {
             elapsed, baselineTime, status: r.status, headers: r.headers,
             rawReflected, context,
           });
+
+          // Same reflection-map enrichment as PARAM_FUZZ
+          let reflections = [];
+          const isStringCheck = ['unencoded_html','unencoded_attr','reflected','crlf'].includes(check);
+          const isSstiCheck  = check === 'ssti_eval';
+          if (isStringCheck && rawReflected) {
+            reflections = findAllReflections(body, payload);
+          } else if (isSstiCheck && ev.severity === 'high' && expect) {
+            reflections = findAllReflections(body, expect);
+          } else if (rawReflected) {
+            reflections = findAllReflections(body, payload);
+          }
+          if (!reflections.length && ev.context && ev.severity !== 'safe') {
+            const sigIdx = body.indexOf(ev.context.trim().slice(0, 40));
+            if (sigIdx >= 0) {
+              const before = body.slice(0, sigIdx);
+              const line = (before.match(/\n/g) || []).length + 1;
+              reflections = [{
+                offset: sigIdx, line, column: 1,
+                snippet: ev.context, preStart: 0,
+                matchLen: Math.min(80, ev.context.length),
+                where: 'evidence',
+              }];
+            }
+          }
+
           let errorBody = '';
           if (r.status >= 500 && body.length < 5000) errorBody = body.slice(0, 500);
           results.push({
@@ -1539,8 +1645,8 @@ const handlers = {
             severity: ev.severity, analysis: ev.analysis,
             status: r.status, bodyLen: body.length, elapsed,
             context: ev.severity !== 'safe' ? ev.context : '',
+            reflections,
             errorBody,
-            responsePreview: body.slice(0, 600),
             responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
             responseTruncated: body.length > 1_000_000,
             responseTotalLen: body.length,

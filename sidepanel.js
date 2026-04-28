@@ -2248,23 +2248,77 @@ async function toolParamFuzz() {
 
         // Detail drawer (hidden by default)
         let detailHTML = '<div class="fz-detail" style="display:none;margin-top:6px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:4px">';
-        if (x.context) detailHTML += '<div class="result-label mb-4">Reflection Context</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:60px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.context) + '</pre>';
+
+        // Reflection map: every place the payload (or its evaluated result, or the matched
+        // signature) appears in the response, with byte offset, line number, and a "where" tag
+        // (script / attr-double / comment / json-string / etc) so the user instantly sees what
+        // sink the reflection landed in. This replaces the old "first 600b of response" preview
+        // which was useless when the payload reflected later in the page.
+        const reflections = x.reflections || [];
+        if (reflections.length) {
+          const totalLen = x.responseTotalLen ?? x.bodyLen ?? 0;
+          const sinkColor = (where) => {
+            if (where === 'script' || where === 'js-uri') return 'var(--accent)';
+            if (where === 'attr-double' || where === 'attr-single' || where === 'attr-unquoted') return '#c9750f';
+            if (where === 'comment') return 'var(--text-tertiary)';
+            if (where === 'evidence') return 'var(--accent)';
+            return 'var(--text-secondary)';
+          };
+          const sinkLabel = (where) => {
+            const map = {
+              'script': 'inside <script>',
+              'style': 'inside <style>',
+              'attr-double': 'inside attr="…"',
+              'attr-single': "inside attr='…'",
+              'attr-unquoted': 'unquoted attr',
+              'comment': 'inside <!-- -->',
+              'title': 'inside <title>',
+              'textarea': 'inside <textarea>',
+              'json-string': 'inside JSON string',
+              'js-uri': 'href="javascript:…"',
+              'evidence': 'matched evidence',
+              'html': 'in HTML body',
+            };
+            return map[where] || where;
+          };
+          detailHTML += '<div class="result-label mb-4">Reflected at ' + reflections.length + ' position' + (reflections.length === 1 ? '' : 's') + (totalLen ? ' <span class="text-xs text-muted">(in ' + totalLen.toLocaleString() + 'b response)</span>' : '') + '</div>';
+          reflections.forEach((m, mi) => {
+            // Highlight the matched bytes inside the snippet
+            const before = esc(m.snippet.slice(0, m.preStart));
+            const matched = esc(m.snippet.slice(m.preStart, m.preStart + m.matchLen));
+            const after = esc(m.snippet.slice(m.preStart + m.matchLen));
+            const positionLabel = 'byte ' + m.offset.toLocaleString() + ' · line ' + m.line + ':' + m.column;
+            const sinkBadge = '<span style="color:' + sinkColor(m.where) + ';font-weight:600">' + esc(sinkLabel(m.where)) + '</span>';
+            detailHTML += '<div style="margin-bottom:8px;border-left:2px solid ' + sinkColor(m.where) + ';padding-left:8px">'
+              + '<div class="text-xs" style="display:flex;justify-content:space-between;gap:8px;margin-bottom:3px;font-family:var(--font-mono)">'
+              +   '<span>' + sinkBadge + '</span>'
+              +   '<span class="text-muted">' + positionLabel + '</span>'
+              + '</div>'
+              + '<pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px;margin:0">'
+              +   (m.offset > 0 ? '…' : '') + before
+              +   '<mark style="background:var(--accent-soft,rgba(196,57,45,0.18));color:var(--accent);padding:0 1px;border-radius:2px">' + matched + '</mark>'
+              +   after + (m.offset + m.matchLen < (x.responseTotalLen || 0) ? '…' : '')
+              + '</pre>'
+              + '</div>';
+          });
+          if ((x.responseTotalLen || 0) > 0 && reflections.length === 5) {
+            detailHTML += '<div class="text-xs text-muted" style="margin-bottom:6px">More than 5 matches — first 5 shown. Copy Response for the full body.</div>';
+          }
+        } else if (x.severity === 'safe') {
+          // For safe results, no reflection map is meaningful. Don't dump 600b of unrelated HTML.
+          detailHTML += '<div class="text-xs text-muted mb-6">No reflection of the payload or its evaluated result was detected in the response. Copy Response for the full body if you want to inspect manually.</div>';
+        } else if (x.context) {
+          // Fallback: evaluator surfaced a context string but findAllReflections couldn't relocate it
+          detailHTML += '<div class="result-label mb-4">Evidence</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.context) + '</pre>';
+        }
+
         if (x.requestBody || x.requestUrl || x.url) {
           detailHTML += '<div class="result-label mt-6 mb-4">Request</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.requestBody || x.url || '') + '</pre>';
-        }
-        if (x.responsePreview) {
-          // Inline preview is intentionally truncated to keep the panel readable. The
-          // "Copy Response" button copies the FULL body (saved as responseFull, capped at 1MB).
-          const totalLen = x.responseTotalLen ?? x.bodyLen ?? x.responsePreview.length;
-          const previewLabel = totalLen > 600
-            ? 'Response (preview · first 600b of ' + totalLen.toLocaleString() + 'b — Copy Response will copy the full body)'
-            : 'Response (' + totalLen + 'b)';
-          detailHTML += '<div class="result-label mt-6 mb-4">' + previewLabel + '</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.responsePreview) + '</pre>';
         }
         if (x.errorBody) {
           detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
         }
-        detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap"><button class="btn-sm fz-copy-curl">Copy cURL</button><button class="btn-sm fz-copy-resp">Copy Response</button><button class="btn-sm fz-copy-url">Copy URL</button></div>';
+        detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap"><button class="btn-sm fz-copy-curl">Copy cURL</button><button class="btn-sm fz-copy-resp">Copy Full Response</button><button class="btn-sm fz-copy-url">Copy URL</button></div>';
         detailHTML += '</div>';
 
         item.innerHTML = summaryHTML + detailHTML;
@@ -2295,14 +2349,13 @@ async function toolParamFuzz() {
         });
         item.querySelector('.fz-copy-resp')?.addEventListener('click', (e) => {
           e.stopPropagation();
-          // Prefer the full body; fall back to preview/error. Append a note if the body was
-          // capped at 1MB to avoid silently giving the user incomplete data.
-          const fullBody = x.responseFull ?? x.responsePreview ?? x.errorBody ?? '';
+          const fullBody = x.responseFull ?? x.errorBody ?? '';
+          if (!fullBody) { log('No response body to copy', 'warn'); return; }
           const note = x.responseTruncated
             ? '\n\n/* Cyboware: response body capped at 1MB; ' + (x.responseTotalLen - 1_000_000).toLocaleString() + ' bytes omitted */'
             : '';
           copyText(fullBody + note);
-          log('Copied full response (' + (fullBody.length).toLocaleString() + 'b)' + (x.responseTruncated ? ' — truncated' : ''), 'info');
+          log('Copied full response (' + fullBody.length.toLocaleString() + 'b)' + (x.responseTruncated ? ' — truncated' : ''), 'info');
         });
         item.querySelector('.fz-copy-url')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.requestUrl || x.url || ''); });
       });

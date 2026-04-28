@@ -2195,37 +2195,18 @@ async function toolParamFuzz() {
       const selectedFields = card ? [...card.querySelectorAll('.fz-field-cb:checked')].map(cb => cb.dataset.fieldName) : [];
       if (!selectedFields.length) { out.innerHTML = '<div class="text-muted text-sm">No fields selected. Check at least one field above.</div>'; return; }
       out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Fuzzing ' + selectedFields.length + ' field(s) with ' + cat.toUpperCase() + (cat === 'sqli' ? ' (includes blind timing)' : '') + '...</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden"><div style="height:100%;width:30%;background:var(--accent);animation:fz-pulse 2s ease-in-out infinite"></div></div>';
-      const payloadSets = {
-        xss: [
-          { p: '<script>alert(1)</script>', check: 'unencoded_html' },
-          { p: '"><img src=x onerror=alert(1)>', check: 'unencoded_html' },
-          { p: '<svg/onload=alert(1)>', check: 'unencoded_html' },
-          { p: 'cyboXSS"onmouseover="alert(1)', check: 'unencoded_attr' },
-          { p: '<details open ontoggle=alert(1)>', check: 'unencoded_html' },
-        ],
-        sqli: [
-          { p: "' OR '1'='1", check: 'sqli_error' },
-          { p: "' UNION SELECT NULL--", check: 'sqli_error' },
-          { p: "' AND extractvalue(1,concat(0x7e,version()))--", check: 'sqli_error' },
-          { p: "' OR SLEEP(4)--", check: 'sqli_blind_time' },
-          { p: "'; WAITFOR DELAY '0:0:4'--", check: 'sqli_blind_time' },
-          { p: "' || pg_sleep(4)--", check: 'sqli_blind_time' },
-        ],
-        ssti: [
-          { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925920740741' },
-          { p: '$' + '{9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
-        ],
-        path: [
-          { p: '../../../etc/passwd', check: 'file_content' },
-          { p: '....//....//etc/passwd', check: 'file_content' },
-        ],
-      };
       const allFields = f.fields.filter(fi => fi.name);
       const action = f.action || activeTabUrl;
+      // Send `category` and let the backend look up the shared FUZZ_PAYLOADS — same source of truth
+      // as URL-fuzz. Previously this passed `payloads` from a hardcoded 4-category client-side set,
+      // which silently ran XSS payloads when the user clicked Proto/NoSQL/Cmd/SSRF/CRLF.
       const r = await chrome.runtime.sendMessage({
-        type: 'FUZZ_FORM', action, method: f.method || 'GET',
-        fields: allFields, payloads: payloadSets[cat] || payloadSets.xss, category: cat,
-        selectedFields
+        type: 'FUZZ_FORM',
+        action,
+        method: f.method || 'GET',
+        fields: allFields,
+        category: cat,
+        selectedFields,
       });
       if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
       renderFuzzResults(out, r, 'form');
@@ -2272,7 +2253,13 @@ async function toolParamFuzz() {
           detailHTML += '<div class="result-label mt-6 mb-4">Request</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.requestBody || x.url || '') + '</pre>';
         }
         if (x.responsePreview) {
-          detailHTML += '<div class="result-label mt-6 mb-4">Response (first 600b)</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.responsePreview) + '</pre>';
+          // Inline preview is intentionally truncated to keep the panel readable. The
+          // "Copy Response" button copies the FULL body (saved as responseFull, capped at 1MB).
+          const totalLen = x.responseTotalLen ?? x.bodyLen ?? x.responsePreview.length;
+          const previewLabel = totalLen > 600
+            ? 'Response (preview · first 600b of ' + totalLen.toLocaleString() + 'b — Copy Response will copy the full body)'
+            : 'Response (' + totalLen + 'b)';
+          detailHTML += '<div class="result-label mt-6 mb-4">' + previewLabel + '</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.responsePreview) + '</pre>';
         }
         if (x.errorBody) {
           detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
@@ -2306,7 +2293,17 @@ async function toolParamFuzz() {
           }
           copyText(curl);
         });
-        item.querySelector('.fz-copy-resp')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.responsePreview || x.errorBody || ''); });
+        item.querySelector('.fz-copy-resp')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          // Prefer the full body; fall back to preview/error. Append a note if the body was
+          // capped at 1MB to avoid silently giving the user incomplete data.
+          const fullBody = x.responseFull ?? x.responsePreview ?? x.errorBody ?? '';
+          const note = x.responseTruncated
+            ? '\n\n/* Cyboware: response body capped at 1MB; ' + (x.responseTotalLen - 1_000_000).toLocaleString() + ' bytes omitted */'
+            : '';
+          copyText(fullBody + note);
+          log('Copied full response (' + (fullBody.length).toLocaleString() + 'b)' + (x.responseTruncated ? ' — truncated' : ''), 'info');
+        });
         item.querySelector('.fz-copy-url')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.requestUrl || x.url || ''); });
       });
       if (!items.length) listEl.innerHTML = '<div class="text-muted text-sm">No results in this filter</div>';

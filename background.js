@@ -9,6 +9,53 @@ const capturedRequests = {};
 // Structure: { 'target.com': { hosts: Set, jsFiles: Map<url, {firstSeen, status, ct, size}>, requests: [], authDetectedAt: timestamp|null } }
 const domainAggregate = {};
 
+// Fuzzer response body cache. Bodies live HERE (in the service worker) and the sidepanel
+// asks for them on-demand via FUZZ_GET_RESPONSE_BODY when the user clicks Copy. Without this,
+// shipping 100 × 1MB responses to the sidepanel would freeze it. Keyed by a stable id we mint
+// per fuzz result. Auto-expires when fuzz session is replaced or after 30 min idle.
+const fuzzResponseCache = new Map();
+
+// Capture the auth context that the browser ATTACHES INVISIBLY to a fetch with credentials:'include'.
+// MV3 doesn't expose what the browser added to a fetch() — Cookie, User-Agent, Accept, etc. are
+// silently appended. Without recording these, the cURL we hand the user can never reproduce the
+// authenticated request. This rebuilds the relevant ones from chrome.cookies + a reasonable UA.
+async function getAuthContextForUrl(targetUrl) {
+  const ctx = { cookies: [], userAgent: '', origin: '', referer: '' };
+  try {
+    const u = new URL(targetUrl);
+    ctx.origin = u.origin;
+    // Get every cookie that would be sent. chrome.cookies.getAll with url=… gives us only
+    // cookies in scope (correct domain, path, secure, expiration, sameSite). HttpOnly cookies
+    // ARE included because cookies.getAll is privileged — and the browser will attach them
+    // on our fetch too, even though JS in a page can't see them.
+    const cookies = await chrome.cookies.getAll({ url: targetUrl });
+    ctx.cookies = cookies.map(c => ({ name: c.name, value: c.value, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite }));
+    // We can't read navigator.userAgent from a service worker, so use a stable Chrome UA.
+    // The user can edit if needed.
+    ctx.userAgent = 'Mozilla/5.0 (Cyboware-replay) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+  } catch {}
+  return ctx;
+}
+
+let fuzzCacheCounter = 0;
+function cacheFuzzResponse(body, totalLen, truncated) {
+  const id = 'fz-' + (++fuzzCacheCounter) + '-' + Date.now();
+  // Only keep up to 200 most recent bodies — evict oldest as we go
+  while (fuzzResponseCache.size >= 200) {
+    const oldest = fuzzResponseCache.keys().next().value;
+    fuzzResponseCache.delete(oldest);
+  }
+  fuzzResponseCache.set(id, { body, totalLen, truncated, ts: Date.now() });
+  return id;
+}
+// Time-based eviction every 5 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, entry] of fuzzResponseCache) {
+    if (entry.ts < cutoff) fuzzResponseCache.delete(id);
+  }
+}, 5 * 60 * 1000);
+
 // ═══ SHARED FUZZER PAYLOAD LIBRARY ═══
 // Single source of truth used by both PARAM_FUZZ (URL params) and FUZZ_FORM (form fields).
 // The previous code duplicated a tiny subset client-side; that subset silently fell back
@@ -435,6 +482,16 @@ const handlers = {
   GET_HEADERS: (msg, _, sr) => sr({ headers: tabHeaders[msg.tabId] || null }),
   GET_CAPTURED_REQUESTS: (msg, _, sr) => sr({ requests: capturedRequests[msg.tabId] || [] }),
 
+  // On-demand fetch of a fuzz-result response body. Bodies live in the service worker's
+  // fuzzResponseCache, indexed by the responseBodyId we minted at fuzz time. The sidepanel
+  // calls this only when the user clicks Copy Full Response — we never ship 100×1MB into
+  // the panel up-front.
+  FUZZ_GET_RESPONSE_BODY: (msg, _, sr) => {
+    const entry = fuzzResponseCache.get(msg.id);
+    if (!entry) { sr({ ok: false, error: 'Response body expired or not found. Re-run the fuzz to refresh.' }); return; }
+    sr({ ok: true, body: entry.body, totalLen: entry.totalLen, truncated: entry.truncated });
+  },
+
   // Domain-wide aggregate (cross-tab): all hosts, JS files, endpoints seen for this root domain
   GET_DOMAIN_AGGREGATE: (msg, _, sr) => {
     const agg = domainAggregate[msg.domain];
@@ -854,6 +911,11 @@ const handlers = {
         msg.customPayloads.forEach(cp => testPayloads.push({ p: cp, check: 'reflected' }));
       }
 
+      // Capture auth context once for the whole session. The browser attaches Cookie + UA
+      // to our fetch() invisibly when credentials:'include'; we record what would be sent so
+      // the cURL/HTTP-request export can faithfully reproduce the authenticated call.
+      const authCtx = await getAuthContextForUrl(msg.url);
+
       // Baseline timing
       let baselineLen = 0, baselineBody = '', baselineTime = 0;
       try {
@@ -934,8 +996,13 @@ const handlers = {
               context: ev.severity !== 'safe' ? ev.context : '',
               reflections,
               url: testUrl.toString(), errorBody,
-              // Full body retained so "Copy Response" can dump everything; no more 600b preview.
-              responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+              // Cache body server-side; sidepanel fetches via FUZZ_GET_RESPONSE_BODY on demand.
+              // Avoids shipping 100 × 1MB strings into the sidepanel which would freeze it.
+              responseBodyId: cacheFuzzResponse(
+                body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+                body.length,
+                body.length > 1_000_000
+              ),
               responseTruncated: body.length > 1_000_000,
               responseTotalLen: body.length,
             });
@@ -944,7 +1011,7 @@ const handlers = {
           }
         }
       }
-      sr({ ok: true, params, results, baselineLen, testedPayloads: Math.min(maxPayloads, testPayloads.length), totalPayloads: testPayloads.length });
+      sr({ ok: true, params, results, baselineLen, testedPayloads: Math.min(maxPayloads, testPayloads.length), totalPayloads: testPayloads.length, authCtx, requestExtras: { method: 'GET', contentType: null } });
     } catch (e) { sr({ ok: false, error: e.message }); }
   },
 
@@ -1552,7 +1619,7 @@ const handlers = {
 
   // ═══ FORM FIELD FUZZER — POST/GET form submission with payloads ═══
   FUZZ_FORM: async (msg, _, sr) => {
-    const { action, method, fields, category, selectedFields } = msg;
+    const { action, method, fields, category, selectedFields, enctype } = msg;
     // Use the shared payload library — same source of truth as URL-fuzz. Previously this handler
     // accepted `payloads` from the caller and the caller hardcoded only 4 categories' worth client-side,
     // silently falling back to XSS payloads for any other category. That meant clicking
@@ -1563,6 +1630,18 @@ const handlers = {
     }
     const results = [];
 
+    // Pick Content-Type based on the form's declared enctype. Form fuzzer used to hardcode
+    // application/x-www-form-urlencoded which would silently break tests against forms that
+    // declared multipart/form-data (file uploads, complex fields) or text/plain.
+    // multipart is rare for our payload types and would need boundary handling — for now
+    // we coerce multipart down to urlencoded but warn the user via the result metadata.
+    const formEnctype = (enctype || 'application/x-www-form-urlencoded').toLowerCase();
+    const usingFallback = formEnctype.includes('multipart');
+    const contentType = usingFallback ? 'application/x-www-form-urlencoded' : formEnctype;
+
+    // Capture auth context once for the whole session
+    const authCtx = await getAuthContextForUrl(action);
+
     // Baseline: submit form with original values
     let baselineLen = 0, baselineBody = '', baselineTime = 0;
     try {
@@ -1570,7 +1649,7 @@ const handlers = {
       fields.forEach(f => baseData.append(f.name, f.value || 'test'));
       const t0 = Date.now();
       const baseOpts = method.toUpperCase() === 'POST'
-        ? { method: 'POST', body: baseData.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(10000) }
+        ? { method: 'POST', body: baseData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(10000) }
         : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(10000) };
       const baseUrl = method.toUpperCase() === 'GET' ? action + '?' + baseData.toString() : action;
       const br = await fetch(baseUrl, baseOpts);
@@ -1595,7 +1674,7 @@ const handlers = {
         try {
           const t0 = Date.now();
           const opts = method.toUpperCase() === 'POST'
-            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) }
+            ? { method: 'POST', body: formData.toString(), headers: { 'Content-Type': contentType }, credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) }
             : { method: 'GET', credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(isTimeBased ? 15000 : 8000) };
           const testUrl = method.toUpperCase() === 'GET' ? action + '?' + formData.toString() : action;
           const r = await fetch(testUrl, opts);
@@ -1647,7 +1726,11 @@ const handlers = {
             context: ev.severity !== 'safe' ? ev.context : '',
             reflections,
             errorBody,
-            responseFull: body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+            responseBodyId: cacheFuzzResponse(
+              body.length > 1_000_000 ? body.slice(0, 1_000_000) : body,
+              body.length,
+              body.length > 1_000_000
+            ),
             responseTruncated: body.length > 1_000_000,
             responseTotalLen: body.length,
             requestBody: formData.toString(), requestUrl: testUrl,
@@ -1657,7 +1740,7 @@ const handlers = {
         }
       }
     }
-    sr({ ok: true, results, baselineLen, baselineTime, method: method.toUpperCase(), action });
+    sr({ ok: true, results, baselineLen, baselineTime, method: method.toUpperCase(), action, authCtx, requestExtras: { method: method.toUpperCase(), contentType, usingFallback, originalEnctype: formEnctype } });
   },
 
   // JWT weak key brute-force

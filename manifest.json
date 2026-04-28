@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Cyboware",
-  "version": "2.1.0",
-  "description": "All-in-one bug bounty hunting toolkit — recon, analysis, secrets, terminal, and more in your sidebar.",
+  "version": "2.4.0",
+  "description": "Security testing toolkit for web pages. Inspect headers, cookies, JWT tokens, request data, and run common reconnaissance checks.",
   "permissions": [
     "sidePanel",
     "tabs",
@@ -36,16 +36,24 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
   "content_security_policy": {

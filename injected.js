@@ -78,18 +78,56 @@
   window.addEventListener('message', (e) => {
     if (e.source !== window || e.data?.source !== 'CYBOWARE_CONTENT' || e.data?.type !== 'DETECT_GLOBALS') return;
     const globals = [];
+    // Meta-frameworks
     if (window.__NEXT_DATA__) globals.push({ name: 'Next.js', detail: window.__NEXT_DATA__?.buildId || '', confidence: 'high' });
     if (window.__NUXT__) globals.push({ name: 'Nuxt.js', confidence: 'high' });
-    if (window.React || window.__REACT_DEVTOOLS_GLOBAL_HOOK__) globals.push({ name: 'React', confidence: 'high' });
-    if (window.Vue) globals.push({ name: 'Vue.js', confidence: 'high' });
-    if (window.angular || window.ng) globals.push({ name: 'Angular', confidence: 'high' });
+    if (window.__GATSBY) globals.push({ name: 'Gatsby', confidence: 'high' });
+    if (window.__remixContext || window.__remixManifest) globals.push({ name: 'Remix', confidence: 'high' });
+    if (window.__sveltekit_payload || document.querySelector('script[type="module"][src*="_app/"]')) globals.push({ name: 'SvelteKit', confidence: 'high' });
+    if (window.__ASTRO__ || document.querySelector('astro-island')) globals.push({ name: 'Astro', confidence: 'high' });
+    if (window.SolidJS || window.__SOLID__) globals.push({ name: 'SolidJS', confidence: 'high' });
+    if (window.qwikloader$ || document.querySelector('script[q\\:base]')) globals.push({ name: 'Qwik', confidence: 'high' });
+    // Core libs
+    if (window.React || window.__REACT_DEVTOOLS_GLOBAL_HOOK__) globals.push({ name: 'React', detail: window.React?.version || '', confidence: 'high' });
+    if (window.Vue) globals.push({ name: 'Vue.js', detail: window.Vue?.version || '', confidence: 'high' });
+    if (window.angular || window.ng) globals.push({ name: 'Angular', detail: window.angular?.version?.full || '', confidence: 'high' });
     if (window.Ember) globals.push({ name: 'Ember.js', confidence: 'high' });
     if (window.jQuery || window.$?.fn?.jquery) globals.push({ name: 'jQuery', detail: window.jQuery?.fn?.jquery || window.$?.fn?.jquery || '', confidence: 'high' });
-    if (window.__GATSBY) globals.push({ name: 'Gatsby', confidence: 'high' });
-    if (window.__remixContext) globals.push({ name: 'Remix', confidence: 'high' });
-    if (window.Shopify) globals.push({ name: 'Shopify', confidence: 'high' });
-    if (window.wp || window.wpApiSettings) globals.push({ name: 'WordPress', confidence: 'high' });
+    if (window.htmx) globals.push({ name: 'htmx', confidence: 'high' });
+    if (window.Alpine) globals.push({ name: 'Alpine.js', detail: window.Alpine?.version || '', confidence: 'high' });
+    if (window.Stimulus) globals.push({ name: 'Stimulus', confidence: 'high' });
+    // Auth & state
+    if (window.firebase) globals.push({ name: 'Firebase', detail: window.firebase?.SDK_VERSION || '', confidence: 'high' });
+    if (window.supabase) globals.push({ name: 'Supabase', confidence: 'high' });
+    if (window.Auth0Lock || window.auth0) globals.push({ name: 'Auth0', confidence: 'high' });
+    if (window.Clerk) globals.push({ name: 'Clerk', confidence: 'high' });
+    if (window.__APOLLO_CLIENT__) globals.push({ name: 'Apollo Client (GraphQL)', confidence: 'high' });
+    if (window.__RELAY_DEVTOOLS_HOOK__ || window.__RELAY_PAYLOADS__) globals.push({ name: 'Relay (GraphQL)', confidence: 'high' });
+    // CMS / commerce
+    if (window.Shopify) globals.push({ name: 'Shopify', detail: window.Shopify?.shop || '', confidence: 'high' });
+    if (window.wp || window.wpApiSettings) globals.push({ name: 'WordPress', detail: window.wpApiSettings?.versionString || '', confidence: 'high' });
+    if (window.Drupal) globals.push({ name: 'Drupal', confidence: 'high' });
+    if (window.Joomla) globals.push({ name: 'Joomla', confidence: 'high' });
+    // Analytics & tag managers
     if (window.dataLayer) globals.push({ name: 'Google Tag Manager', confidence: 'high' });
+    if (window.gtag) globals.push({ name: 'Google Analytics 4', confidence: 'high' });
+    if (window.fbq) globals.push({ name: 'Facebook Pixel', confidence: 'high' });
+    if (window.posthog) globals.push({ name: 'PostHog', confidence: 'high' });
+    if (window.mixpanel) globals.push({ name: 'Mixpanel', confidence: 'high' });
+    if (window.amplitude) globals.push({ name: 'Amplitude', confidence: 'high' });
+    if (window.heap) globals.push({ name: 'Heap Analytics', confidence: 'high' });
+    if (window.LogRocket) globals.push({ name: 'LogRocket (session replay)', confidence: 'high' });
+    if (window.FS) globals.push({ name: 'FullStory (session replay)', confidence: 'high' });
+    // Error tracking
+    if (window.Sentry) globals.push({ name: 'Sentry', detail: window.Sentry?.SDK_VERSION || '', confidence: 'high' });
+    if (window.Rollbar) globals.push({ name: 'Rollbar', confidence: 'high' });
+    if (window.Bugsnag) globals.push({ name: 'Bugsnag', confidence: 'high' });
+    // Payments
+    if (window.Stripe) globals.push({ name: 'Stripe', confidence: 'high' });
+    if (window.paypal) globals.push({ name: 'PayPal', confidence: 'high' });
+    // Bot management (visible in JS context)
+    if (window.DD_RUM || document.cookie.includes('datadome=')) globals.push({ name: 'DataDome (bot mgmt)', confidence: 'high' });
+    if (window._pxAppId || window._pxParam1) globals.push({ name: 'PerimeterX (bot mgmt)', confidence: 'high' });
     window.postMessage({ source: SRC, payload: { type: 'globals_detected', globals } }, '*');
   });
 })();

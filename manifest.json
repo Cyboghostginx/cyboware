@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Cyboware",
-  "version": "2.4.8",
+  "version": "2.4.9",
   "description": "Security testing toolkit for web pages. Inspect headers, cookies, JWT tokens, request data, and run common reconnaissance checks.",
   "permissions": [
     "sidePanel",

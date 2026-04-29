@@ -6,6 +6,8 @@
 
 A Chrome extension built for bug bounty hunters, pentesters, and security researchers. Everything runs locally in your browser — no accounts, no API keys, no telemetry.
 
+**_Free & Open Source. Feel free to contribute and report bugs or improvements._**
+
 ---
 
 ## Install
@@ -25,6 +27,7 @@ _last updated: Apr 29, 2026_
 **Sometimes you need to refresh your page in case some of the tools is not detecting anything.**
 
 ---
+![cybowaredemo](cybowaredemo.png)
 
 ## Tools (35)
 

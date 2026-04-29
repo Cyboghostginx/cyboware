@@ -575,14 +575,27 @@ const handlers = {
     });
   },
 
-  // Bulk-scan all JS files captured for a domain. Fetches each, runs secret scanner / endpoint extraction.
+  // Bulk-scan all JS files captured for a domain. Fetches each, returns content for the
+  // sidepanel to run secret scanner / endpoint extraction over.
+  //
+  // PREVIOUS BUG: filtered to `!scanned` files — so the first run marked files scanned
+  // and every subsequent run silently SKIPPED them, losing any findings. Combined with the
+  // 30-file cap per run, a 69-file domain ended up scanning at most 30 fresh files at a
+  // time, with previously-found secrets disappearing on re-run.
+  //
+  // FIX: scan EVERY file in the aggregate every run, up to a higher cap (100). The
+  // `scanned` flag is kept in metadata for display only — it no longer gates inclusion.
+  // Each scan is now a comprehensive sweep, so re-running re-finds prior secrets and
+  // catches new ones.
   SCAN_ALL_JS: async (msg, _, sr) => {
     const agg = domainAggregate[msg.domain];
     if (!agg) { sr({ ok: false, error: 'No JS captured. Browse around first.' }); return; }
-    const urls = Object.keys(agg.jsFiles).filter(u => !agg.jsFiles[u].scanned);
+    const allUrls = Object.keys(agg.jsFiles);
+    // Higher cap — banking apps and SPAs commonly load 60-100 JS chunks across an auth
+    // session. The previous 30-cap was the limiting factor for "Scanned 38 of 69" reports.
+    const SCAN_CAP = 100;
+    const batch = allUrls.slice(0, SCAN_CAP);
     const results = [];
-    // Limit to 30 unscanned files per run to avoid hammering
-    const batch = urls.slice(0, 30);
     for (let i = 0; i < batch.length; i += 4) {
       const slice = batch.slice(i, i + 4);
       const fetched = await Promise.all(slice.map(async url => {
@@ -598,7 +611,14 @@ const handlers = {
       fetched.forEach(f => results.push(f));
     }
     persistRequests();
-    sr({ ok: true, scanned: results.filter(r => r.text).length, errors: results.filter(r => r.error).length, files: results, remaining: urls.length - batch.length });
+    sr({
+      ok: true,
+      scanned: results.filter(r => r.text).length,
+      errors: results.filter(r => r.error).length,
+      files: results,
+      total: allUrls.length,
+      capped: allUrls.length > SCAN_CAP,
+    });
   },
 
   CLEAR_DOMAIN_AGGREGATE: (msg, _, sr) => {

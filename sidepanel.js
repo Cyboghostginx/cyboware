@@ -1595,21 +1595,29 @@ async function toolSecrets() {
   // even when the user had been browsing the authenticated app for 10 minutes.
   const root = getRootDomain(activeTabDomain);
   let domainJsCount = 0;
+  let cappedAt = 0;
   if (root) {
     try {
       const aggRes = await chrome.runtime.sendMessage({ type: 'GET_DOMAIN_AGGREGATE', domain: root });
       if (aggRes.ok && aggRes.jsFiles) {
         const allDomainJs = Object.keys(aggRes.jsFiles);
         domainJsCount = allDomainJs.length;
-        const newOnes = allDomainJs.filter(u => !scannedUrls.has(u));
-        if (newOnes.length) {
-          // Trigger a bulk scan via the service worker (it handles batching + caching)
-          b.innerHTML = '<div class="loading-text" data-ts="' + Date.now() + '"><span class="spinner"></span> Scanning ' + newOnes.length + ' additional JS files from this domain session…</div>';
+        if (domainJsCount > 0) {
+          // Trigger full-domain bulk scan. Backend now scans ALL files every run (not
+          // just unscanned), so re-running re-finds previous secrets and catches new ones.
+          b.innerHTML = '<div class="loading-text" data-ts="' + Date.now() + '"><span class="spinner"></span> Scanning ' + domainJsCount + ' JS files from this domain session…</div>';
           const scanRes = await chrome.runtime.sendMessage({ type: 'SCAN_ALL_JS', domain: root });
           if (scanRes.ok && scanRes.files) {
             scanRes.files.forEach(f => {
-              if (f.text) { scanSecrets(f.text, f.url, findings); scannedUrls.add(f.url); }
+              if (f.text && !scannedUrls.has(f.url)) {
+                // Skip files already scanned in step 1 (current page) to avoid duplicate
+                // findings. The dedupe inside scanSecrets via `findings.some(...match)`
+                // handles within-file dedup; this Set handles across-source dedup.
+                scanSecrets(f.text, f.url, findings);
+                scannedUrls.add(f.url);
+              }
             });
+            if (scanRes.capped) cappedAt = scanRes.total;
           }
         }
       }
@@ -1643,10 +1651,13 @@ async function toolSecrets() {
   if (findings.length) { const bd=document.getElementById('badge-discovery'); bd.textContent=findings.length; bd.classList.remove('hidden'); }
   // Coverage banner — tell the user EXACTLY what was scanned. Without this, "no secrets"
   // is ambiguous (was it a small page, or did we scan thousands of files?).
+  const capWarning = cappedAt > 100
+    ? '<div class="result-item medium mb-4"><div class="result-label">⚠ Scan capped at 100 files</div><div class="result-value">This domain has ' + cappedAt + ' JS files captured. Cyboware scans up to 100 per run to avoid hammering the server. Run again to scan additional files (the cap is per-run, not per-domain).</div></div>'
+    : '';
   const coverageNote = '<div class="text-xs text-muted mb-6">Scanned ' + scannedUrls.size + ' JS file' + (scannedUrls.size === 1 ? '' : 's')
-    + (domainJsCount > scannedUrls.size ? ' (' + domainJsCount + ' total in domain session)' : '')
+    + (domainJsCount > 0 ? ' of ' + domainJsCount + ' in domain session' : '')
     + ' \u00b7 Page: ' + esc(activeTabUrl) + '</div>';
-  b.innerHTML = coverageNote +
+  b.innerHTML = capWarning + coverageNote +
     (findings.length===0 ? '<div class="text-muted text-sm">No secrets detected across ' + scannedUrls.size + ' file' + (scannedUrls.size === 1 ? '' : 's') + '. Browse more of the app (post-login flows, admin pages) and re-run to widen coverage.</div>' :
     findings.slice(0,50).map(f => {
       const isGoogleKey = f.name === 'Google API Key';

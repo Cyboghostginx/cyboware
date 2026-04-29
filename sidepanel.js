@@ -232,6 +232,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Track tab changes
   chrome.tabs.onActivated.addListener(() => { if (!pinnedTabId) updateActiveTab(); });
 
+  // When a tab is closed, react: if it was the pinned tab, unpin and refresh. If it was
+  // the tab we were tracking, also refresh. This handles the case where pinning kept the
+  // sidepanel locked to a tab that got closed — without this, the sidepanel would stay
+  // stuck on the dead tab's domain forever, and clicking pills wouldn't recover because
+  // pinnedTabId still pointed at the stale id.
+  chrome.tabs.onRemoved.addListener(async (closedId) => {
+    let needRefresh = false;
+    if (closedId === pinnedTabId) {
+      pinnedTabId = null;
+      pinnedRootDomain = null;
+      const pinBtn = document.getElementById('btn-pin');
+      if (pinBtn) {
+        pinBtn.classList.remove('pinned');
+        pinBtn.classList.remove('drift');
+        pinBtn.textContent = 'PIN';
+      }
+      log('Pinned tab closed — unpinned automatically', 'info');
+      needRefresh = true;
+    }
+    if (closedId === activeTabId) needRefresh = true;
+    if (needRefresh) {
+      // Brief delay to let Chrome settle on a new active tab before we query
+      setTimeout(() => updateActiveTab(), 50);
+    }
+  });
+
   // Throttled browseHistory persistence. Was fired on every tab `status:complete` event,
   // even when the sidepanel was closed — burning CPU and serialized storage writes against
   // a hundreds-of-KB object. Now batched at 1Hz, dropped if no changes.
@@ -284,6 +310,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 let lastDomain = '';
+let isCachedMode = false;  // true when sidepanel is showing a cached session whose live tab is closed
 const visitedDomains = new Set();
 const domainPanels = {}; // rootDomain -> { groupName: panelHTML }
 const DOMAIN_CAP = 50;
@@ -337,6 +364,10 @@ async function updateActiveTab() {
     }
 
     try { activeTabDomain = new URL(activeTabUrl).hostname; } catch { activeTabDomain = ''; }
+
+    // Snapping back from a cached-session view to a live tab. Clear the flag so tools
+    // know they can run normally again.
+    isCachedMode = false;
 
     // Show URL + pin status in context bar
     document.getElementById('tab-url').textContent = activeTabUrl || '—';
@@ -460,20 +491,41 @@ function renderDomainPills() {
       if (pinnedTabId) {
         pinnedTabId = null;
         pinnedRootDomain = null;
-        document.getElementById('btn-pin').classList.remove('pinned');
-        document.getElementById('btn-pin').classList.remove('drift');
-        document.getElementById('btn-pin').textContent = 'PIN';
+        const pinBtn = document.getElementById('btn-pin');
+        pinBtn.classList.remove('pinned');
+        pinBtn.classList.remove('drift');
+        pinBtn.textContent = 'PIN';
       }
-      // Find any tab whose root domain matches — was looking for hostname-exact match,
-      // which missed the common case where the user has app.target.com open and clicks
-      // the target.com pill.
       const tabs = await chrome.tabs.query({ currentWindow: true });
-      const match = tabs.find(t => {
-        try { return getRootDomain(new URL(t.url).hostname) === domain; }
-        catch { return false; }
-      });
+      // Prefer the currently-active browser tab if it matches. Two reasons:
+      // (1) If the active tab is the right domain, we want to keep the user on it
+      //     rather than swapping to some other same-root tab (multi-tab UX).
+      // (2) Critically: chrome.tabs.update on the already-active tab is a no-op and
+      //     does NOT fire chrome.tabs.onActivated. So if the active tab matches and
+      //     the sidepanel was on a cached/stale view, we have to call updateActiveTab
+      //     ourselves to resync — otherwise the click does nothing visible.
+      const browserActive = tabs.find(t => t.active);
+      let match = null;
+      if (browserActive) {
+        try {
+          if (getRootDomain(new URL(browserActive.url).hostname) === domain) match = browserActive;
+        } catch {}
+      }
+      if (!match) {
+        match = tabs.find(t => {
+          try { return getRootDomain(new URL(t.url).hostname) === domain; }
+          catch { return false; }
+        });
+      }
       if (match) {
-        await chrome.tabs.update(match.id, { active: true });
+        if (match.active) {
+          // Browser already on this tab; sidepanel was on a different (cached) view.
+          // chrome.tabs.update would no-op without firing onActivated. Resync directly.
+          await updateActiveTab();
+        } else {
+          await chrome.tabs.update(match.id, { active: true });
+          // chrome.tabs.onActivated fires next, which calls updateActiveTab
+        }
       } else {
         // No live tab on this root — load cached session in-place using DOM fragment swap.
         // Save current as fragments first.
@@ -499,8 +551,7 @@ function renderDomainPills() {
           });
         }
         activeTabDomain = domain; lastDomain = domain;
-        // Make it clear this is a CACHED snapshot — and how to get back. The user can either
-        // open a new tab on the live domain or click another pill that has a live tab.
+        isCachedMode = true;
         document.getElementById('tab-url').textContent = '📁 ' + domain + ' (cached — no live tab)';
         document.getElementById('tab-url').title = 'Cached session for ' + domain + '. Open a tab on this domain to test live again.';
         renderDomainPills();
@@ -600,6 +651,7 @@ function setupRefreshButton() {
     }
     // Re-detect current tab from scratch — lastDomain reset means no save/restore on update
     lastDomain = '';
+    isCachedMode = false;
     renderDomainPills();
     updateActiveTab();
     log('Full reset complete', 'success');
@@ -745,6 +797,24 @@ function wireResultsCopyJson(p) {
 // ═══ DISPATCHER ═══
 let currentToolName = '';
 async function runTool(tool) {
+  // Cached mode guard: sidepanel is showing a snapshot for a domain whose tab is closed.
+  // activeTabId still points at the actual browser-active tab (a different domain).
+  // Running a tool would test the wrong target. Tell the user clearly and let them choose.
+  if (isCachedMode) {
+    const liveTabs = await chrome.tabs.query({ currentWindow: true });
+    const liveActive = liveTabs.find(t => t.active);
+    let liveLabel = 'unknown';
+    try { liveLabel = liveActive ? new URL(liveActive.url).hostname : 'no tab'; } catch {}
+    const proceed = confirm(
+      "You're viewing a cached session for " + activeTabDomain + " (no live tab open).\n\n" +
+      'Running "' + tool + '" will test the live active tab (' + liveLabel + ') instead — likely the wrong target.\n\n' +
+      'Click OK to snap back to the live tab and run the tool there.\nClick Cancel to stay in cached view (read-only).'
+    );
+    if (!proceed) return;
+    // Snap back to the live tab and continue
+    isCachedMode = false;
+    await updateActiveTab();
+  }
   log('Running: ' + tool);
   currentToolName = tool;
   try {

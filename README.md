@@ -20,6 +20,8 @@ A Chrome extension built for bug bounty hunters, pentesters, and security resear
 
 When new version drops, and you want to install manually, you have to remove the existing one at `chrome://extensions/` then re install with instuction above with the new downloaded unpacked.
 
+_last updated: Apr 29, 2026_
+
 **Sometimes you need to refresh your page in case some of the tools is not detecting anything.**
 
 ---

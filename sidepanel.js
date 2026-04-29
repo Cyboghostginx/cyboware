@@ -366,29 +366,45 @@ async function updateActiveTab() {
     // generally feeling like a hang. Same-root-domain navigation now preserves all panel state.
     const currentRoot = getRootDomain(currentHost) || currentHost;
 
-    // ── Domain switch: save → clear → restore — only on actual root-domain changes ──
+    // ── Domain switch: detach current panel nodes, reattach previous ones ──
+    // PREVIOUS BUG: stored panel.innerHTML as strings. On restore, set innerHTML back —
+    // but innerHTML drops all event listeners. Result: buttons looked right, did nothing.
+    // Symptom: open Burp, "Open response in browser" → opens new tab → switch back →
+    // fuzz results unclickable until you hit Reset.
+    // FIX: store live DOM nodes. Detach (preserves listeners), reattach later.
     if (lastDomain && currentRoot !== lastDomain) {
-      // Save current panels under the LAST root domain
+      // Save: detach the .results-body content node from each active panel and stash it
       domainPanels[lastDomain] = {};
       document.querySelectorAll('.results-panel.active').forEach(p => {
-        domainPanels[lastDomain][p.id.replace('results-', '')] = p.innerHTML;
+        const groupName = p.id.replace('results-', '');
+        const body = p.querySelector('.results-body');
+        const header = p.querySelector('.results-header');
+        const closeBtn = p.querySelector('.results-close');
+        // Stash the entire panel content as a fragment we can re-insert later
+        const fragment = document.createDocumentFragment();
+        [...p.childNodes].forEach(n => fragment.appendChild(n)); // moves nodes out of the panel
+        domainPanels[lastDomain][groupName] = {
+          fragment,
+          tool: p.dataset.tool || '',
+        };
       });
       // Save live browse
       if (liveFindings.length || liveSeenItems.size) {
         liveDomainData[lastDomain] = { findings: [...liveFindings], seenItems: new Set(liveSeenItems), feedHTML: document.getElementById('live-feed')?.innerHTML || '' };
       }
 
-      // Clear panels
+      // Clear panels — they should be empty after fragment-detach above, but ensure deactivated
       document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
       document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
 
-      // Restore for new domain
+      // Restore for new domain — reattach the stored fragment
       if (domainPanels[currentRoot]) {
-        Object.entries(domainPanels[currentRoot]).forEach(([group, html]) => {
+        Object.entries(domainPanels[currentRoot]).forEach(([group, snap]) => {
           const panel = document.getElementById('results-' + group);
-          if (panel && html) {
-            panel.innerHTML = html; panel.classList.add('active');
-            wireResultsClose(panel); wireResultsCopyJson(panel);
+          if (panel && snap?.fragment) {
+            panel.appendChild(snap.fragment);  // event listeners preserved
+            panel.classList.add('active');
+            panel.dataset.tool = snap.tool || '';
             panel.closest('.feat-group')?.classList.add('open');
           }
         });
@@ -443,7 +459,9 @@ function renderDomainPills() {
       if (domain === currentRoot) return;
       if (pinnedTabId) {
         pinnedTabId = null;
+        pinnedRootDomain = null;
         document.getElementById('btn-pin').classList.remove('pinned');
+        document.getElementById('btn-pin').classList.remove('drift');
         document.getElementById('btn-pin').textContent = 'PIN';
       }
       // Find any tab whose root domain matches — was looking for hostname-exact match,
@@ -457,24 +475,36 @@ function renderDomainPills() {
       if (match) {
         await chrome.tabs.update(match.id, { active: true });
       } else {
-        // No tab on this root — restore cached session in-place
+        // No live tab on this root — load cached session in-place using DOM fragment swap.
+        // Save current as fragments first.
         if (lastDomain) {
           domainPanels[lastDomain] = {};
           document.querySelectorAll('.results-panel.active').forEach(p => {
-            domainPanels[lastDomain][p.id.replace('results-', '')] = p.innerHTML;
+            const groupName = p.id.replace('results-', '');
+            const fragment = document.createDocumentFragment();
+            [...p.childNodes].forEach(n => fragment.appendChild(n));
+            domainPanels[lastDomain][groupName] = { fragment, tool: p.dataset.tool || '' };
           });
         }
         document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
         if (domainPanels[domain]) {
-          Object.entries(domainPanels[domain]).forEach(([group, html]) => {
+          Object.entries(domainPanels[domain]).forEach(([group, snap]) => {
             const panel = document.getElementById('results-' + group);
-            if (panel && html) { panel.innerHTML = html; panel.classList.add('active'); wireResultsClose(panel); wireResultsCopyJson(panel); panel.closest('.feat-group')?.classList.add('open'); }
+            if (panel && snap?.fragment) {
+              panel.appendChild(snap.fragment);
+              panel.classList.add('active');
+              panel.dataset.tool = snap.tool || '';
+              panel.closest('.feat-group')?.classList.add('open');
+            }
           });
         }
         activeTabDomain = domain; lastDomain = domain;
-        document.getElementById('tab-url').textContent = domain + ' (cached session)';
+        // Make it clear this is a CACHED snapshot — and how to get back. The user can either
+        // open a new tab on the live domain or click another pill that has a live tab.
+        document.getElementById('tab-url').textContent = '📁 ' + domain + ' (cached — no live tab)';
+        document.getElementById('tab-url').title = 'Cached session for ' + domain + '. Open a tab on this domain to test live again.';
         renderDomainPills();
-        log('Loaded cached session: ' + domain);
+        log('Loaded cached session: ' + domain + ' (read-only — no live tab open)', 'info');
       }
     });
   });
@@ -524,23 +554,55 @@ function setupPinButton() {
   });
 }
 function setupRefreshButton() {
-  document.getElementById('btn-refresh').addEventListener('click', () => { Object.keys(cache).forEach(k => delete cache[k]); updateActiveTab(); });
-  // Reset button — close all panels, clear cache for current domain
+  // Refresh: re-read the current tab and re-render. Useful when you've changed something
+  // in the page (logged in, navigated within an SPA) and want the sidepanel to re-detect.
+  // Does NOT clear cached sessions for other domains.
+  document.getElementById('btn-refresh').addEventListener('click', () => {
+    Object.keys(cache).forEach(k => delete cache[k]);
+    updateActiveTab();
+    log('Refreshed current tab', 'info');
+  });
+
+  // Reset: full extension reset. Clears ALL domain caches, ALL panels, ALL state.
+  // Was clearing only the current domain — but the user explicitly wants Reset to mean
+  // "wipe everything and start clean." Anything they care about should already be exported.
   document.getElementById('btn-reset')?.addEventListener('click', () => {
-    const currentHost = activeTabDomain;
-    const currentRoot = getRootDomain(currentHost) || currentHost;
-    // Cache is keyed by hostname, but domainPanels/liveDomainData by root.
-    Object.keys(cache).forEach(k => { if (k.startsWith(currentHost + ':')) delete cache[k]; });
-    delete domainPanels[currentRoot];
-    delete liveDomainData[currentRoot];
-    document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; });
+    if (!confirm('Reset Cyboware?\n\nThis clears all panels, all cached sessions for other domains, all live findings, and unpins any pinned tab. Notes, scope, and settings are kept.')) return;
+    // Clear ALL domain caches
+    Object.keys(cache).forEach(k => delete cache[k]);
+    Object.keys(domainPanels).forEach(k => delete domainPanels[k]);
+    Object.keys(liveDomainData).forEach(k => delete liveDomainData[k]);
+    visitedDomains.clear();
+    // Unpin
+    if (pinnedTabId) {
+      pinnedTabId = null;
+      pinnedRootDomain = null;
+      const pinBtn = document.getElementById('btn-pin');
+      pinBtn.classList.remove('pinned');
+      pinBtn.classList.remove('drift');
+      pinBtn.textContent = 'PIN';
+    }
+    // Clear all panel DOM
+    document.querySelectorAll('.results-panel').forEach(p => { p.classList.remove('active'); p.innerHTML = ''; p.dataset.tool = ''; });
     document.querySelectorAll('.badge').forEach(b => b.classList.add('hidden'));
-    liveFindings = []; liveSeenItems.clear();
+    // Clear live browse
+    liveActive = false;
+    liveTargetDomain = '';
+    liveFindings = [];
+    liveSeenItems.clear();
     const feed = document.getElementById('live-feed');
-    if (feed) feed.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">Cleared</div>';
+    if (feed) feed.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">Click Start to begin</div>';
     document.getElementById('live-count').textContent = '0 findings';
+    const liveBtn = document.getElementById('btn-live-toggle');
+    if (liveBtn) {
+      liveBtn.textContent = 'Start Monitoring';
+      liveBtn.classList.remove('success'); liveBtn.classList.add('primary');
+    }
+    // Re-detect current tab from scratch — lastDomain reset means no save/restore on update
+    lastDomain = '';
     renderDomainPills();
-    log('Reset: ' + currentRoot, 'success');
+    updateActiveTab();
+    log('Full reset complete', 'success');
   });
   // Collapse / Expand all sections
   document.getElementById('btn-collapse')?.addEventListener('click', () => {
@@ -2423,8 +2485,22 @@ async function toolParamFuzz() {
         item.className = 'result-item ' + sev;
         item.style.cursor = 'pointer';
 
-        // Summary row
-        let summaryHTML = '<div class="result-label"><span class="result-tag ' + tagClass + '">' + tagText + '</span> ' + esc(target) + (x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : '') + '<span style="float:right;font-size:9px;color:var(--text-tertiary)">&#9660;</span></div>';
+        // Color-code the status to scan patterns at a glance
+        const statusColor = (s) => {
+          if (typeof s !== 'number') return 'var(--text-muted)';
+          if (s >= 500) return 'var(--accent)';   // server error — red
+          if (s >= 400) return 'var(--text-secondary)';  // client error — neutral
+          if (s >= 300) return '#c9750f';         // redirect — amber (often signals auth gate)
+          if (s >= 200) return 'var(--text-secondary)';  // success — neutral
+          return 'var(--text-muted)';
+        };
+        const statusBadge = x.status
+          ? '<span style="font-family:var(--font-mono);font-weight:600;color:' + statusColor(x.status) + '">' + x.status + '</span>'
+          : '<span class="text-muted" style="font-family:var(--font-mono)">—</span>';
+
+        // Summary row — status code now visible on the LABEL line so user can scan all results
+        // for, e.g., "show me the only 500 in this batch" without expanding each one.
+        let summaryHTML = '<div class="result-label"><span class="result-tag ' + tagClass + '">' + tagText + '</span> ' + esc(target) + (x.fieldType ? ' <span class="text-muted">[' + esc(x.fieldType) + ']</span>' : '') + ' ' + statusBadge + '<span style="float:right;font-size:9px;color:var(--text-tertiary)">&#9660;</span></div>';
         summaryHTML += '<div class="result-value" style="margin-bottom:3px">' + esc(x.payload) + '</div>';
         summaryHTML += '<div class="text-xs" style="color:var(--text-secondary)">' + esc(x.analysis) + '</div>';
         if (x.status) summaryHTML += '<div class="text-xs text-muted">HTTP ' + x.status + ' \u00b7 ' + x.bodyLen + 'b' + (x.elapsed ? ' \u00b7 ' + (x.elapsed / 1000).toFixed(1) + 's' : '') + '</div>';

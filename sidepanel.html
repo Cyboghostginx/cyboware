@@ -6,7 +6,7 @@
   <header>
     <div class="logo-row">
       <span class="wordmark">Cyboware<span class="dot">.</span></span>
-      <div class="header-actions"><button class="btn-sm" id="btn-collapse" title="Collapse / Expand all">▽</button><button class="btn-sm" id="btn-copy-all" title="Copy all results as JSON">📋</button><button class="btn-sm" id="btn-reset" title="Reset all panels">🗑</button><button class="btn-sm" id="btn-refresh" title="Re-scan">↻</button></div>
+      <div class="header-actions"><button class="btn-sm" id="btn-collapse" title="Collapse / Expand all sections">▽</button><button class="btn-sm" id="btn-copy-all" title="Copy all results as JSON">📋</button><button class="btn-sm" id="btn-reset" title="Reset everything — clears all domains, panels, live findings">🗑</button><button class="btn-sm" id="btn-refresh" title="Refresh — re-detect current tab (does not clear cached sessions)">↻</button></div>
     </div>
     <div class="context-bar">
       <span class="scope-dot" id="scope-indicator"></span>
@@ -22,7 +22,7 @@
       <div class="feat-group-header">
         <span class="chevron">▶</span>
         <span class="group-title">📡 Live Browse</span>
-        <span class="badge hidden" id="badge-live">0</span>
+        <span class="badge hidden" id="badge-live" title="Findings detected during live monitoring">0</span>
       </div>
       <div class="feat-group-body">
         <div class="flex-between mb-6">
@@ -76,7 +76,7 @@
     </div>
     <!-- DISCOVERY -->
     <div class="feat-group" data-group="discovery">
-      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🕵️ Discovery</span><span class="badge hidden" id="badge-discovery">0</span></div>
+      <div class="feat-group-header"><span class="chevron">▶</span><span class="group-title">🕵️ Discovery</span><span class="badge hidden" id="badge-discovery" title="Number of findings in this section">0</span></div>
       <div class="feat-group-body">
         <div class="tool-grid">
           <button class="tool-btn" data-tool="secrets"><span class="tool-icon">🔑</span><span class="tool-name">Secret Scanner</span><span class="tool-desc">API keys, tokens, creds</span></button>

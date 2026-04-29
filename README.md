@@ -1,6 +1,7 @@
 # Cyboware.
 
 ![cyboware](cyboware.png)
+<a href="https://buymeacoffee.com/cyboghostginx" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
 
 **Bug bounty toolkit in your browser sidebar. 35 tools. Zero dependencies. Zero data collection.**
 

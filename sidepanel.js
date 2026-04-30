@@ -2094,8 +2094,14 @@ async function toolSiteMap() {
   html += `<div class="result-label mt-4 mb-4">Hosts seen (${hostList.length})</div>`;
   hostList.forEach(([h, count]) => {
     const isInScope = scopeDomains.length === 0 || scopeDomains.some(s => h === s || h.endsWith('.' + s));
+    // Cross-origin host: hostname's eTLD+1 differs from the root domain we're viewing.
+    // When islandsbanki.is's pages call api.isb.is, that's a cross-origin API call —
+    // surfacing it here is the whole point of initiator-keyed aggregation.
+    const hostRoot = getRootDomain(h);
+    const isCrossOrigin = hostRoot && hostRoot !== root;
+    const xoLabel = isCrossOrigin ? ' <span class="text-xs" style="color:var(--accent);font-weight:600">cross-origin → ' + esc(hostRoot) + '</span>' : '';
     html += `<div class="result-item ${isInScope ? 'info' : 'low'}" style="cursor:pointer">
-      <div class="result-label"><code>${esc(h)}</code> ${isInScope ? '' : '<span class="text-xs text-muted">(out of scope)</span>'}</div>
+      <div class="result-label"><code>${esc(h)}</code>${xoLabel} ${isInScope ? '' : '<span class="text-xs text-muted">(out of scope)</span>'}</div>
       <div class="result-value text-xs">${count} requests</div>
     </div>`;
   });
@@ -2118,7 +2124,10 @@ async function toolSiteMap() {
   if (!treeHosts.length) html += '<div class="text-muted text-sm">No XHR/fetch endpoints captured yet</div>';
   treeHosts.forEach(h => {
     const paths = Object.keys(tree[h]).sort();
-    html += `<details style="margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:6px"><summary class="text-sm" style="cursor:pointer;font-weight:600"><code>${esc(h)}</code> <span class="text-xs text-muted">(${paths.length} path${paths.length===1?'':'s'})</span></summary>`;
+    const hostRoot = getRootDomain(h);
+    const isCrossOrigin = hostRoot && hostRoot !== root;
+    const xoLabel = isCrossOrigin ? ' <span class="text-xs" style="color:var(--accent)">→ ' + esc(hostRoot) + '</span>' : '';
+    html += `<details style="margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:6px"><summary class="text-sm" style="cursor:pointer;font-weight:600"><code>${esc(h)}</code>${xoLabel} <span class="text-xs text-muted">(${paths.length} path${paths.length===1?'':'s'})</span></summary>`;
     paths.forEach(p => {
       const calls = tree[h][p];
       const total = calls.reduce((s, c) => s + c.count, 0);

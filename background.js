@@ -367,28 +367,59 @@ function getRootDomain(hostname) {
 function aggregateRequest(d, kind) {
   let host;
   try { host = new URL(d.url).hostname; } catch { return; }
-  const root = getRootDomain(host);
-  if (!root) return;
-  if (!domainAggregate[root]) domainAggregate[root] = { hosts: {}, jsFiles: {}, endpoints: {}, requests: [], authDetectedAt: null, firstSeen: Date.now() };
-  const agg = domainAggregate[root];
-  agg.hosts[host] = (agg.hosts[host] || 0) + 1;
+  const targetRoot = getRootDomain(host);
+  if (!targetRoot) return;
 
-  // Track JS files specifically — these are gold for hunters
-  if (kind === 'script' || /\.js(\?|$)/i.test(d.url)) {
-    if (!agg.jsFiles[d.url]) agg.jsFiles[d.url] = { firstSeen: Date.now(), status: d.statusCode || null, ct: '', size: 0, scanned: false };
-    else if (d.statusCode) agg.jsFiles[d.url].status = d.statusCode;
+  // CROSS-ORIGIN API CALLS:
+  // When islandsbanki.is's page calls api.isb.is, we want that request visible from
+  // BOTH domains' perspective:
+  //   - From islandsbanki.is's view: "this page makes calls to api.isb.is" (initiator-keyed)
+  //   - From isb.is's view (if user later opens it directly): "the API endpoints exposed"
+  //
+  // d.initiator is the origin of the document that made the request (Chrome adds this
+  // to webRequest details for cross-origin requests). For same-origin requests it's
+  // either equal to the target origin or undefined. We extract its root and aggregate
+  // under both roots when they differ.
+  let initiatorRoot = '';
+  if (d.initiator) {
+    try { initiatorRoot = getRootDomain(new URL(d.initiator).hostname); } catch {}
   }
-  // Track XHR/fetch endpoints (deduped by path-with-method)
-  if (kind === 'xhr' || kind === 'fetch') {
-    let pathKey;
-    try { const u = new URL(d.url); pathKey = (d.method || 'GET') + ' ' + u.hostname + u.pathname; } catch { pathKey = d.url; }
-    if (!agg.endpoints[pathKey]) agg.endpoints[pathKey] = { url: d.url, method: d.method || 'GET', count: 0, lastStatus: null, firstSeen: Date.now() };
-    agg.endpoints[pathKey].count++;
-    if (d.statusCode) agg.endpoints[pathKey].lastStatus = d.statusCode;
+  // documentUrl is more reliable for sub_frame requests
+  if (!initiatorRoot && d.documentUrl) {
+    try { initiatorRoot = getRootDomain(new URL(d.documentUrl).hostname); } catch {}
   }
-  // Cap total request log per domain
-  agg.requests.push({ url: d.url, method: d.method || 'GET', kind, status: d.statusCode || null, ts: Date.now(), tabId: d.tabId });
-  if (agg.requests.length > 1000) agg.requests = agg.requests.slice(-1000);
+
+  // Build the set of roots this request should be indexed under. Always include the
+  // target. If there's a different initiator, also include that — but mark cross-origin
+  // entries so the UI can display them differently (e.g. "→ api.isb.is" prefix).
+  const indexUnder = new Set([targetRoot]);
+  const isCrossOrigin = initiatorRoot && initiatorRoot !== targetRoot;
+  if (isCrossOrigin) indexUnder.add(initiatorRoot);
+
+  for (const root of indexUnder) {
+    if (!domainAggregate[root]) domainAggregate[root] = { hosts: {}, jsFiles: {}, endpoints: {}, requests: [], authDetectedAt: null, firstSeen: Date.now() };
+    const agg = domainAggregate[root];
+    agg.hosts[host] = (agg.hosts[host] || 0) + 1;
+
+    // Track JS files specifically — these are gold for hunters.
+    // For cross-origin JS (e.g. CDN-loaded chunks), index under both the loading page's
+    // root AND the CDN's root, so secret scanner picks them up wherever the user looks.
+    if (kind === 'script' || /\.js(\?|$)/i.test(d.url)) {
+      if (!agg.jsFiles[d.url]) agg.jsFiles[d.url] = { firstSeen: Date.now(), status: d.statusCode || null, ct: '', size: 0, scanned: false, crossOrigin: isCrossOrigin && root !== targetRoot };
+      else if (d.statusCode) agg.jsFiles[d.url].status = d.statusCode;
+    }
+    // Track XHR/fetch endpoints (deduped by path-with-method)
+    if (kind === 'xhr' || kind === 'fetch') {
+      let pathKey;
+      try { const u = new URL(d.url); pathKey = (d.method || 'GET') + ' ' + u.hostname + u.pathname; } catch { pathKey = d.url; }
+      if (!agg.endpoints[pathKey]) agg.endpoints[pathKey] = { url: d.url, method: d.method || 'GET', count: 0, lastStatus: null, firstSeen: Date.now(), crossOrigin: isCrossOrigin && root !== targetRoot, targetRoot };
+      agg.endpoints[pathKey].count++;
+      if (d.statusCode) agg.endpoints[pathKey].lastStatus = d.statusCode;
+    }
+    // Cap total request log per domain. Mark cross-origin entries.
+    agg.requests.push({ url: d.url, method: d.method || 'GET', kind, status: d.statusCode || null, ts: Date.now(), tabId: d.tabId, crossOrigin: isCrossOrigin && root !== targetRoot, targetHost: host });
+    if (agg.requests.length > 1000) agg.requests = agg.requests.slice(-1000);
+  }
 }
 
 // ═══ SERVICE WORKER PERSISTENCE ═══
